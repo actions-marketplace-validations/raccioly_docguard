@@ -19,7 +19,7 @@ jobs:
       version: ${{ steps.check.outputs.version }}
       changed: ${{ steps.check.outputs.changed }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 1 # only need HEAD's package.json; the tag check hits the remote
 
@@ -56,10 +56,10 @@ jobs:
         # newer npm so a version-incompatible .npmrc / install can't ship (bug-198).
         node-version: [18, 20, 22, 24]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
       - name: Install dependencies
@@ -77,7 +77,7 @@ jobs:
     outputs:
       tag: v${{ needs.detect-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0 # Fetch all history + tags for reliable tag detection
 
@@ -134,7 +134,7 @@ jobs:
     needs: [detect-version, create-release]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Build extension ZIP
         run: |
@@ -163,8 +163,8 @@ jobs:
     needs: [detect-version, create-release]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
 
@@ -200,8 +200,8 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           registry-url: 'https://registry.npmjs.org'
@@ -216,8 +216,8 @@ jobs:
     needs: [detect-version, test, create-release]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -258,7 +258,7 @@ jobs:
       issues: write # reminder issue in THIS repo only — never github/spec-kit
     steps:
       - name: Checkout docguard repo
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
 
       - name: Get version and metadata
         id: meta
