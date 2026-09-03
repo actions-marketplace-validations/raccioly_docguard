@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.1] - 2026-08-28
+
+### Fixed
+
+- **OpenAPI schema field with no `type` crashed schema sync.** `extractOpenAPIRelationships` called `.toLowerCase()` on `field.type` unconditionally — a field with no `type` (valid OpenAPI, e.g. a bare `$ref`) threw instead of being skipped. (#328)
+- **TODO-Tracking never recognized Python/Go/Ruby test-file naming.** The test-file exclusion regex only matched the dotted JS convention (`foo.test.py`), which nobody writes — real Python/Go/Ruby test files are `test_foo.py`, `foo_test.py`, `foo_test.go`, `foo_spec.rb`. TODOs inside those files' actual test functions were flagged as untracked source TODOs. Now recognizes the idiomatic naming for all three. (#328)
+
+### Changed
+
+- Bumped `actions/setup-node` and `actions/setup-python` to v7 in CI/release workflows. (#330)
+
+### Reverted
+
+- **`@babel/parser` 8.0.4 → back to 7.29.7.** Dependabot's major-bump PR (#331) tested green locally and merged, but `8.0.4` requires Node `^22.18.0 || >=24.11.0` — it silently dropped Node 18 (and, per its own `engines` field, isn't really supported on 20 either, though it happened to run there). This project declares `"engines": {"node": ">=18.0.0"}` and CI gates all four Node versions; the release pipeline itself caught it — `test (18)` failed with 20 broken AST-parsing tests while 20/22/24 passed, so nothing published (npm/PyPI publish correctly never ran). Reverted and re-verified locally across Node 18, 20, 22, and 24 before re-releasing. Lesson: a major bump of a parsing library needs the full supported-version matrix tested, not just the developer's local Node version — `engines` mismatches don't show up as install failures, they show up as silent behavioral differences.
+
+### Tests
+
+- Added coverage for `walkFiles`, `isNonProductDir`, and `isNonProductPath` in `shared-ignore.mjs`. (#324)
+
+## [0.34.0] - 2026-08-13
+
+### Fixed
+
+- **Canonical docs in subfolders were invisible across 19 call sites (`listCanonicalDocs`).** Every consumer of `docs-canonical/` enumerated it by hand with a flat `readdirSync(...).filter(f => f.endsWith('.md'))`, so a project that groups its canonical docs — `docs-canonical/01-architecture/MODULE-MAP.md`, a common convention past a handful of files — was scanned as if those docs did not exist. Replaced all 19 with one shared recursive enumerator (`listCanonicalDocs` in `shared-ignore.mjs`, built on the existing `walkFiles`), which honors `.docguardignore` per-doc against the full relative path, skips dot-directories while keeping dot-markdown files, and returns sorted project-relative POSIX paths.
+
+  First pass (5 sites) fixed the worst offenders: **docs-sync** reported services as undocumented while the documentation sat right there (an *unfixable* DSY002 — editing the nested doc could never clear it); `docguard:validator … n/a` **markers** in nested docs were dropped, so a validator declared N/A ran anyway; **semantic-claims** never scanned nested docs for unverified claims; **agent-readability** scored an empty set; **ALCOA** reported "all docs updated within 30 days" against zero documents, so a stale nested tree scored green.
+
+  Second pass (14 more sites, across `impact`, `init`, `llms`, `memory`, `trace`, `hooks`, and the `api-doc-smells`/`cross-reference`/`diff-suspicion`/`doc-quality`/`docs-coverage`/`generated-staleness`/`reference-existence`/`traceability` validators) closed the rest. The standout: **generated-staleness**'s cheap pre-flight check missed a nested `docguard:section source=code` marker and concluded "nothing to do" — the *entire validator* silently never ran, disabling drift detection outright rather than just under-reporting it. Also fixed: `trace --reverse <file>` falsely reporting no canonical doc references a file documented only in a nested doc; `reference-existence` never indexing symbol references made from nested docs; `init`'s re-init detection treating an already-initialized nested-docs project as first-run; a post-commit hook nudge that couldn't find docs referencing an edited file; and orphaned-doc detection in `traceability` that was blind to strays outside the top level.
+
+  Two behavior notes: `.md` matching is now uniformly case-insensitive (some call sites lowercased, some didn't — one tool must not hold two opinions about what a canonical doc is), and projects with nested canonical docs will see freshness, readability, and claim counts move as those documents become visible for the first time. Where a site's message or `location` text is user-visible (validator findings, CLI output), the fix preserves the exact flat-tree wording — only visibility into nested docs changed, not the format of existing output. Verified against DocGuard's own repo (flat `docs-canonical/`, so a correct fix must produce identical output): `guard`/`score` JSON byte-identical apart from timings across both passes (282/291, 0 errors, 14 warnings). 18 regression tests across `tests/canonical-docs-nested.test.mjs` and `tests/canonical-docs-nested-phase2.test.mjs`; 9 of them fail against the previous release, proving they actually catch the bug.
+
 ## [0.33.1] - 2026-07-16
 
 ### Added
