@@ -1,4 +1,5 @@
 /**
+ * @implements docguard.evidence-scoped-verification#FR-010
  * Findings — the structured, LLM-addressable result unit (v0.27).
  *
  * Background (LLM field report #3): DocGuard's whole job is to tell an agent
@@ -16,6 +17,14 @@
  * hand-built results and render exactly as before. Nothing regresses.
  *
  * Zero npm dependencies — pure Node.js built-ins.
+ * @implements docguard.adoption-workflow-integrity#FR-002
+ * @implements docguard.calibrated-finding-channels#FR-001
+ * @implements docguard.calibrated-finding-channels#FR-002
+ * @implements docguard.calibrated-finding-channels#FR-003
+ * @implements docguard.calibrated-finding-channels#FR-004
+ * @implements docguard.calibrated-finding-channels#FR-006
+ * @implements docguard.calibrated-finding-channels#FR-009
+ * @implements docguard.calibrated-finding-channels#FR-014
  *
  * @typedef {Object} Suggestion
  * @property {'fix'|'suppress'|'review'|'report'} kind
@@ -26,25 +35,62 @@
  * @typedef {Object} Finding
  * @property {string}      code          Stable code, e.g. 'SEC001' (see CODES).
  * @property {string}      validator     Owning validator key.
- * @property {'error'|'warn'} severity
- * @property {'high'|'low'} confidence   'low' = candidate false positive.
+ * @property {'error'|'warn'} severity    Does CI block? (intrinsic; policy may reweight)
+ * @property {'high'|'low'} confidence   How sure the detector is of its OBSERVATION.
+ *                                       'low' = candidate false positive. NOT a triage
+ *                                       signal and NOT a measured rate — see the two
+ *                                       channels below (docguard.calibrated-finding-channels).
+ * @property {'act'|'escalate'} disposition  Who decides. 'act' = DocGuard asserts a
+ *                                       defect and names the correction; 'escalate' =
+ *                                       DocGuard reports a signal whose judgement belongs
+ *                                       to the reader. Orthogonal to severity and confidence:
+ *                                       a certain observation can still be an escalation
+ *                                       (FRS002: the commit count is a fact; staleness is not).
+ * @property {FindingEvidence} evidence  Whether the reviewed corpus has ever measured this
+ *                                       code. 'not-measured' is the honest answer for most
+ *                                       codes; it is never inherited from a sibling code.
+ * @property {ParserTier}  parserTier    Which analyzer tier produced the evidence. Computed
+ *                                       at run time; 'not-applicable' for doc-only findings.
  * @property {string}      message       Concise, NO ansi colour.
- * @property {string|null} location      'path:line' or 'path'.
+ * @property {string|null} location      'path:line' or 'path'. Always a string or null.
  * @property {Suggestion|null} suggestion
- * @property {boolean}     reportable    Surface in `docguard feedback`.
+ * @property {boolean}     reportable    Surface in `docguard feedback`: true when the code is
+ *                                       unmeasured OR confidence is low — so the feedback
+ *                                       loop samples exactly the findings whose label has
+ *                                       never been validated, not only the ones it doubts.
  * @property {string|null} redactedContext  Safe-to-share context for a report.
+ *
+ * @typedef {'js-ast'|'py-ast'|'regex-fallback'|'fallback-language'|'mixed'|'not-applicable'} ParserTier
+ *
+ * @typedef {Object} FindingEvidence
+ * @property {'measured'|'not-measured'} status
+ * @property {number}  [n]                Labelled findings behind the estimate.
+ * @property {number|null} [precision]    Point estimate ONLY when n meets the published floor.
+ * @property {number[]} [precisionInterval]  Wilson 95% [lower, upper].
+ * @property {boolean} [quotable]
+ * @property {string}  [measuredOnVersion]
+ * @property {boolean} [measuredOnRunningVersion]
  */
+
+import { readFileSync } from 'node:fs';
+import { evidenceForCode, PRECISION_EVIDENCE } from './precision-evidence.mjs';
 
 /**
  * Stable finding-code registry. `docguard explain <CODE>` reads this, and
  * inline `// docguard:ignore <CODE>` keys off it. Keep codes append-only — a
  * published code is a public surface we don't renumber.
+ *
+ * `defaultLevel: 'info'` makes a code informational for the exit code unless
+ * `findingSeverity.<CODE>` says otherwise. A finding's own `severity` stays
+ * `error` or `warn` (the documented contract: `info` is an enforcement level
+ * only), so the code's default lives here, beside its title and help.
  */
 export const CODES = {
+  __proto__: null,
   SEC001: {
     validator: 'security',
     title: 'Hardcoded password',
-    help: 'A `password`/`passwd`/`pwd` assignment with a quoted literal value (8+ chars). If the value is natural-language UI copy or a validation message — not a credential — this is a false positive: DocGuard now flags those low-confidence, but you can suppress inline.',
+    help: 'A `password`/`passwd`/`pwd` assignment with a quoted literal value (8+ chars). A password label is skipped: a capitalised word for "password" in a common language (`Password`, `Contraseña`, `Mot de passe`, `パスワード`), a short letter-only phrase containing one (`Confirm Password`), or the key\'s own words, unless the key is an all-caps constant such as `DB_PASSWORD`. Other natural-language UI copy or validation messages are flagged low-confidence; suppress inline if the value is not a credential.',
     suppress: '// docguard:ignore SEC001 — UI copy, not a credential',
   },
   SEC002: {
@@ -103,10 +149,29 @@ export const CODES = {
     suppress: null,
   },
   STR003: {
-    validator: 'structure',
+    validator: 'docSections',
     title: 'Missing required doc section',
     help: 'A canonical doc exists but lacks a section its document type requires. Add the section — or, if it is genuinely not applicable, own the absence with an inline marker: `<!-- docguard:section <slug> n/a — reason -->`.',
     suppress: '<!-- docguard:section <slug> n/a — reason -->',
+  },
+  STR004: {
+    validator: 'structure',
+    title: 'Agent instruction chain exceeds its byte budget',
+    help: 'Codex concatenates AGENTS.md files from the repository root down to the working directory (AGENTS.override.md replaces AGENTS.md in its directory) and stops reading at project_doc_max_bytes, 32768 bytes by default. Text past the limit is dropped without warning, and the nested, most specific rules come last. Move long procedures into linked documents, remove duplicated rules, or — for existing debt — record an allowance in `agentInstructions.allowances` (keyed by the deepest file) so the chain can shrink but any growth is a reviewed configuration change. The budget itself is `agentInstructions.maxBytes`.',
+    suppress: null,
+  },
+  STR005: {
+    validator: 'structure',
+    defaultLevel: 'info',
+    title: 'Instruction allowance has slack',
+    help: 'An allowance in `agentInstructions.allowances` is at least 1024 bytes above the chain it covers. The chain shrank; lower the allowance to the current size (or remove it when the chain is within the default budget) so it cannot grow back unnoticed. Informational: it never changes the exit code unless `findingSeverity.STR005` says so.',
+    suppress: null,
+  },
+  STR006: {
+    validator: 'docSections',
+    title: 'Canonical doc is an unedited scaffold',
+    help: 'A canonical doc holds nothing a reader wrote beyond the template `docguard init` created it from: every line is template text, an HTML-comment placeholder, an empty table cell, the Metadata table or a date. It scores as unfinished in docQuality, ALCOA+ Legible and Machine markers. Write the document (or run `docguard generate --plan --write`, which fills code-derived sections), or — if it is intentionally blank — own it with `<!-- docguard:section scaffold n/a — reason -->` (any reasoned section N/A marker owns the document, and it is then scored as written). A placeholder owner or unchosen status alone is not reported: `generate --plan --write` leaves both. A document that `docs.roles` remaps is compared with the template of its role.',
+    suppress: '<!-- docguard:section scaffold n/a — reason -->',
   },
   CHG001: {
     validator: 'changelog',
@@ -138,46 +203,58 @@ export const CODES = {
     help: 'A doc states "N <noun>" for a noun declared in `config.collections`, but the collection glob matches a different number of files. Either the doc is stale (fix with `docguard fix --write`) or the code lost/gained members unintentionally — check which side is wrong before fixing.',
     suppress: null,
   },
+  MET003: {
+    validator: 'metricsConsistency',
+    title: 'Documented test count is below the declared test cases',
+    help: 'A line about the project\'s own test suite ("npm test # N tests", "N tests passing") states fewer tests than the test files declare. The declared count is a static lower bound of what the runner reports (cases generated in loops are not expanded), so a smaller documented number is stale for certain, but the true number is only known by running the suite. Run it and update the count by hand; there is no mechanical fix.',
+    suppress: null,
+  },
+  MET004: {
+    validator: 'metricsConsistency',
+    title: 'Documented runtime-dependency count disagrees with package.json',
+    help: 'A document (including the Spec Kit constitution) states how many runtime dependencies the project has ("zero runtime dependencies", "Dependencies: None", "one npm dependency"), and package.json `dependencies` declares a different number. Only qualified wording counts, so "no dependencies between modules" is never compared. The claim may be stale, or a dependency may have been added that the project promised not to take: decide which side is wrong. There is no mechanical fix.',
+    suppress: null,
+  },
   FRS001: {
     validator: 'freshness',
-    title: 'Doc has no freshness signal',
-    help: 'The doc exists but is not committed to git and carries no review marker, so its currency cannot be assessed. Commit it, or stamp it with `<!-- docguard:last-reviewed YYYY-MM-DD -->` (or `<!-- docguard:status approved -->` for a doc generated this session).',
-    suppress: '<!-- docguard:status approved -->',
+    title: 'Document review signal unavailable',
+    help: 'No committed update or dated review signal was found. Review the document’s intended behavior and implementation before recording a review date. An approved status is an author signal, not semantic verification.',
+    suppress: null,
   },
   FRS002: {
     validator: 'freshness',
-    title: 'Code moved on since the doc was last updated',
-    help: '10+ code commits landed after the doc\'s last update/review — its code-truth sections are likely stale. Run `docguard sync --write` to refresh them in one pass, or review and stamp `<!-- docguard:last-reviewed YYYY-MM-DD -->` if it is still accurate.',
+    title: 'Document review due after repository activity',
+    help: 'At least 10 code commits followed the document update or review. This repository-wide heuristic does not prove the document is stale. Review its purpose, intended behavior and relevant code before deciding which side needs a change.',
     suppress: null,
   },
   FRS003: {
     validator: 'freshness',
-    title: 'Doc predates the latest code change by 30+ days',
-    help: 'The doc\'s last update is more than 30 days older than the newest code commit. Review it against the current code, then update it or stamp it reviewed.',
+    title: 'Document review due after elapsed repository history',
+    help: 'The document update or review predates the latest code change by more than 30 days. This repository-wide heuristic does not establish drift. Review relevance and intent before changing documentation or code.',
     suppress: null,
   },
   FRS004: {
     validator: 'freshness',
-    title: 'CHANGELOG lagging behind code changes',
-    help: 'Code changed but CHANGELOG.md has not been updated in over a week. Add the missing entries under [Unreleased].',
+    title: 'Release-note review due',
+    help: 'The changelog update predates the latest code change by more than a week. Review whether these changes need release notes; timing alone does not prove entries are missing.',
     suppress: null,
   },
   FRS005: {
     validator: 'freshness',
-    title: 'DRIFT-LOG possibly stale',
-    help: 'Recent commits added `DRIFT:` comments but DRIFT-LOG.md has not kept pace. Log the new deviations (each DRIFT comment needs a DRIFT-LOG entry) or remove resolved markers.',
+    title: 'Deviation-log review due',
+    help: 'Recent code commits added DRIFT comment lines. Review whether the deviations are already recorded or resolved; history alone does not prove the log is incomplete.',
     suppress: null,
   },
   DSY001: {
     validator: 'docsSync',
     title: 'Route not referenced in canonical docs',
-    help: 'A route file exists but neither its path nor its basename appears in any docs-canonical .md file. Reference the route in a canonical doc (e.g. ARCHITECTURE.md or an API doc) so the documented surface matches the code.',
+    help: 'A route file exists but no docs-canonical .md file names it. Only text a reader sees counts: a name inside an HTML comment, such as a template placeholder, does not. A Next.js route handler (`app/api/**/route.ts`) is named by the URL path it serves (`/api/users/{id}`, `GET /api/users/:id`, or its file path), and `/api/users/*` names the routes under it; the word `route` names none. Any other route is named by its path, file name or module name (the file name without its extension) as a whole name, so `users` or `user-service` does not document `user`. A module name that several checked files share needs its directory (`auth/types`), and an `index` file is named by its directory (`routes/users`) or `users/index`. A file tree drawn in a doc (`├──`, `└──`) names the paths it lists, and a `docguard:section` marker whose `covers` lists the file documents it too. Reference the route in a canonical doc (e.g. ARCHITECTURE.md or an API doc) so the documented surface matches the code.',
     suppress: null,
   },
   DSY002: {
     validator: 'docsSync',
     title: 'Service not referenced in canonical docs',
-    help: 'A service/lib file exists but neither its path nor its basename appears in any docs-canonical .md file. Reference the service in a canonical doc (e.g. ARCHITECTURE.md) so the documented surface matches the code.',
+    help: 'A service/lib file exists but no docs-canonical .md file names it. Only text a reader sees counts: a name inside an HTML comment, such as a template placeholder, does not. Its path, file name or module name (the file name without its extension) must appear as a whole name, so `users` or `user-service` does not document `user`. A module name that several checked files share needs its directory (`auth/types`), and an `index` file is named by its directory (`services/auth`) or `auth/index`. A file tree drawn in a doc (`├──`, `└──`) names the paths it lists, and a `docguard:section` marker whose `covers` lists the file documents it too. Reference the service in a canonical doc (e.g. ARCHITECTURE.md) so the documented surface matches the code.',
     suppress: null,
   },
   DSY003: {
@@ -189,13 +266,13 @@ export const CODES = {
   DDF001: {
     validator: 'docsDiff',
     title: 'Tech Stack drift',
-    help: 'The tech named in docs-canonical/ARCHITECTURE.md and the dependencies actually declared (package.json across the monorepo, Dockerfile, .tf files) disagree. Drift is two-sided — document the new tech or remove the stale entries after checking which side is wrong.',
+    help: 'The tech named in docs-canonical/ARCHITECTURE.md and the technologies the code shows disagree. The code side reads the dependency manifests of every ecosystem (package.json across the monorepo, pyproject/requirements, go.mod, Gemfile, Cargo.toml, composer.json, *.csproj, Maven/Gradle), a Dockerfile or compose file, and .tf files; DynamoDB and Docker are also found from unambiguous source text in product files (a DynamoDB API target or endpoint, `docker run`/`build`/`compose` in a script, Makefile or CI workflow, a compose file), and the message names that file. A documented technology is reported missing only where a manifest could have shown it (see docs/reference/languages.md); a project with no manifest is not checked. Drift is two-sided — document the new tech or remove the stale entries after checking which side is wrong. A technology is not read as documented when a negator governs it (`no CDK, Terraform or Pulumi stacks` negates every item of the list; `No Docker, Express serves the API` negates Docker only), when a removal or migration verb takes it as its object (`removed Terraform`, `migrated off Terraform`, `was replaced by` — but not `removed all Redis keys`), or when it appears under a Revision History, Changelog or Release Notes heading, which describe past state.',
     suppress: null,
   },
   DDF002: {
     validator: 'docsDiff',
     title: 'Test Files drift',
-    help: 'The test files documented in docs-canonical/TEST-SPEC.md and the test files on disk disagree. Add entries for new tests or remove documented tests that no longer exist — TEST-SPEC.md entries may be glob patterns.',
+    help: 'The test files documented in docs-canonical/TEST-SPEC.md and the test files on disk disagree. A documented test is a backticked `*.test.*`/`*.spec.*` name or one matching `testPatterns`/`testPattern` in .docguard.json, the same patterns the code side uses. Add entries for new tests or remove documented tests that no longer exist — TEST-SPEC.md entries may be glob patterns, and a brace pattern (`src/tests/{alpha,beta}.test.ts`, `foo.{test,spec}.ts`) documents every path it expands to (single level, at most 64 expansions); a brace glob (`src/**/*.test.{js,jsx}`) is one pattern that documents what any alternative matches.',
     suppress: null,
   },
   DCV001: {
@@ -249,19 +326,19 @@ export const CODES = {
   ENV001: {
     validator: 'environment',
     title: 'Missing setup section in ENVIRONMENT.md',
-    help: 'ENVIRONMENT.md lacks both a "## Prerequisites" and a "## Setup Steps" heading (H2/H3 anchored, not a TOC mention). Add a Setup Steps section describing how to get the project running from a fresh clone.',
+    help: 'ENVIRONMENT.md lacks both a Prerequisites and a Setup Steps heading. Headings match as STR003 matches them: any case, section numbers allowed, synonyms such as "Getting Started" accepted. Add a Setup Steps section describing how to get the project running from a fresh clone.',
     suppress: null,
   },
   ENV002: {
     validator: 'environment',
     title: 'Missing Environment Variables section',
-    help: 'ENVIRONMENT.md has no "## Environment Variables" heading. Add the section and document each variable the app reads — backticked names or a pipe table both count.',
+    help: 'ENVIRONMENT.md has no Environment Variables heading (matched as STR003 matches headings: any case, section numbers allowed, synonyms such as "Env Vars" accepted; "Environment" and "Configuration" only as the whole heading or followed by a word such as "Reference", "Variables" or "(.env)", so "Configuration Files" or "Production environment" does not count). Add the section and document each variable the app reads — backticked names or a pipe table both count.',
     suppress: null,
   },
   ENV003: {
     validator: 'environment',
     title: 'Env vars used in code but undocumented',
-    help: "Variables read via process.env / import.meta.env were found in code but not in ENVIRONMENT.md or .env.example. Document each listed variable in the doc, or add it to .env.example — either counts as documentation.",
+    help: "Variables read in code (process.env / import.meta.env, os.environ, os.Getenv, ENV[...], System.getenv, Spring ${X} placeholders, and the C#, PHP and Rust forms) were not found in ENVIRONMENT.md or .env.example. Document each listed variable in the doc, or add it to .env.example — either counts as documentation.",
     suppress: null,
   },
   ENV004: {
@@ -350,8 +427,8 @@ export const CODES = {
   },
   TRC004: {
     validator: 'traceability',
-    title: 'Requirement ID without test coverage',
-    help: 'A requirement ID found in the docs (REQ-/FR-/SC-/T-style) has no matching reference in any test file. Add an `@req <ID>` comment to the test that verifies it. Requirement traceability is opt-in: it only activates once IDs appear in your docs.',
+    title: 'Requirement ID without a recognized test annotation or label',
+    help: 'A documented requirement has no recognized annotation or test label in the scanned tests. This is a traceability gap, not proof of missing behavioral coverage. Review existing tests and add an `@req <ID>` annotation or ID test label only where the requirement is verified. Write a test only if coverage is actually missing.',
     suppress: null,
   },
   TRC005: {
@@ -369,7 +446,7 @@ export const CODES = {
   TDO002: {
     validator: 'todoTracking',
     title: 'Untracked TODO/FIXME annotation',
-    help: 'A TODO/FIXME/HACK/XXX/TEMP/WORKAROUND comment is not tracked in any tracking doc (ROADMAP.md, CURRENT-STATE.md, TODO.md, BACKLOG.md, or docs-canonical/ equivalents). Track it there with its file location, resolve it, or exclude the path via `todoIgnore` in .docguard.json.',
+    help: 'A TODO/FIXME/HACK/XXX/TEMP/WORKAROUND comment is not tracked in any tracking doc (ROADMAP.md, CURRENT-STATE.md, TODO.md, BACKLOG.md, or docs-canonical/ equivalents). Track it there with its file location, resolve it, or exclude the path via `todoIgnore` in .docguard.json. Only real comments count: a keyword inside a string, or quoted in backticks within a comment, is a quotation and is not reported.',
     suppress: null,
   },
   TDO003: {
@@ -381,7 +458,7 @@ export const CODES = {
   SCH001: {
     validator: 'schemaSync',
     title: 'Database models found but no DATA-MODEL.md',
-    help: 'Schema definitions were detected (Prisma/Drizzle/TypeORM/Sequelize/Knex/Django/Rails) but docs-canonical/DATA-MODEL.md does not exist, so the schema is undocumented. Run `docguard init` to create it, then document the models.',
+    help: 'Database models were detected (Prisma, Drizzle, Mongoose, TypeORM, Sequelize, Django, SQLAlchemy or SQLModel models, or Knex and Rails migration tables) but docs-canonical/DATA-MODEL.md does not exist, so the schema is undocumented. Run `docguard init` to create it, then document the models.',
     suppress: null,
   },
   SCH002: {
@@ -423,7 +500,7 @@ export const CODES = {
   CSY003: {
     validator: 'canonicalSync',
     title: 'Stale "N validators" claim',
-    help: "A surface doc (README.md/AGENTS.md) states a validator count that does not match guard's actual count (validator files + the inlined Doc Sections validator). Update the claim.",
+    help: 'A surface doc (README.md/AGENTS.md) states a validator count that does not match the validator modules shipped in the package. Guard can emit multiple check results from one module; those do not increase the public validator count. Update the claim.',
     suppress: null,
   },
   CSY004: {
@@ -480,10 +557,268 @@ export const CODES = {
     help: 'A tasks.md task marked [x] names a deliverable path that does not exist, and no evidence tier confirms the work landed: no matching basename anywhere in the repo (moved file), no named code symbol in source, no plan.md/spec.md tie to an existing artifact, no task-ID annotation in source, and no task-ID in the git log. A checked task with no artifact corrupts agent memory — later sessions trust the checkbox and skip the work. Uncheck the task or land the implementation. Flagged low-confidence — report a false positive if the deliverable was renamed beyond recognition. Opt out with `"specKit": { "phantomCheck": false }` in .docguard.json.',
     suppress: null,
   },
+  SPK010: {
+    validator: 'specKit',
+    title: 'Completed task names a file the feature never changed',
+    suppress: '<!-- docguard:ignore SPK010 — task invokes this file rather than changing it -->',
+    help: 'A tasks.md task marked [x] names a deliverable path that EXISTS but that no commit since this feature began — and no uncommitted change — ever touched. SPK008 asks whether the artifact exists; a task naming files that already existed passes that check whether or not the work happened, which is how a skill file listed in a completed documentation task shipped unmodified in this repository. The git fact is exact, so this is high-confidence, but it is an ESCALATION, not a verdict: a task may legitimately name a file as context, invoke it rather than change it, or the work may have landed under a different path. Read the task, then either do the work, correct the task text, or uncheck it. Suppress one task with `<!-- docguard:ignore SPK010 — reason -->` on its line; opt out entirely with `"specKit": { "untouchedClaimCheck": false }` in .docguard.json.',
+  },
+  SPK011: {
+    validator: 'specKit',
+    title: 'Additional untouched claims elided',
+    help: 'Guard reports at most 10 untouched-claim findings (SPK010) per run to avoid noise; this line counts the remainder. Resolve the reported tasks and re-run guard to surface more, or set `"specKit": { "untouchedClaimCheck": false }` in .docguard.json to disable the check.',
+    suppress: null,
+  },
+  SPK012: {
+    validator: 'specKit',
+    title: 'Two feature directories share a spec number',
+    help: 'Two or more top-level `specs/` feature directories use the same numeric prefix (for example `016-a` and `016-b`), usually because parallel agents each picked "the next number" from their own checkout. References to "spec 016" become ambiguous and tools that key on the number pick one arbitrarily. Renumber the later feature with `git mv` and update references. Projects that create specs in parallel can set Spec Kit\'s `feature_numbering` to `timestamp` in `.specify/init-options.json`.',
+    suppress: null,
+  },
   SPK009: {
     validator: 'specKit',
     title: 'Additional phantom completions elided',
     help: 'Guard reports at most 10 phantom-completion findings (SPK008) per run to avoid noise; this line counts the remainder. Fix or uncheck the reported tasks and re-run guard to surface more, or set `"specKit": { "phantomCheck": false }` in .docguard.json to disable the check.',
+    suppress: null,
+  },
+  DLC001: {
+    validator: 'documentLifecycle',
+    title: 'Terminal document remains in active context',
+    help: 'A tracked Markdown file declares itself superseded, deprecated, obsolete, or archived but remains searchable as current repository context. Confirm its outcomes are represented in current docs, then use `docguard retire --write --path <path> --reason <reason>`.',
+    suppress: null,
+  },
+  DLC002: {
+    validator: 'documentLifecycle',
+    title: 'Completed task list needs lifecycle review',
+    help: 'A spec has checked tasks and no open tasks. This is a review signal, not proof that the feature shipped. Confirm release evidence and current documentation before archiving the spec.',
+    suppress: null,
+  },
+  DLC003: {
+    validator: 'documentLifecycle',
+    title: 'Document lifecycle coverage incomplete',
+    help: 'DocGuard could not enumerate or read every tracked Markdown document. Fix Git access or file readability and rerun guard; an incomplete lifecycle scan must not be interpreted as a clean result.',
+    suppress: null,
+  },
+  DLC004: {
+    validator: 'documentLifecycle',
+    title: 'Retired document remains active',
+    help: 'The retirement manifest records this path, but the document still exists in the working tree. Remove it through the reviewed retirement transaction or remove the incorrect manifest event; the two states must agree.',
+    suppress: null,
+  },
+  SPR001: {
+    validator: 'specRegistry',
+    title: 'Spec registry missing or stale',
+    help: 'The committed `.docguard-specs.json` does not match the deterministic projection of current specs, tasks, tests, and archive tombstones. Run `docguard specs --write`, review the diff, and commit it with the behavior change.',
+    suppress: null,
+  },
+  SPR002: {
+    validator: 'specRegistry',
+    title: 'Spec identity missing or reused',
+    help: 'Every active spec needs one immutable lowercase Spec ID in authoritative metadata. IDs survive moves and retirement and may never be reused. Add `**Spec ID**: ` followed by a unique namespaced ID in backticks.',
+    suppress: null,
+  },
+  SPR003: {
+    validator: 'specRegistry',
+    title: 'Spec registry is invalid',
+    help: 'The registry is malformed or contains an unsupported lifecycle value. DocGuard refuses to overwrite invalid reviewed state. Repair the named field, then run `docguard specs --write`.',
+    suppress: null,
+  },
+  SPR004: {
+    validator: 'specRegistry',
+    title: 'Spec lifecycle contradicts storage',
+    help: 'Working-tree presence, lifecycle context, storage state, and the recovery archive disagree. Active specs must be current/working_tree; retired specs must be retired/git_history with a reason and matching archive event.',
+    suppress: null,
+  },
+  DLK001: {
+    validator: 'docDependency',
+    title: 'Code a reviewed doc section describes has changed',
+    help: 'A `docguard:section` declares `covers="path#symbol, …"`, and `.docguard-doc-lock.json` records what that code looked like when the section was last reviewed. The fingerprint of a covered dependency no longer matches: the symbol\'s normalized AST changed (formatting, comments and line moves do not count), or the file\'s bytes changed where no parser applies. Read the change (the finding carries the `git diff` command), update the prose if it no longer holds, then record the review with `docguard review --accept <doc>#<section> --reason "<what you checked>"`. This is a review signal: DocGuard knows the code changed, not whether the prose is now wrong.',
+    suppress: null,
+  },
+  DLK002: {
+    validator: 'docDependency',
+    title: 'Covered dependency no longer exists',
+    help: 'A path or symbol named in a section\'s `covers=` attribute does not resolve: the file was moved or deleted, the symbol was renamed, or the path is outside the project, a symlink, or excluded by .docguardignore. Fix the declaration to name what the section now describes, update the prose, and accept the review again.',
+    suppress: null,
+  },
+  DLK003: {
+    validator: 'docDependency',
+    title: 'Covered section has no accepted review',
+    help: 'A section declares `covers=` but `.docguard-doc-lock.json` has no entry for it, or its declared dependencies changed since the last review. Read the section against the code and run `docguard review --accept <doc>#<section> --reason "<what you checked>"`. Only this command writes the lock; sync, fix and agents never do.',
+    suppress: null,
+  },
+  DLK004: {
+    validator: 'docDependency',
+    title: 'Doc lock entry has no section',
+    help: 'The lock records a review for a `doc#section` that no longer declares `covers=` (the section was removed, renamed, or its attribute dropped). Run `docguard review --prune` to remove entries without a section.',
+    suppress: null,
+  },
+  DLK005: {
+    validator: 'docDependency',
+    title: 'Doc lock file is unreadable',
+    help: '`.docguard-doc-lock.json` does not parse or does not match its schema (schemas/docguard-doc-lock.schema.json). Nothing in it can be trusted, so no section is reported current. Restore it from git, or delete it and accept each covered section again.',
+    suppress: null,
+  },
+  ANC001: {
+    validator: 'requirementAnchors',
+    title: 'Code a reviewed requirement link anchors has changed',
+    help: 'A tag such as `@implements acme.billing#FR-003` anchors a requirement to the code below it, and `.docguard-anchor-lock.jsonl` records that code\'s fingerprint from the last review. The fingerprint no longer matches: the normalized code changed (formatting, comments and line moves do not count). Read the change (the finding carries the command), confirm the code still meets the requirement, then record the review with `docguard anchors accept --link <key> --reason "<what you checked>"`. A warning by default; an error under `anchors.failOn: reviewed-exact` for reviewed, exact-tier, symbol-scope links.',
+    suppress: null,
+  },
+  ANC002: {
+    validator: 'requirementAnchors',
+    title: 'Requirement text changed since its code link was reviewed',
+    help: 'The requirement block a reviewed link cites has changed since the review (whitespace-only edits do not count). The code may no longer meet the new wording. Read both, then accept the link again with a reason, or `docguard anchors accept --spec <id> --bulk --reason "…"` for every link of the spec. Never an error.',
+    suppress: null,
+  },
+  ANC003: {
+    validator: 'requirementAnchors',
+    title: 'A reviewed requirement link lost its code',
+    help: 'The lock records a reviewed or baselined link whose tag no longer exists, while the requirement still does: the implementation was deleted or the tag was dropped. Restore the tag where the requirement is now implemented, or remove the link with `docguard anchors accept --remove <key> --reason "…"`.',
+    suppress: null,
+  },
+  ANC004: {
+    validator: 'requirementAnchors',
+    title: 'Requirement link has no review yet',
+    help: 'A tag anchors a requirement to code, and the project has an anchor lock, but this link has never been accepted. Reported by `docguard anchors` only, never by guard. Read the code against the requirement, then `docguard anchors accept --link <key> --reason "…"`.',
+    suppress: null,
+  },
+  ANC005: {
+    validator: 'requirementAnchors',
+    title: 'Anchor lock file is unreadable',
+    help: '`.docguard-anchor-lock.jsonl` does not parse, has an unsupported header, or has a line that does not match schemas/docguard-anchor-lock.schema.json. Nothing in it can be trusted, so no link is reported current. Restore it from git, or delete it and baseline again with `docguard anchors accept --baseline --bulk --reason "…"`.',
+    suppress: null,
+  },
+  ANC006: {
+    validator: 'requirementAnchors',
+    title: 'Requirement tag scope is ambiguous or did not resolve',
+    help: 'A tag sits where its scope is unclear (a file header directly above a declaration), asks for a scope that does not resolve (`{scope=symbol}` with no declaration below), lists several requirements in one tag, or sits in a file the pattern tier could not balance. It still counts as file-scope evidence. Add `{scope=symbol}` or `{scope=file}` to say which you mean, or split the tag. Reported by `docguard anchors` only, never by guard.',
+    suppress: null,
+  },
+  ANC007: {
+    validator: 'requirementAnchors',
+    title: 'Requirement tag cites a requirement nobody declares',
+    help: 'An `@implements` or `@req` tag cites a requirement that no spec or requirement document declares, or a bare ID that several documents declare. Qualify it with the Spec ID (`@implements acme.billing#FR-003`), fix the ID, or remove the tag.',
+    suppress: null,
+  },
+  ANC008: {
+    validator: 'requirementAnchors',
+    title: 'Requirement tag cites a retired requirement',
+    help: 'The tag cites a requirement of a retired or superseded spec. Point it at the requirement that replaced it, or remove it if the code no longer implements anything that spec described.',
+    suppress: null,
+  },
+  ANC009: {
+    validator: 'requirementAnchors',
+    title: 'Anchor lock has conflicting entries for one link',
+    help: 'Two lines of `.docguard-anchor-lock.jsonl` record the same link with different content, usually after a union merge of two branches that both reviewed it. The link is treated as suspect until someone reviews it: `docguard anchors accept --link <key> --reason "…"` rewrites one entry.',
+    suppress: null,
+  },
+  ANC010: {
+    validator: 'requirementAnchors',
+    title: 'Requirement anchors were read at a lower tier',
+    help: 'Some links could not be compared or placed at their exact tier: a parser is unavailable (Babel, python3), a file does not parse, a different interpreter version recorded the lock, or the anchor cache under `.docguard/` is tracked by git and was ignored. Those links fall back to the pattern or file tier, which is less precise. Install the parser or fix the file; untrack `.docguard/` with `git rm --cached -r .docguard`.',
+    suppress: null,
+  },
+  ANC011: {
+    validator: 'requirementAnchors',
+    title: 'Requirement anchor covers only volatile lines',
+    help: 'Every line of the code this tag anchors carries a `docguard:volatile` marker, so its fingerprint is a placeholder and the link can never turn suspect. A marker is for a release-managed value inside code that implements the requirement, not for the code itself. Anchor the tag to that code, or remove the marker. Reported by `docguard anchors` only, never by guard.',
+    suppress: null,
+  },
+  OWN001: {
+    validator: 'docOwnership',
+    title: 'Source directory with no owning doc section',
+    help: 'Under an ownership root, this directory holds source code that no `ownership.entries[].paths` pattern covers. Nobody is named as responsible for documenting it, so a change there has no doc to update. It is reported at the highest directory with no owned file in it, not once per file. Add the directory to the paths of the doc section that describes it, or add an entry. Test, fixture and example paths are skipped under the default roots; a declared root is checked as declared.',
+    suppress: null,
+  },
+  OWN002: {
+    validator: 'docOwnership',
+    title: 'Two ownership entries are equally specific for one file',
+    help: 'Two entries match the same file with equal specificity (an exact file path beats any glob; a longer literal directory prefix beats a shorter one), so the file has no single owner and the two docs will drift apart. Narrow one entry, or name the file exactly in the entry that owns it.',
+    suppress: null,
+  },
+  OWN003: {
+    validator: 'docOwnership',
+    title: 'Ownership pattern or root matches nothing',
+    help: "An `ownership` entry's path pattern, or an ownership root, matches no tracked file, usually because the code moved. Low confidence when other patterns of the same entry still match. Point it at where the code lives now, or remove it.",
+    suppress: null,
+  },
+  OWN004: {
+    validator: 'docOwnership',
+    title: 'Ownership entry names a missing doc or section',
+    help: 'An `ownership` entry names a doc that does not exist, or a `section` that is neither a `docguard:section` id nor a heading anchor in that doc. Name an existing doc and section.',
+    suppress: null,
+  },
+  OWN005: {
+    validator: 'docOwnership',
+    title: '.devin/wiki.json breaks a documented Devin rule',
+    help: "The committed `.devin/wiki.json` that steers Devin's DeepWiki breaks a rule from Devin's documentation (checked 2026-09-30): `repo_notes` and `pages` are required, `pages` needs at least one page, titles must be unique and non-empty, every page needs a `purpose`, at most 30 pages (80 on enterprise: set `devinWiki.maxPages`), at most 100 notes counting repo and page notes together, at most 10,000 characters per note. Devin rejects a file without pages; what it does with other violations is not documented.",
+    suppress: null,
+  },
+  OWN006: {
+    validator: 'docOwnership',
+    title: '.devin/wiki.json names a path that does not exist',
+    help: "A note or page purpose in `.devin/wiki.json` names a file or directory (`src/api/`, `docs/x.md`) that is not tracked in the repository. Devin's documentation encourages naming paths but does not check them, so a stale path keeps steering the generated wiki toward code that is gone. This is DocGuard's own rule. Point the note at the path that replaced it, or remove it.",
+    suppress: null,
+  },
+  OWN007: {
+    validator: 'docOwnership',
+    title: 'Ownership map or wiki file is unreadable',
+    help: 'The `ownership` block in `.docguard.json` is malformed (for example `entries` is not a list, or a path uses `..` or an absolute prefix), or `.devin/wiki.json` is not valid JSON. Nothing in it can be trusted, so no path counts as owned. Fix it.',
+    suppress: null,
+  },
+  PSR001: {
+    validator: 'pathScopedRules',
+    title: 'Path-scoped rule matches no tracked file',
+    help: 'A path-scoped agent instruction file (a Claude Code rule or skill `paths:`, a Cursor rule `globs:`, a Copilot `.instructions.md` `applyTo:`, an OpenHands skill `paths:`) has a pattern that matches no tracked file. The harness never loads the rule for that pattern, so its instructions silently stop applying — usually because the code moved. Point the pattern at where the code lives now, or delete the rule. Low confidence when other patterns in the same file still match. `docguard rules --for <path>` shows which rules apply to a path.',
+    suppress: null,
+  },
+  PSR002: {
+    validator: 'pathScopedRules',
+    title: 'Instruction file points at a path that does not exist',
+    help: 'An agent instruction file (AGENTS.md, CLAUDE.md, a rule, a skill) names a file or directory — in backticks, a Markdown link or a table row — that is not tracked in this repository. A pointer is resolved against the instruction file\'s own directory first, then the project root; a bare file name that matches exactly one tracked file counts as resolved; a path the repository\'s ignore rules exclude is treated as a machine-local file and not reported. Point it at the file that replaced it, or remove the reference.',
+    suppress: null,
+  },
+  PSR003: {
+    validator: 'pathScopedRules',
+    title: 'Instructions loaded for a path exceed the budget',
+    help: 'For some tracked path, the instruction files one harness loads (always-on rules, directory files such as nested CLAUDE.md, and the path-scoped rules that match) total more than `agentInstructions.maxBytes` (default 32768). Every byte is paid on every turn, and some harnesses truncate. Nested AGENTS.md chains are measured by STR004 and are not counted here. Narrow the scopes, move procedures into linked docs, or record `agentInstructions.allowances["<harness>:<path>"]` (any path in the reported group, or `"<harness>"` for all) so further growth is a reviewed change.',
+    suppress: null,
+  },
+  PSR004: {
+    validator: 'pathScopedRules',
+    title: 'Instruction scope cannot be read',
+    help: 'The frontmatter of a path-scoped instruction file does not parse, a scope field has the wrong type (`alwaysApply: "yes"`), an unquoted value starts with `*` (YAML reads `globs: **/*` as an alias, not text: quote it), or a `.md` file sits in `.cursor/rules` where Cursor loads only `.mdc`. A scope key the harness does not read (`globs:` in a Claude Code rule) is ignored by it. Claude Code loads a rule whose frontmatter does not parse for every file. A pattern that is valid for the harness but uses syntax DocGuard does not evaluate (`[...]` classes, `!` negation, nested braces) is not a finding: the check reports partial coverage and names the rule.',
+    suppress: null,
+  },
+  SPR008: {
+    validator: 'specRegistry',
+    title: 'Recorded review revision is not on this history',
+    help: 'A spec\'s `lastReviewedRevision` or an outcome revision does not resolve, or is not an ancestor of HEAD. This happens when `specs complete` ran on a PR branch that was then squash-merged: the reviewed commit never reached the default branch, so the next maintenance completion cannot reconcile from it. Run `docguard specs reanchor --id <spec-id> --write` to move the anchor to the commit on this history whose evidence files are byte-identical; if the old revision no longer exists anywhere, pass `--to <revision> --reason <text>` to attest it. To avoid it, run completions on a branch at the default branch\'s tip and commit them once. In a shallow clone ancestry cannot be known, so the check reports partial coverage instead.',
+    suppress: null,
+  },
+  SPR009: {
+    validator: 'specRegistry',
+    title: 'Asset path covers no file',
+    help: 'A spec\'s `reviewed.scope.assetPaths` names files it owns that cannot carry a spec annotation, such as digest-pinned fixtures or recorded outputs; reconciliation links changes under those paths to the spec. An entry ending in `/` covers a directory, any other entry one file. This entry covers no tracked file (no file on disk outside git): the files moved or were removed, so the entry no longer records anything. Remove it, or correct it to the files the spec owns. Editing `assetPaths` is a reviewed change, like `canonicalDocs`.',
+    suppress: null,
+  },
+  SPR007: {
+    validator: 'specRegistry',
+    title: 'As-built spec drifted from its source paths',
+    help: 'An as-built spec (registry `origin: as_built`, created by `docguard generate --spec <area>`) records the facts under its `sourcePaths` — routes, exported symbols, environment variables, entities — with `<!-- docguard:fact <kind> <key> -->` markers. Guard re-scans those paths: a fact in the code that the spec neither marks nor lists under `## Out of Scope` is unaccounted for, and a marked fact that no longer exists means the spec describes code that changed. Update the spec (add or remove the requirement), or move a deliberately unspecified fact under Out of Scope with a reason. This is an escalation: DocGuard knows the fact changed, not whether the spec or the code is right.',
+    suppress: null,
+  },
+  SPR006: {
+    validator: 'specRegistry',
+    title: 'Tasks checked but no implementation annotation',
+    help: 'A spec has at least one checked task, yet no source file carries `@implements <specId>#<requirement>` for any of its requirements. Implementation evidence is explicit, never inferred from file names, so the lifecycle cannot tell what implements the spec: `reconcile` classifies the changed sources as unsupported, and `specs complete` blocks (SPC004/SPC006). Annotate the implementing code (`// @implements …`, or `# @implements …` in Python, shell and YAML) and run `docguard specs --write`. This is an escalation: if the work has not started, uncheck the tasks instead.',
+    suppress: null,
+  },
+  SPR005: {
+    validator: 'specRegistry',
+    title: 'New spec overlaps prior intent',
+    help: 'Preflight found lexical overlap with a prior spec. This is a review hint, never proof of duplication or delivery. Inspect the prior lifecycle and evidence before adding an explicit supersedes or related relationship.',
     suppress: null,
   },
   XRF001: {
@@ -501,7 +836,7 @@ export const CODES = {
   GST001: {
     validator: 'generatedStaleness',
     title: 'Generated doc stuck in draft',
-    help: 'A docguard:generated doc has sat in `status: draft` beyond the staleness window (default 14 days; `draftStalenessDays` in .docguard.json). Draft the prose (e.g. `/docguard.fix --doc <name>`) and promote it to status:current, or delete the forgotten skeleton.',
+    help: 'A docguard:generated doc has sat in `status: draft` beyond the staleness window (default 14 days; `draftStalenessDays` in .docguard.json). Draft the prose (`docguard fix --doc <name>` prints a research prompt) and promote it to status:current, or delete the forgotten skeleton.',
     suppress: null,
   },
   GST002: {
@@ -542,8 +877,8 @@ export const CODES = {
   },
   API004: {
     validator: 'apiSurface',
-    title: 'Documented endpoint not found in code',
-    help: 'docs-canonical/API-REFERENCE.md documents an endpoint absent from the actual surface. Spec-confirmed absences are errors and `docguard fix --write` removes them; code-scan-only absences are low-confidence warnings ([code-scan — verify]) — verify before pruning.',
+    title: 'Documented endpoint missing from authoritative contract',
+    help: 'docs-canonical/API-REFERENCE.md documents an endpoint absent from the authoritative OpenAPI contract. The contract mismatch is certain; route presence or absence is separate, low-confidence evidence. Reconcile intent, contract, implementation, and documentation manually. DocGuard never deletes an endpoint from negative route-scan evidence.',
     suppress: null,
   },
   API005: {
@@ -632,11 +967,193 @@ export const CODES = {
     help: 'An API doc unit is vague/generic or barely exceeds the signature it documents (deterministic Lazy detector F1 0.95). Document parameters, return, and errors concretely.',
     suppress: '<!-- docguard:quality api-smell off — your reason -->',
   },
+  EVD001: {
+    validator: 'evidence',
+    title: 'Evidence manifest is invalid',
+    help: 'The strict `.docguard-evidence.json` contract is malformed, unsafe, duplicated, or combines an adapter with an incompatible predicate. Compare it with `templates/evidence-manifest.json`, repair the named field, and rerun `docguard verify --evidence`.',
+    suppress: null,
+  },
+  EVD002: {
+    validator: 'evidence',
+    title: 'Declared evidence contradicts documentation',
+    help: 'A unique Markdown statement and its current declared source disagree under an exact predicate. Review approved intent before changing either side; implementation may have regressed from the document.',
+    suppress: null,
+  },
+  EVD003: {
+    validator: 'evidence',
+    title: 'Saved evidence is stale',
+    help: 'A saved oasdiff or Buf report names an input whose current SHA-256 differs from the declared snapshot. Regenerate the upstream report with the recorded command and producer version, update every input digest, then review the dependent statement.',
+    suppress: null,
+  },
+  EVD004: {
+    validator: 'evidence',
+    title: 'Evidence verification is inconclusive',
+    help: 'DocGuard could not safely and uniquely read the declaration, document statement, source, or report. Restore the evidence or narrow the target; missing evidence never becomes a pass.',
+    suppress: null,
+  },
+  EVD005: {
+    validator: 'evidence',
+    title: 'Evidence format is unsupported',
+    help: 'The adapter version, command, source type, report shape, or predicate is outside the implemented contract. Keep the finding visible and contribute a synthetic failing fixture plus a neighboring valid control before expanding support.',
+    suppress: null,
+  },
+  // docguard.ignore-reasons#FR-005 — `.docguardignore` entry hygiene.
+  IGN001: {
+    validator: 'suppressions',
+    title: 'Ignore entry expired',
+    help: 'A `.docguardignore` entry carries `expires:YYYY-MM-DD` and that day has passed (UTC). It no longer excludes anything: DocGuard validates the paths it used to hide, so findings in them can appear in this run. If the reason still holds, set a new date; otherwise delete the line. `docguard ignore` lists every entry with its reason and expiry. Opt out of these checks with `"validators": { "suppressions": false }`.',
+    suppress: null,
+  },
+  IGN002: {
+    validator: 'suppressions',
+    title: 'Ignore entry has no reason',
+    help: '`"suppressions": { "requireReason": true }` is set and this `.docguardignore` entry has no trailing `# reason`. The entry still applies. Write why the path is excluded after the pattern, e.g. `legacy/  # removed with the v2 API`. A reason of 8 or more characters is also what `docguard ignore --format claimspec` needs to export the entry.',
+    suppress: null,
+  },
+  IGN003: {
+    validator: 'suppressions',
+    title: 'Ignore entry unreadable',
+    help: 'This `.docguardignore` line has an `expires:` value that is not a calendar date written YYYY-MM-DD, or an expiry or reason with no pattern. DocGuard cannot tell when the entry should end, so it excludes nothing. Write the date as `expires:2026-12-31`, or remove the token.',
+    suppress: null,
+  },
 };
 
 /**
- * Build a Finding with sane defaults. `reportable` defaults to true for
- * low-confidence findings — low confidence IS the feedback signal.
+ * Codes a lifecycle command prints when it refuses to act. They are not
+ * findings: guard never reports them, so `findingSeverity`, SARIF and
+ * feedback do not read this table. `docguard explain` and the MCP explain
+ * tool do, so every blocker a command prints can be looked up.
+ * @implements docguard.first-spec-preflight#FR-007
+ */
+export const BLOCKER_CODES = { __proto__: null,
+  SPC001: {
+    command: 'docguard specs complete | approve | reanchor',
+    title: 'Spec, registry or working tree not ready',
+    help: 'The command cannot identify what it acts on, or the repository is not in a state it can record. Causes: `--id` is missing or names no spec in the registry; the committed `.docguard-specs.json` is missing or stale (run `docguard specs --write`, review and commit it); the spec is retired; completion found no Git HEAD, or tracked files changed since the recorded revision (commit them first; the lifecycle files completion itself writes are allowed).',
+  },
+  SPC002: {
+    command: 'docguard specs complete | approve',
+    title: 'Lifecycle state does not allow this transition',
+    help: 'Completion needs an approved spec whose delivery is in_progress or implemented, or a verified or released living spec for a maintenance outcome. Record approval, and the delivery state, with `docguard specs approve --id <spec-id> [--delivery in_progress|implemented] --write`; a person runs it and the registry diff is reviewed in the pull request. `approve` refuses verified and released (only `specs complete` records them) and refuses to move a verified or released spec back.',
+  },
+  SPC003: {
+    command: 'docguard specs complete',
+    title: 'Task ledger incomplete',
+    help: 'The spec has a tasks.md and not every task is checked, or it has no task ledger and is not a living verification contract. Finish and check the tasks, or uncheck none you have not done; a living spec with qualified evidence for every requirement may omit tasks.md.',
+  },
+  SPC004: {
+    command: 'docguard specs complete',
+    title: 'Requirement evidence missing',
+    help: 'Completion needs at least one source file annotated `@implements <specId>#<requirement>`, at least one test annotated `@req <specId>#<requirement>`, and implementation or test evidence for every requirement the spec declares. Add the annotations, then run `docguard specs --write`. Bare `FR-001` references do not count: the same local ID appears in many specs.',
+  },
+  SPC005: {
+    command: 'docguard specs complete',
+    title: 'Affected canonical documents not recorded',
+    help: 'The registry entry names no canonical document the spec affected (`reviewed.scope.canonicalDocs`), or names one that does not exist. List the documents the change updated; this is a reviewed field, edited by hand and reviewed in the pull request.',
+  },
+  SPC006: {
+    command: 'docguard specs complete',
+    title: 'Reconciliation incomplete',
+    help: 'Completion reconciles every file changed since the review baseline. It blocks when there is no baseline (pass `--since <ref>` the first time), when the plan is unsupported, when a changed file traces to no spec (annotate it, list files that cannot carry an annotation under `reviewed.scope.assetPaths`, or, for a removed file, name its path in the spec that removes it), or when a living spec\'s maintenance completion has no new linked change since its last reviewed revision. `docguard reconcile --since <ref>` shows the classification.',
+  },
+  SPC007: {
+    command: 'docguard specs complete',
+    title: 'Guard has errors',
+    help: 'Completion runs guard and refuses while it reports errors. Run `docguard guard`, fix the errors, commit, and complete again.',
+  },
+  SPC008: {
+    command: 'docguard specs reanchor',
+    title: 'Re-anchor target not established',
+    help: 'Re-anchoring moves a recorded revision that a squash merge discarded (SPR008). It blocks when no commit on HEAD\'s first-parent history carries the reviewed evidence unchanged, when the old revision no longer resolves, or when `--to` names no commit on HEAD\'s history. Pass `--to <revision>` (a SHA, branch, tag or HEAD; the full SHA is recorded) with `--reason` to attest the anchor, and `--from <revision>` when one spec has dangling revisions from different merges.',
+  },
+};
+
+export const SUGGESTION_KINDS = Object.freeze(['fix', 'suppress', 'review', 'report']);
+export const DISPOSITIONS = Object.freeze(['act', 'escalate']);
+export const PARSER_TIERS = Object.freeze(['js-ast', 'py-ast', 'regex-fallback', 'fallback-language', 'mixed', 'not-applicable']);
+// Kinds where DocGuard names the correction itself. Everything else is a
+// signal for the reader to judge.
+const ACT_KINDS = new Set(['fix', 'suppress']);
+
+const RUNNING_VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8')).version || null;
+  } catch { return null; }
+})();
+
+// Per-code evidence is identical for every finding of that code in a run, so
+// project it once. A run with 249 findings (a real monorepo) must not build
+// 249 copies of the same object.
+const evidenceCache = new Map();
+function findingEvidence(code) {
+  const key = typeof code === 'string' ? code : '';
+  let cached = evidenceCache.get(key);
+  if (cached) return cached;
+  const e = evidenceForCode(key);
+  cached = e.status !== 'measured'
+    ? Object.freeze({ status: 'not-measured' })
+    : Object.freeze({
+        status: 'measured',
+        n: e.precisionDenominator,
+        precision: e.quotable ? e.precision : null,
+        precisionInterval: e.precisionInterval,
+        quotable: e.quotable === true,
+        measuredOnVersion: PRECISION_EVIDENCE.source.toolVersion,
+        measuredOnRunningVersion: PRECISION_EVIDENCE.source.toolVersion === RUNNING_VERSION,
+      });
+  evidenceCache.set(key, cached);
+  return cached;
+}
+
+/**
+ * A location is a string or null — never an object. An emitter that passes
+ * `{ file, line }` (api-doc-smells did) used to render as `[object Object]`
+ * and defeat SARIF's location parser; normalize it here so the contract holds
+ * regardless of the call site.
+ */
+function normalizeLocation(loc) {
+  if (loc == null) return null;
+  if (typeof loc === 'string') return loc || null;
+  if (typeof loc === 'object') {
+    const file = typeof loc.file === 'string' ? loc.file : typeof loc.path === 'string' ? loc.path : '';
+    if (!file) return null;
+    return Number.isInteger(loc.line) && loc.line > 0 ? `${file}:${loc.line}` : file;
+  }
+  return null;
+}
+
+/** A code's registered default enforcement level, or null (docguard.agent-instruction-budget#FR-004). */
+export function codeDefaultLevel(code) {
+  const level = typeof code === 'string' ? CODES[code.toUpperCase()]?.defaultLevel : undefined;
+  return level === 'info' ? level : null;
+}
+
+/**
+ * Build a Finding with sane defaults.
+ *
+ * Three orthogonal channels (docguard.calibrated-finding-channels):
+ *   severity    — does CI block?
+ *   disposition — who decides, tool or reader? Derived from suggestion.kind
+ *                 unless set explicitly; defaults to 'escalate' when there is
+ *                 no valid suggestion (fail closed on triage: a finding DocGuard
+ *                 cannot say how to fix is one a human should look at).
+ *   evidence    — has the reviewed corpus measured this code? Attached per
+ *                 finding so a reader never mistakes an asserted prior for a
+ *                 measured rate.
+ *
+ * A suggestion whose `kind` is not a supported value is malformed and is
+ * omitted (adoption-workflow-integrity#FR-002), never coerced: a typo must
+ * not silently turn 'fix' into 'review'. A suggestion with text but NO kind
+ * is the legacy shape and stays a 'review' nudge.
+ *
+ * `reportable` is true when the code is unmeasured or confidence is low.
+ * Deriving it from confidence alone made the feedback loop sample only the
+ * findings it already doubted — the population where a wrong label is most
+ * costly (confident, never measured) was excluded by default.
+ *
+ * `severity` is `error` or `warn`; anything else becomes `warn`. A detector
+ * that means "informational" registers `defaultLevel: 'info'` for its code
+ * instead: passing `severity: 'info'` here was silently read as a warning.
  *
  * @param {Partial<Finding>} f
  * @returns {Finding}
@@ -644,15 +1161,38 @@ export const CODES = {
 export function mkFinding(f) {
   const severity = f.severity === 'error' ? 'error' : 'warn';
   const confidence = f.confidence === 'low' ? 'low' : 'high';
+  const rawSuggestion = f.suggestion;
+  let suggestion = null;
+  if (rawSuggestion && typeof rawSuggestion === 'object'
+    && typeof rawSuggestion.text === 'string' && rawSuggestion.text.trim()) {
+    const kind = rawSuggestion.kind === undefined || rawSuggestion.kind === null ? 'review' : rawSuggestion.kind;
+    if (SUGGESTION_KINDS.includes(kind)) {
+      suggestion = {
+        kind,
+        text: rawSuggestion.text.trim(),
+        ...(typeof rawSuggestion.command === 'string' && rawSuggestion.command.trim()
+          ? { command: rawSuggestion.command.trim() } : {}),
+        ...(typeof rawSuggestion.pragma === 'string' && rawSuggestion.pragma.trim()
+          ? { pragma: rawSuggestion.pragma.trim() } : {}),
+      };
+    }
+  }
+  const disposition = DISPOSITIONS.includes(f.disposition)
+    ? f.disposition
+    : suggestion && ACT_KINDS.has(suggestion.kind) ? 'act' : 'escalate';
+  const evidence = findingEvidence(f.code);
   return {
     code: f.code || null,
     validator: f.validator || null,
     severity,
     confidence,
+    disposition,
+    evidence,
+    parserTier: PARSER_TIERS.includes(f.parserTier) ? f.parserTier : 'not-applicable',
     message: f.message || '',
-    location: f.location || null,
-    suggestion: f.suggestion || null,
-    reportable: f.reportable === true || confidence === 'low',
+    location: normalizeLocation(f.location),
+    suggestion,
+    reportable: f.reportable === true || confidence === 'low' || evidence.status === 'not-measured',
     redactedContext: f.redactedContext || null,
   };
 }
@@ -684,6 +1224,9 @@ export function resultFromFindings(findings, opts = {}) {
   return res;
 }
 
+/** One inline pragma: `docguard:ignore[-secret] [CODES]`. Shared by `suppressesCode` and `parseInlinePragma`. */
+const PRAGMA_RE = /docguard:ignore(-secret)?\b[ \t]*([A-Za-z0-9_,*-]+)?/i;
+
 /**
  * Does an inline `docguard:ignore` pragma in `text` suppress finding `code`?
  *
@@ -701,7 +1244,7 @@ export function resultFromFindings(findings, opts = {}) {
  */
 export function suppressesCode(text, code) {
   if (!text || !code) return false;
-  const m = text.match(/docguard:ignore(-secret)?\b[ \t]*([A-Za-z0-9_,*-]+)?/i);
+  const m = text.match(PRAGMA_RE);
   if (!m) return false;
   if (m[1]) return /^SEC/i.test(code);            // ignore-secret alias
   const arg = (m[2] || '').trim();
@@ -712,6 +1255,39 @@ export function suppressesCode(text, code) {
     if (tok.endsWith('*')) return code.toUpperCase().startsWith(tok.slice(0, -1).toUpperCase());
     return tok.toUpperCase() === code.toUpperCase();
   });
+}
+
+/**
+ * Read an inline pragma's codes and the reason written after them — the
+ * in-process model of a `docguard:ignore` suppression (docguard.ignore-reasons#FR-006).
+ *
+ * Codes are read exactly as `suppressesCode` reads them, so the model never
+ * disagrees with what is suppressed: `null` means any code (bare form or
+ * `all`), and `docguard:ignore-secret` is `['SEC*']`. The reason is the text
+ * after the code list, with a leading separator (`—`, `–`, `:`, `-`, `--`) and
+ * a trailing comment terminator (`-->`, `*\/`) removed; `null` when absent.
+ *
+ * @param {string} text
+ * @returns {{codes: string[]|null, reason: string|null}|null} null when no pragma
+ * @implements docguard.ignore-reasons#FR-006
+ */
+export function parseInlinePragma(text) {
+  if (!text) return null;
+  const source = String(text);
+  const m = source.match(PRAGMA_RE);
+  if (!m) return null;
+  let codes;
+  if (m[1]) {
+    codes = ['SEC*'];
+  } else {
+    const tokens = (m[2] || '').split(',').map((s) => s.trim()).filter(Boolean);
+    codes = tokens.length === 0 || tokens.some((t) => t.toLowerCase() === 'all') ? null : tokens;
+  }
+  const reason = source.slice(m.index + m[0].length)
+    .replace(/\s*(?:-->|\*\/)\s*$/, '')
+    .replace(/^\s*(?:[—–:]|-{1,2})\s*/, '')
+    .trim();
+  return { codes, reason: reason || null };
 }
 
 /**

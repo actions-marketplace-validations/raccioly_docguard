@@ -1,6 +1,6 @@
 # AI Agent Instructions — DocGuard
 
-<!-- docguard:last-reviewed 2026-07-03 -->
+<!-- docguard:last-reviewed 2026-10-13 -->
 
 > This project follows **Canonical-Driven Development (CDD)**.
 > Documentation is the source of truth. Read before coding.
@@ -22,7 +22,7 @@
 - **Runtime**: Node.js 18+
 - **Dependencies**: One — `@babel/parser` (exact-pinned, optional-load); Node.js built-ins otherwise
 - **Testing**: `node:test` (built-in)
-- **Distribution**: npm + PyPI
+- **Distribution**: npm + PyPI; the release also publishes the MCP server image to GHCR, the Claude Desktop MCPB bundle and the Homebrew tap
 - **Version**: see `package.json` (single source of truth — do not hardcode here)
 
 ## Key Files
@@ -30,7 +30,7 @@
 | File | Purpose |
 |------|---------|
 | `docs-canonical/ARCHITECTURE.md` | System design |
-| `docs-canonical/DATA-MODEL.md` | Database schemas |
+| `docs-canonical/DATA-MODEL.md` | Config, file formats and output contracts |
 | `docs-canonical/SECURITY.md` | Auth & secrets |
 | `docs-canonical/TEST-SPEC.md` | Test requirements |
 | `docs-canonical/ENVIRONMENT.md` | Environment setup |
@@ -49,9 +49,16 @@ code-truth sections), `score` (CDD maturity 0-100).
 
 **Tools** — `demo` (zero-install tour), `diagnose` (guard → AI fix prompts),
 `fix` (AI fix instructions; `--doc <name>`), `generate` (reverse-engineer docs;
-`--plan`), `explain` (explain a validator/warning), `memory` (what DocGuard
-remembers), `trace` (requirements traceability; `--reverse`), `upgrade` (migrate
-config/CLI), `watch` (live re-guard).
+`--plan`; `--spec <area>` for an as-built Spec Kit spec), `agent` (task graph; `--task <text>` for bounded current evidence),
+`retire` (remove reviewed docs from active context),
+`specs` (check/refresh/preflight/approve/complete the spec lifecycle registry; `require` for the spec-first gate; `reanchor` for a squash-discarded revision),
+`reconcile` (classify code/spec changes since a Git ref without rewriting intent),
+`review` (doc sections whose covered code changed; `--accept`, `--prune`, `--suggest`),
+`anchors` (code→requirement links and whether each changed since review; `accept` records a review),
+`rules` (which instruction files each agent harness loads for a path; `--for <path>`),
+`explain` (explain a validator/warning), `verify` (declared evidence; `--semantic` claims), `ignore` (every suppression with its reason and expiry), `feedback` (report false positives), `mcp` (MCP server; stdio or loopback HTTP; tool calls stay inside the served directory and each `--root`), `report` (compliance bundle), `ci` (guard + score gate), `memory` (what DocGuard
+remembers; `--pack [--symbols]` for the context pack), `trace` (requirements traceability; `--reverse`; `--owners` for the doc ownership map; `--matrix` exports requirement → anchor → test), `upgrade` (check npm for a newer
+release and migrate the config schema; `--apply` also refreshes out-of-date agent files and the registered Spec Kit extension; `--apply --schema-only` stays offline), `watch` (live re-guard).
 
 **`init --with <name>`** scaffolders — `agents`, `hooks`, `ci`, `badge`, `llms`,
 `publish` (also reachable as standalone deprecation aliases).
@@ -62,14 +69,40 @@ config/CLI), `watch` (live re-guard).
 ## Consuming Guard Output (agents)
 
 Prefer the machine contract over parsing prose: `docguard guard --format json`
-returns `status` (PASS/WARN/FAIL, matches exit code 0/2/1), `findings[]`
-(`{code, severity, confidence, message, location, suggestion}`), `nextStep`,
-`reportable[]` (low-confidence findings — verify before acting), `coverage`
-(Markdown tier map incl. `unclassified[]`), and `semanticClaims.count`
+returns `status` (PASS/WARN/FAIL, matches exit code 0/2/1 — but FAIL exits `3`,
+not `1`, when the project has no `.docguard.json`, so branch on `status` rather
+than assuming `1`), `findings[]`
+(`{code, severity, confidence, disposition, evidence, parserTier, message, location, suggestion}`),
+`nextStep`, `reportable[]` (findings whose code is unmeasured or whose
+confidence is low — verify before acting), `coverage`
+(Markdown tier map incl. the `specKit` tier and `unclassified[]`), `evidence`, and `semanticClaims.count`
 (documented numbers not yet verified against code).
 
-- Every finding has a stable code (`STR001`, `ENV003`, `XRF002`, …) — all 27
-  validators emit them. `docguard explain <CODE>` gives the contract and fix.
+When a command is launched from an implicitly selected nested package, inspect
+stderr for repository-root guidance. Human output supplies an exact rerun;
+machine modes emit a `docguard.repository-root-guidance` JSON diagnostic there
+so stdout remains a valid JSON/SARIF/JUnit artifact. The current command still
+checks only the selected package unless it is explicitly rerun with `--dir`.
+
+- Every structured finding has a stable code (`STR001`, `ENV003`, `XRF002`, …).
+  `docguard explain <CODE>` gives the contract and fix.
+- Triage on `disposition`, not on severity alone. `act` means DocGuard asserts a
+  defect and names the correction — apply it. `escalate` means DocGuard observed
+  a signal and the judgement is yours; read the source before changing anything.
+  A high-confidence finding can still be an escalation: FRS002 counts commits
+  exactly and still does not establish that the document is stale.
+- Read `evidence.status` before trusting a confidence label. `measured` quotes
+  the reviewed corpus with `n` and a Wilson interval; `not-measured` means the
+  label is a maintainer's prior that has never been checked against labelled
+  cases. Most codes are unmeasured — that does not make their findings wrong,
+  only unverified.
+- Read `parserTier` when a finding concerns source code. `regex-fallback` or
+  `fallback-language` means an AST was unavailable for that file, so absence of
+  a finding is weak evidence; the owning validator also reports `partial`.
+- When `evidence.configured` is true, inspect `docguard verify --evidence
+  --format json` first. A `verified-within-scope` result covers only its selected
+  statement. Contradictions can indicate code regressions from approved intent;
+  stale reports must be regenerated from their declared inputs.
 - Mechanical fixes go through `docguard fix --write` (provenance-checked,
   fail-closed) — never hand-apply what the tool fixes deterministically.
 - Genuine false positives: suppress at the site with `// docguard:ignore <CODE>`
@@ -78,6 +111,21 @@ returns `status` (PASS/WARN/FAIL, matches exit code 0/2/1), `findings[]`
 - Doc≠code does not mean the doc is wrong — canonical docs are the spec. If the
   code regressed from a documented decision, fix the code or log a
   `// DRIFT: reason` + DRIFT-LOG.md entry instead of rewriting the doc.
+- Treat `specs/` and planning docs as active intent only. Review candidates with
+  `docguard retire --plan`; retire only explicit, clean tracked documents after
+  their shipped outcomes are represented in current docs and `CHANGELOG.md`.
+- Run `docguard specs preflight` before drafting and `docguard specs preflight
+  --path <spec>` before planning. Refresh `.docguard-specs.json` with `specs
+  --write` and record approval with `specs approve --id <id> --write`; never edit
+  generated intent/evidence fields or treat bare requirement IDs as completion proof.
+- Run `docguard reconcile --since <ref> --format json` before completing a
+  changed feature. Only its mechanical write plan may run automatically;
+  unsupported changes and possible regressions require review. `docguard specs
+  complete` records that review and regenerates the active context projection.
+- For a concrete implementation task, prefer `docguard agent --task <text>
+  --format json`. Follow only selected current evidence, retain its
+  retrieval-only assurance, inspect additional repository facts as needed, and
+  fall back to normal discovery when `selection.status` is `abstained`.
 
 ## AI Skills
 
@@ -89,60 +137,116 @@ DocGuard provides enterprise-grade AI behavior protocols via the Spec Kit extens
 | `docguard-fix` | 7-step research workflow with validation loops (max 3 iterations) |
 | `docguard-review` | Read-only semantic cross-document consistency analysis |
 | `docguard-score` | CDD maturity assessment with ROI-based improvement roadmap |
+| `docguard-sync` | Mechanical code-truth refresh with explicit prose review boundaries |
 
 Skills are located at `extensions/spec-kit-docguard/skills/*/SKILL.md`. They tell agents **how to think**, not just what to run.
 
 ## Spec Kit Hooks
 
-DocGuard integrates into the spec-kit workflow:
+DocGuard integrates into the spec-kit workflow. `extensions/spec-kit-docguard/extension.yml`
+is authoritative; a hook is mandatory when its `optional` field is `false`.
 
-| Hook | When | Required? |
-|------|------|-----------|
-| `after_implement` | After `/speckit.implement` | Mandatory |
-| `before_tasks` | Before `/speckit.tasks` | Optional |
-| `after_tasks` | After `/speckit.tasks` | Optional |
+| Hook | Command | Required? |
+|------|---------|-----------|
+| `before_specify` | `speckit.docguard.brief` | Mandatory |
+| `before_tasks` | `speckit.docguard.preflight` | Mandatory |
+| `after_tasks` | `speckit.docguard.score` | Optional |
+| `after_implement` | `speckit.docguard.guard`, then `speckit.docguard.complete` | Mandatory, then optional |
+| `after_converge` | `speckit.docguard.complete` | Optional |
 
 ## Extension Structure
 
 ```
 extensions/spec-kit-docguard/
-├── skills/                    # AI behavior protocols
-│   ├── docguard-guard/SKILL.md
-│   ├── docguard-fix/SKILL.md
-│   ├── docguard-review/SKILL.md
-│   └── docguard-score/SKILL.md
+├── skills/                    # AI behavior protocols (docguard-guard, -fix, -review, -score, -sync)
 ├── scripts/bash/              # Orchestration scripts (--json output)
 ├── commands/                  # Spec Kit slash commands
 ├── templates/                 # Hook registration templates
-└── extension.yml              # Skills, scripts, hooks declaration
+└── extension.yml              # Commands, scripts, hooks declaration
 ```
 
 ## Rules
 
+- **Spec-first (Constitution X).** A change to `cli/**` runs the Spec Kit pipeline:
+  `specs/###-slug/` spec → plan → tasks → implement. The PR description names the
+  spec (`specs/015-spec-first-gate` or its Spec ID), or declares one line
+  `Spec-Exempt: <release|deps|typo|test-only> — <reason>`. CI enforces this with
+  `docguard specs require --since origin/main --message-file <body>`. When the area
+  being changed has no spec, write an as-built spec scoped to that area first.
+- **Changes must not make DocGuard slower, noisier or heavier by accident.** The
+  CI `budget` job compares the PR with its base on one runner: guard wall time
+  (×1.15, 150 ms floor), new error findings on this repository, agent-facing
+  bytes (context pack, task packets, MCP responses, llms bundles; +10%), package
+  weight and runtime dependencies. A cost the change needs is declared in the PR
+  body as `Budget-Exempt: <metric> — <reason>`. Reproduce locally with
+  `npm run budget -- --base <base-worktree>` (specs/031-non-regression-budgets).
+  The CI test job fails any single test over 100 seconds at reference-runner
+  speed (`TEST_CEILING_MS`, `tools/suite-runtime-budget.mjs`); the suite total
+  is reported, not gated (specs/051-release-cut-green FR-007, TEST-SPEC.md).
 - **PR-first workflow — no direct-to-main commits.** Create a branch (`git checkout -b <type>/<slug>`), push, `gh pr create`, let CI run, self-review, squash-merge. Tag releases only after merge on `main`. The only acceptable direct-to-main: typo fixes in comments or README badge URLs.
 - Never commit without updating CHANGELOG.md
+- Regenerate checked-in generated files in the same change; each has a drift test
+  that fails and names its command: `npm run llms` after editing a canonical or
+  optional doc (`llms.txt`, `llms-full.txt`), `npm run docs:reference` after
+  changing a finding code or a validator's display name (the docs site's
+  finding-code reference), and `npm run generate:precision-evidence` after
+  a reviewed benchmark baseline change (`cli/precision-evidence-data.mjs`).
 - If code deviates from docs, add `// DRIFT: reason`
 - Security rules in SECURITY.md are mandatory
 - Test requirements in TEST-SPEC.md must be met
+- **Tests that build Git repositories pass the fixture options per call.** Every
+  fixture `git` call goes through `tests/helpers/git.mjs` (`FIXTURE_GIT`,
+  `fixtureGit`): hooks and signing off for that call, never for the whole
+  environment, so DocGuard's own Git calls still meet the machine's config. A
+  scan test rejects a direct `git` spawn without a `fixture-git-exempt:`
+  reason, and the CI `hermeticity` job runs the suite under a hostile global
+  config (specs/066-test-git-hermeticity).
+- **Workflow jobs run code without a repository write token.** Workflows default
+  to `contents: read`; a job asks for its own scope. A job that runs tests or
+  DocGuard holds no write permission and checks out with
+  `persist-credentials: false`; a job holding `contents`, `actions`,
+  `pull-requests` or `issues` write runs no package manager, build tool or test.
+  `tests/workflow-permissions.test.mjs` enforces it
+  (specs/068-release-least-privilege).
+- **A changed requirement link is reviewed, not silenced.** This repository
+  commits `.docguard-anchor-lock.jsonl`, so guard reports a link whose code or
+  requirement changed since its review (ANC001, ANC002) or whose tag is gone
+  (ANC003); ANC001 and ANC003 fail guard for a link accepted as reviewed. Read
+  the change, then run `docguard anchors accept --link '<key>'` (or
+  `--file <path> --bulk` for a file you changed) with a `--reason` that says
+  what you checked. Accept only links in files your change touched. The lock
+  merges with `merge=union`: after a rebase, ANC009 means two lines for one
+  link, so restore `origin/main`'s lock and re-accept only your own files.
+  CODEOWNERS sends every lock change to a maintainer
+  (specs/070-requirement-anchors, CI-RECIPES.md Recipe 3f).
 - Run `docguard guard` before pushing — all checks must pass
-- All file writes use `safeWrite()` — backups before overwrite
+- Standalone file writes use `safeWrite()` with backups before overwrite.
+  Lifecycle operations spanning multiple files use `commitFileTransaction()` so
+  preparation, rollback, and post-write validation cover the complete set.
 
 
 ## Agent Rules
 
-### Automated agents / bots (Jules "Sentinel", "Bolt", "Palette", and any auto-PR agent)
-- **Never open a duplicate PR.** Before opening ANY PR, search existing **open
-  AND closed** PRs and issues for the same topic/title. If it exists, STOP — do
-  not open another. (Dozens of duplicate command-injection and diff-optimization
-  PRs were closed as noise.)
-- **Do not re-open resolved work.** See `.jules/sentinel.md` (execSync/command
-  injection — RESOLVED in v0.21.1 + #296) and `.jules/bolt.md` (diff/scan
-  micro-optimizations — already applied; code refactored since). These are
-  historical learnings, **not** standing mandates to re-scan every run.
-- **Bar for a new PR:** a genuinely new, unaddressed finding, with evidence — a
-  concrete exploit path / failing test (security) or a benchmark showing >20%
-  real-workload improvement (performance). A Big-O note alone is insufficient.
-- This repo has **no web UI and no VS Code extension** — skip all UX tasks.
+### Automated agents / bots (Google Jules and any auto-PR agent)
+- **Jules runs only the routines in `.jules/routines/`** (`bug-hunt`,
+  `test-gaps`, `docs-drift`, weekly), after `.jules/RULES.md`. Each starts with
+  `node .jules/preflight.mjs <routine>`; on `STOP` it ends with no PR.
+  **Never ask a question:** take the pessimistic in-scope option, or end the
+  task with a summary and no PR.
+- **One PR per routine target**, titled `[jules:<routine>] <target> — …`.
+  `.github/scripts/jules-policy.mjs` (via `jules-triage.yml`) closes a PR that
+  is empty, a duplicate of an open PR, work declined in the last 60 days, over
+  the five-PR queue, or off its routine's contract. It never closes a PR for
+  its subject: a security or performance fix reaches a maintainer.
+- **Only new test files merge alone.** `auto-merge.yml` merges a green Jules PR
+  only when every file is a newly added `tests/<name>.test.mjs`, pinned to the
+  head CI verified. Edited tests, fixtures, any Markdown (instruction and
+  prompt files ship to npm), code and CI wait for a maintainer.
+- **Agents never edit an existing test, `CHANGELOG.md`, `.github/`, `.jules/`
+  or instruction files**, and never mention an agent by handle: in Jules'
+  Reactive Mode a mention is an instruction. Setup: `bash .jules/setup.sh`
+  (fails unless the suite and guard are green). Spec:
+  `specs/067-jules-policy`.
 
 ### Dependencies
 - Never add a package without first verifying it exists on the official registry (npm/PyPI).
@@ -154,3 +258,33 @@ extensions/spec-kit-docguard/
 ### CI/CD
 - Never write a workflow using `pull_request_target` with checkout of PR-controlled refs.
 - Always pin third-party GitHub Actions to commit SHA, not @v1 or @main.
+
+## Claim probing (TestGuard)
+
+`testguard.claims.json` states what this codebase guarantees, as claims with
+mechanical faults. `testguard probe` injects each fault and reports the ones the
+suite fails to detect — a test that pins a *defect* stays green under coverage,
+so this is the check that catches it.
+
+This suite runs on `node --test`, which ships no `json` reporter, while TestGuard
+reads Jest-shape JSON. `tools/node-test-json-reporter.mjs` translates between
+them:
+
+```bash
+npx testguard-cli@0.15.0 probe --confirm 3 --serial \
+  --node-modules "$PWD/node_modules" \
+  --runner-cmd "node --test --test-reporter=$PWD/tools/node-test-json-reporter.mjs --test-reporter-destination={out} {files}"
+```
+
+Pass an absolute reporter path: the probe runs in a scratch worktree built from
+a commit, so a relative path resolves there and untracked files do not exist.
+
+`npx testguard-cli@0.15.0 gate --changed origin/main` reports changed source files
+that carry no claim. It does not find bugs; it refuses to let a change land without stating
+what must be true, which is the step that surfaces them. A file the probe cannot
+observe (for example, one that only runs as a subprocess) is excused in
+`testguard.ignore.json`, with a reason that names what protects it instead.
+
+## Evidence and contributions
+
+A structural score is a maturity proxy. Preserve `assurance` and nullable factual accuracy in automation; a clean guard does not establish arbitrary prose correctness. Review human intent separately from generated code facts. To challenge any finding, run `docguard feedback --code <CODE> --preview`, inspect the metadata-only public draft, and check the supplied search link for existing open and closed work. Contribute a synthetic failing example paired with a neighboring valid case. Submission remains opt-in.

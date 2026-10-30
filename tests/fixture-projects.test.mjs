@@ -8,7 +8,7 @@
  * error (B-5 class), this test catches it before release.
  *
  * Why we need this: single-fixture tests can mask env-specific bugs. The
- * wu-whatsappinbox B-5 regression slipped past 434 tests because the
+ * downstream-project B-5 regression slipped past 434 tests because the
  * specific combination of OS + node version + .docguard.json shape wasn't
  * covered. Multi-fixture testing is a low-cost insurance policy.
  *
@@ -24,12 +24,13 @@
  */
 import { describe, it, afterEach } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { runGuardInternal } from '../cli/commands/guard.mjs';
+import { fixtureGit } from './helpers/git.mjs';
+// @implements docguard.test-git-hermeticity#FR-001: this file's fixture git goes through the helper.
 
 function makeRepo(files) {
   const dir = mkdtempSync(join(tmpdir(), 'docguard-fixture-'));
@@ -40,9 +41,9 @@ function makeRepo(files) {
   }
   // git init + commit so validators that need git history have it
   const env = { ...process.env };
-  spawnSync('git', ['init', '-q'], { cwd: dir, env });
-  spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'add', '-A'], { cwd: dir, env });
-  spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { cwd: dir, env });
+  fixtureGit(dir, ['init', '-q'], { env });
+  fixtureGit(dir, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'add', '-A'], { env });
+  fixtureGit(dir, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { env });
   return dir;
 }
 

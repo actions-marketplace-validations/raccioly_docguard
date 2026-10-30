@@ -1,14 +1,15 @@
 import { describe, it, before, after } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { validateDiffSuspicion } from '../cli/validators/diff-suspicion.mjs';
+import { fixtureGit } from './helpers/git.mjs';
+// @implements docguard.test-git-hermeticity#FR-001: this file's fixture git goes through the helper.
 
 // Build a real git repo: commit code + doc, then change the code (remove a
 // symbol the doc talks about) so HEAD~1..HEAD carries a removed token.
-function git(dir, ...args) { spawnSync('git', args, { cwd: dir, encoding: 'utf-8' }); }
+function git(dir, ...args) { fixtureGit(dir, args); }
 
 describe('validateDiffSuspicion', () => {
   let dir;
@@ -44,6 +45,8 @@ describe('validateDiffSuspicion', () => {
     assert.match(dsp[0].message, /validatetoken/i);
     // all findings are low-confidence / soft
     assert.ok(dsp.every(f => f.confidence === 'low' && f.severity === 'warn'));
+    assert.ok(dsp.every(f => f.suggestion?.kind === 'review' && f.suggestion?.text));
+    assert.ok(dsp.every(f => !Object.hasOwn(f.suggestion, 'summary')));
   });
 
   it('does NOT flag an unrelated doc', () => {

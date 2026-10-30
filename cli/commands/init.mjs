@@ -1,3 +1,4 @@
+import { assertDefaultDocWrites } from '../shared-doc-roles.mjs';
 /**
  * Init Command — Initialize CDD documentation from templates
  *
@@ -9,22 +10,31 @@
  * with a warning suggesting spec-kit installation.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, lstatSync, realpathSync, copyFileSync, statSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { listCanonicalDocs } from '../shared-ignore.mjs';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { execSync } from 'node:child_process';
 import { c, PROFILES, CURRENT_SCHEMA_VERSION } from '../shared.mjs';
-import { ensureSkills, detectAgentMode, detectAIAgent, isSpecKitAvailable, isSpecKitInitialized, getDetectedAgent, safeSpawnSpecify } from '../ensure-skills.mjs';
+import { detectCanonicalLayout, applyDocRoles, mappedDefaultPaths } from '../shared-doc-roles.mjs';
+import { autoDetectProjectType, getProjectTypeDefaults } from '../config.mjs';
+import { hasE2ESuite } from '../shared-source.mjs';
+import { detectProjectProfile } from '../scanners/project-type.mjs';
+import { ensureSkills, detectAgentMode } from '../ensure-skills.mjs';
+import { delegateSpecKitInit, MIN_SPEC_KIT_VERSION } from '../spec-kit-delegation.mjs';
+import { readAgentSurface, readIntegrationLayout, readExtensionCommands, agentCommand, commandHint } from '../agent-surface.mjs';
+import { safeWrite } from '../writers/generate-io.mjs';
+import { buildMemoryPlan } from '../scanners/memory-plan.mjs';
 
 // v0.20: scaffolder names that can be passed via `init --with <name>` and
-// dispatched to the corresponding standalone runner. Each name maps to its
-// canonical command module. Keep in sync with cli/docguard.mjs router.
+// dispatched to their writers. CI scaffolding is distinct from the standalone
+// `ci` validation gate; it copies the maintained workflow starter.
 const SCAFFOLDER_DISPATCH = {
+  __proto__: null,
   agents:  async (dir, cfg, flags) => (await import('./agents.mjs')).runAgents(dir, cfg, flags),
   hooks:   async (dir, cfg, flags) => (await import('./hooks.mjs')).runHooks(dir, cfg, flags),
-  ci:      async (dir, cfg, flags) => (await import('./ci.mjs')).runCI(dir, cfg, flags),
+  ci:      (dir, cfg, flags) => scaffoldCI(dir, flags),
   badge:   async (dir, cfg, flags) => (await import('./badge.mjs')).runBadge(dir, cfg, flags),
   llms:    async (dir, cfg, flags) => (await import('./llms.mjs')).runLlms(dir, cfg, flags),
   publish: async (dir, cfg, flags) => (await import('./publish.mjs')).runPublish(dir, cfg, flags),
@@ -57,27 +67,50 @@ async function runScaffolders(projectDir, config, flags, names) {
   }
 }
 
-function detectProjectType(dir) {
-  const pkgPath = resolve(dir, 'package.json');
-  if (existsSync(pkgPath)) {
-    try {
-      const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-      const allDeps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-      if (pkg.bin) return 'cli';
-      if (allDeps.next || allDeps.react || allDeps.vue || allDeps['@angular/core'] ||
-          allDeps.svelte || allDeps.nuxt) return 'webapp';
-      if (allDeps.express || allDeps.fastify || allDeps.hono || allDeps.koa) return 'api';
-      if (pkg.main || pkg.exports || pkg.module) return 'library';
-    } catch { /* fall through */ }
-  }
-  if (existsSync(resolve(dir, 'manage.py'))) return 'webapp';
-  if (existsSync(resolve(dir, 'setup.py')) || existsSync(resolve(dir, 'pyproject.toml'))) return 'library';
-  return 'unknown';
-}
+// Project-type detection lives in config.mjs. This file used to carry its own
+// copy, which never learned about Cloudflare Workers, so `init` typed a Worker as
+// a library and disabled the env/database/E2E checks that matter most for it.
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const TEMPLATES_DIR = resolve(__dirname, '../../templates');
+
+function scaffoldCI(projectDir, flags) {
+  // Resolve the user's root once (e.g. macOS /tmp), then refuse symlinks in
+  // every destination component, including the backup safeWrite will use.
+  const root = realpathSync(projectDir);
+  const target = resolve(root, '.github/workflows/docguard.yml');
+  let existing;
+  for (const [path, directory] of [
+    [resolve(root, '.github'), true],
+    [dirname(target), true],
+    [target, false],
+    [target + '.bak', false],
+  ]) {
+    let stat;
+    try { stat = lstatSync(path); } catch (err) {
+      if (err.code === 'ENOENT') continue;
+      throw err;
+    }
+    if (stat.isSymbolicLink() || (directory ? !stat.isDirectory() : !stat.isFile())) {
+      throw new Error(`Unsafe CI scaffold path: ${path} (expected a real ${directory ? 'directory' : 'file'}, not a symlink)`);
+    }
+    if (!directory && stat.nlink > 1) throw new Error(`Unsafe CI scaffold path: ${path} (hard-linked file)`);
+    if (path === target) existing = stat;
+  }
+  if (existing && !flags.force) {
+    console.log(`  ${c.dim}⏭️  .github/workflows/docguard.yml exists; use --force to overwrite${c.reset}`);
+    return;
+  }
+  // Copy literally: the starter's fixed package pin is release-tested, and
+  // GitHub expressions must not go through canonical-doc interpolation.
+  const content = readFileSync(resolve(TEMPLATES_DIR, 'ci/github-actions.yml'), 'utf-8');
+  // safeWrite's generic backup is best-effort and skips empty files. Here a
+  // forced replacement requires a successful backup, including empty files.
+  if (existing) copyFileSync(target, target + '.bak');
+  safeWrite(target, content);
+  console.log(`  ${c.green}✅ .github/workflows/docguard.yml ${existing ? 'replaced (backup: docguard.yml.bak)' : 'created'}${c.reset}`);
+}
 
 /**
  * v0.28 (field report #11): inject a `<!-- docguard:last-reviewed DATE -->`
@@ -105,7 +138,126 @@ function askQuestion(prompt) {
   });
 }
 
+/**
+ * Confirm where a project actually keeps its canonical documents.
+ *
+ * Runs before init creates anything. If the role filenames already exist
+ * somewhere other than the directory the config points at, say so and offer to
+ * adopt that location, instead of reporting "no canonical docs" and scaffolding
+ * a second copy next to the real one.
+ *
+ * Writes `docs.roles` (the mechanism every validator already resolves through)
+ * plus a matching `requiredFiles.canonical`. Declaring only the latter leaves
+ * the content validators walking the conventional directory, where they find
+ * nothing and report "no matches" — checks disappear without anyone saying so.
+ *
+ * @returns {Promise<Record<string,string>|null>} adopted roles, or null
+ */
+async function confirmCanonicalLocation(projectDir, flags) {
+  const configPath = resolve(projectDir, '.docguard.json');
+  let existing = {};
+  if (existsSync(configPath)) {
+    try { existing = JSON.parse(readFileSync(configPath, 'utf-8')); } catch { return false; }
+  }
+  // An explicit mapping is the user's answer already; do not second-guess it.
+  if (existing.docs?.roles) return null;
+
+  const hits = detectCanonicalLayout(projectDir).filter(h => h.count >= 2);
+  if (hits.length === 0) return null;
+  const best = hits[0];
+  if (best.dir === 'docs-canonical') return null; // already conventional
+
+  console.log(`\n${c.bold}📁 Found existing canonical documents${c.reset}`);
+  console.log(`${c.dim}   DocGuard defaults to docs-canonical/, but ${Object.keys(best.roles).length} of its documents${c.reset}`);
+  console.log(`${c.dim}   already live in ${c.reset}${c.cyan}${best.dir}/${c.reset}${c.dim}:${c.reset}`);
+  for (const [role, path] of Object.entries(best.roles)) {
+    console.log(`     ${c.green}•${c.reset} ${path} ${c.dim}(${role})${c.reset}`);
+  }
+
+  if (!flags.skipPrompts && !flags.force) {
+    const answer = (await askQuestion(`\n   Use ${best.dir}/ as the canonical location? [Y/n] `)).trim().toLowerCase();
+    if (answer === 'n' || answer === 'no') {
+      console.log(`${c.dim}   Keeping docs-canonical/. Map them later with docs.roles in .docguard.json.${c.reset}\n`);
+      return null;
+    }
+  } else {
+    // Non-interactive: adopting what is on disk is the safe default, because
+    // the alternative is scaffolding a duplicate the user never asked for.
+    console.log(`${c.dim}   Adopting ${best.dir}/ (non-interactive).${c.reset}`);
+  }
+
+  // Deliberately no write here. init owns the single .docguard.json write, so a
+  // run that fails later leaves no half-configured project behind, and the
+  // adopted mapping reaches the full generated config instead of short-circuiting
+  // it with a two-key file that has no profile, projectType or validators.
+  console.log(`  ${c.green}✅${c.reset} Canonical documents will be read from ${c.cyan}${best.dir}/${c.reset}\n`);
+  return best.roles;
+}
+
 // ── Init Command ─────────────────────────────────────────────────────────
+
+
+/**
+ * The `.docguard.json` init writes: one shape for the skeleton path and the
+ * smart path, so both record the same facts.
+ * @implements docguard.output-ux#FR-007
+ */
+function buildInitConfig({ projectDir, config, profileName, profile, detectedType, canonical, adoptedOrConfiguredRoles = {} }) {
+  // Shared with runtime config loading, so a type means the same thing wherever
+  // it is decided. Only the four documented booleans are written.
+  const shared = getProjectTypeDefaults(detectedType);
+  const ptc = {
+    needsEnvVars: shared.needsEnvVars,
+    needsEnvExample: shared.needsEnvExample,
+    // A detected suite outranks the type default, which is only a guess.
+    needsE2E: shared.needsE2E || hasE2ESuite(projectDir),
+    needsDatabase: shared.needsDatabase,
+  };
+
+  const defaultConfig = {
+    // v0.15-P4: $schema reference enables VS Code / IDE autocomplete +
+    // validation for .docguard.json fields. Picked up by any
+    // JSON-Schema-aware editor; ignored by DocGuard itself.
+    $schema: 'https://raccioly.github.io/docguard/schemas/docguard-config.schema.json',
+    projectName: config.projectName,
+    version: CURRENT_SCHEMA_VERSION, // single source of truth (shared.mjs) — never hardcode
+    profile: profileName,
+    projectType: detectedType,
+    projectTypeConfig: ptc,
+    // Present only for a mapped layout; a default layout needs no docs.roles.
+    ...(Object.keys(adoptedOrConfiguredRoles).length
+      ? { docs: { ...(config.docs || {}), roles: { ...adoptedOrConfiguredRoles } } }
+      : {}),
+    // Mapped documents are canonical too: list them beside the scaffolded ones,
+    // or adoption silently drops them from every check.
+    requiredFiles: {
+      canonical: [...canonical, ...Object.values(adoptedOrConfiguredRoles)].sort(),
+    },
+    validators: profile.validators || {
+      structure: true,
+      docsSync: true,
+      drift: true,
+      changelog: true,
+      architecture: false,
+      testSpec: true,
+      security: false,
+      environment: true,
+      freshness: true,
+    },
+    // Per-validator severity overrides (v0.5+).
+    //   'high':   warnings from this validator fail CI (exit 1)
+    //   'medium': default — warnings exit 2 (informational)
+    //   'low':    warnings ignored for exit code (exit 0)
+    // Empty by default — every validator uses 'medium'. Add entries to dial
+    // strictness up (CI-critical checks) or down (experimental validators).
+    severity: {},
+    // Exact stable-code overrides. Use this when one rule needs a different
+    // policy without weakening or escalating every finding in its validator.
+    findingSeverity: {},
+  };
+
+  return defaultConfig;
+}
 
 /**
  * v0.21 — Smart first-run detection.
@@ -128,6 +280,8 @@ function askQuestion(prompt) {
  *
  * @returns {boolean} true if smart-detection fired and dispatched
  */
+const PYTHON_WEB_FRAMEWORKS = new Set(['Django', 'Flask', 'FastAPI', 'Starlette']);
+
 function shouldRunGenerate(projectDir, flags) {
   if (flags.skeleton)        return false; // explicit opt-out
   if (flags.skipPrompts)     return false; // non-interactive (CI) keeps deterministic skeleton path
@@ -140,11 +294,27 @@ function shouldRunGenerate(projectDir, flags) {
   // detected as already-initialized, or the wizard re-triggers on every run.
   if (listCanonicalDocs(projectDir).length > 0) return false;
 
+  // listCanonicalDocs only walks the directories the config points at, so a
+  // project keeping the same documents somewhere else (docs/canonical/) read as
+  // EMPTY. Init then offered to reverse-engineer docs from code and would
+  // scaffold a second canonical directory beside the real one. Look for the
+  // role filenames anywhere before concluding a project has no documentation.
+  if (detectCanonicalLayout(projectDir).some(hit => hit.count >= 2)) return false;
+
   // Existing-code signals: any of cli/, src/, lib/, app/ as a directory.
   const codeDirs = ['cli', 'src', 'lib', 'app'];
   for (const d of codeDirs) {
     if (existsSync(resolve(projectDir, d))) return true;
   }
+
+  // Python web layouts keep their code in a project package and app packages
+  // (Django: manage.py, mysite/, blog/), not in src/ or app/.
+  // @implements docguard.python-extraction#FR-011
+  if (existsSync(resolve(projectDir, 'manage.py'))) return true;
+  try {
+    const { ecosystems } = detectProjectProfile(projectDir);
+    if (ecosystems.some(e => e.language === 'Python' && PYTHON_WEB_FRAMEWORKS.has(e.framework))) return true;
+  } catch { /* fall through to the file count */ }
 
   // Fallback: count source files at top level (Python / Rust / Go projects
   // often don't use src/ — files live at the root).
@@ -159,11 +329,172 @@ function shouldRunGenerate(projectDir, flags) {
   return false;
 }
 
-export async function runInit(projectDir, config, flags) {
+/**
+ * Print a Spec Kit delegation result. Every failure names its cause and the
+ * command to run by hand; nothing here prints a count it did not measure.
+ *
+ * @implements docguard.specify-init-delegation#FR-007
+ * @implements docguard.specify-init-delegation#FR-008
+ * @implements docguard.specify-init-delegation#FR-010
+ * @implements docguard.specify-init-delegation#FR-011
+ */
+function renderSpecKitDelegation(result, flags) {
+  const integration = result.integration ? ` ${c.dim}(integration: ${result.integration.key})${c.reset}` : '';
+  switch (result.status) {
+    case 'skipped': {
+      const why = flags.noSpecKit
+        ? '--no-spec-kit'
+        : 'starter profile is minimal — pass --spec-kit to include the framework scaffold';
+      console.log(`\n  ${c.dim}⏭️  Spec Kit framework scaffold skipped (${why}).${c.reset}`);
+      return;
+    }
+    case 'unavailable':
+      console.log(`\n  ${c.yellow}⚠️${c.reset}  Spec Kit CLI not found — running DocGuard standalone.`);
+      console.log(`     ${c.dim}DocGuard is a Spec Kit extension. Install Spec Kit (>= ${MIN_SPEC_KIT_VERSION}), then re-run ${c.cyan}docguard init${c.reset}${c.dim}:${c.reset}`);
+      console.log(`     ${c.cyan}uv tool install specify-cli --from git+https://github.com/github/spec-kit.git${c.reset}`);
+      return;
+    case 'unsupported-version':
+      console.log(`\n  ${c.yellow}⚠️${c.reset}  Spec Kit not initialized: ${result.reason}`);
+      console.log(`     ${c.dim}Upgrade, then re-run docguard init:${c.reset} ${c.cyan}${result.manualCommand}${c.reset}`);
+      return;
+    case 'failed':
+      console.log(`\n  ${c.red}❌${c.reset} Spec Kit init failed${integration}: ${result.reason}`);
+      console.log(`     ${c.dim}Continuing with DocGuard standalone. To retry by hand:${c.reset} ${c.cyan}${result.manualCommand}${c.reset}`);
+      return;
+    case 'already-initialized':
+      console.log(`\n  ${c.green}✅${c.reset} Spec Kit already initialized${integration}`);
+      break;
+    case 'initialized':
+      console.log(`\n  ${c.bold}🌱 Spec Kit Integration${c.reset}`);
+      console.log(`  ${c.green}✅${c.reset} Spec Kit initialized${integration}`);
+      break;
+    default:
+      return;
+  }
+  const ext = result.extension;
+  if (ext.status === 'registered') {
+    console.log(`  ${c.green}✅${c.reset} DocGuard extension registered with Spec Kit`);
+  } else if (ext.status === 'refreshed') {
+    console.log(`  ${c.green}✅${c.reset} DocGuard extension updated in Spec Kit ${c.dim}(${ext.from} → ${ext.to})${c.reset}`);
+  } else if (ext.status === 'already-registered') {
+    console.log(`  ${c.green}✅${c.reset} DocGuard extension already registered with Spec Kit`);
+  } else if (ext.status === 'disabled') {
+    console.log(`  ${c.yellow}⚠️${c.reset}  DocGuard extension is registered but disabled${ext.from ? ` (v${ext.from}; this CLI ships v${ext.to})` : ''}. Re-enable it: ${c.cyan}${ext.manualCommand}${c.reset}`);
+  } else if (ext.status === 'unsupported-version') {
+    console.log(`  ${c.yellow}⚠️${c.reset}  DocGuard extension not registered: ${ext.reason}`);
+    console.log(`     ${c.dim}Upgrade, then re-run docguard init:${c.reset} ${c.cyan}${ext.manualCommand}${c.reset}`);
+  } else if (ext.status === 'failed') {
+    console.log(`  ${c.red}❌${c.reset} DocGuard extension registration failed: ${ext.reason}`);
+    console.log(`     ${c.dim}To retry by hand:${c.reset} ${c.cyan}${ext.manualCommand}${c.reset}`);
+  }
+  renderHookStatus(result);
+}
+
+/**
+ * "Hooks active" is said only after every mandatory hook resolved to a file
+ * the agent can run (docguard.spec-kit-integration-honesty#FR-002).
+ *
+ * @implements docguard.spec-kit-integration-honesty#FR-002
+ */
+function renderHookStatus(result) {
+  const commands = result.commands;
+  if (commands?.written?.length) {
+    console.log(`  ${c.green}✅${c.reset} DocGuard's Spec Kit commands written for the generic integration ${c.dim}(${commands.written.length} file${commands.written.length === 1 ? '' : 's'})${c.reset}`);
+  }
+  if (commands?.skipped) console.log(`  ${c.yellow}⚠️${c.reset}  DocGuard's Spec Kit commands not written: ${commands.skipped}`);
+  const hooks = result.hooks;
+  if (!hooks) return;
+  if (hooks.status === 'active') {
+    const list = hooks.resolved.map(h => `${h.event} → ${h.invocation}`).join(', ');
+    console.log(`  ${c.green}✅${c.reset} Workflow hooks active ${c.dim}(${list})${c.reset}`);
+  } else if (hooks.status === 'unresolved' && hooks.unresolved.length) {
+    console.log(`  ${c.yellow}⚠️${c.reset}  Workflow hooks are NOT active — ${hooks.unresolved.length} mandatory hook command(s) have no file:`);
+    for (const h of hooks.unresolved) {
+      console.log(`     ${c.yellow}•${c.reset} ${h.command} ${c.dim}(${h.event}) — expected ${h.path}${c.reset}`);
+    }
+  } else {
+    console.log(`  ${c.yellow}⚠️${c.reset}  Workflow hooks not verified: ${hooks.reason}`);
+  }
+}
+
+/**
+ * Files Spec Kit wrote during this run: everything under `.specify/` plus the
+ * agent files its install manifests and the extension commands name, counted
+ * one by one (docguard.spec-kit-integration-honesty#FR-010).
+ */
+function countSpecKitWrites(projectDir, sinceMs, docguardWritten = []) {
+  const seen = new Set();
+  const walk = (rel) => {
+    let entries;
+    try { entries = readdirSync(resolve(projectDir, rel), { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const child = `${rel}/${e.name}`;
+      if (e.isDirectory()) walk(child);
+      else if (e.isFile()) seen.add(child);
+    }
+  };
+  walk('.specify');
+  try {
+    for (const name of readdirSync(resolve(projectDir, '.specify', 'integrations'))) {
+      if (!name.endsWith('.manifest.json')) continue;
+      const files = JSON.parse(readFileSync(resolve(projectDir, '.specify', 'integrations', name), 'utf-8'))?.files;
+      for (const f of Object.keys(files || {})) seen.add(f);
+    }
+  } catch { /* no manifests */ }
+  const layout = readIntegrationLayout(projectDir);
+  if (layout) for (const { id } of readExtensionCommands()) seen.add(layout.pathFor(id));
+  for (const rel of docguardWritten) seen.delete(rel);
+  let count = 0;
+  for (const rel of seen) {
+    // ctime, not just mtime: specify copies templates with their packaged
+    // modification times, so only the status-change time shows this run wrote them.
+    try {
+      const st = statSync(resolve(projectDir, rel));
+      if (Math.max(st.mtimeMs, st.ctimeMs) >= sinceMs) count++;
+    } catch { /* absent */ }
+  }
+  return count;
+}
+
+export async function runInit(projectDir, configArg, flags) {
+  let config = configArg;
+  // `--list` is read-only inventory owned by the hooks scaffolder. Routing it
+  // through normal init can start prompts or create documentation before the
+  // requested inventory is shown, which violates the command's read-only intent.
+  if (flags.list && Array.isArray(flags.with)) {
+    if (flags.with.length !== 1 || flags.with[0] !== 'hooks') {
+      console.error(`${c.red}--list is supported only with \`docguard init --with hooks\`.${c.reset}`);
+      process.exitCode = 1;
+      return;
+    }
+    const { runHooks } = await import('./hooks.mjs');
+    return runHooks(projectDir, config, flags);
+  }
+  // Ask where the documents live before creating any. The adopted mapping has
+  // to reach the in-memory config as well: the skeleton path below reads it,
+  // and would otherwise create a second canonical directory it was just told
+  // not to use.
+  const adoptedRoles = await confirmCanonicalLocation(projectDir, flags);
+  if (adoptedRoles) {
+    config.docs = { ...(config.docs || {}), roles: { ...adoptedRoles } };
+    config.requiredFiles = {
+      ...(config.requiredFiles || {}),
+      canonical: Object.values(adoptedRoles).sort(),
+    };
+    config = applyDocRoles(projectDir, config);
+  }
+  // Deliberately NOT assertDefaultDocWrites here. That guard forbids generating
+  // INTO a mapped document, which is right, but init's job on a mapped layout is to
+  // configure it and scaffold the roles the mapping has not placed. Those documents
+  // are filtered out of the scaffold list below, so nothing is generated into them
+  // and no duplicate is created beside them.
   // v0.20: `--wizard` dispatches to the full interactive onboarding (formerly
   // `docguard setup`). Done before profile validation so the wizard can ask
   // for the profile itself if needed.
   if (flags.wizard) {
+    // The wizard generates whole documents, so the mapped-layout guard still
+    // applies here even though plain init no longer trips it.
+    assertDefaultDocWrites(config);
     const { runSetup } = await import('./setup.mjs');
     return runSetup(projectDir, config, flags);
   }
@@ -178,7 +509,30 @@ export async function runInit(projectDir, config, flags) {
     console.log(`${c.dim}   canonical docs from your code instead of dumping a blank skeleton.${c.reset}`);
     console.log(`${c.dim}   (Opt out: ${c.cyan}docguard init --skeleton${c.dim} for the blank-template path.)${c.reset}\n`);
     const { runGenerate } = await import('./generate.mjs');
-    return runGenerate(projectDir, config, { ...flags, plan: true });
+    const result = await runGenerate(projectDir, config, { ...flags, plan: true });
+    // docguard.output-ux#FR-007: the plan is a preview, but the project is now
+    // adopted. Without a config every later command said "run docguard init"
+    // and guard exited 3 for a project that had just run it.
+    const smartConfigPath = resolve(projectDir, '.docguard.json');
+    if (!existsSync(smartConfigPath)) {
+      const plan = buildMemoryPlan(projectDir, config);
+      const canonical = plan.docs.map(d => d.path).filter(p => p.startsWith('docs-canonical/'));
+      const detectedType = autoDetectProjectType(projectDir);
+      const inferred = buildInitConfig({
+        projectDir, config, profileName: 'standard', profile: PROFILES.standard, detectedType, canonical,
+        adoptedOrConfiguredRoles: { ...(config.docs?.roles || {}) },
+      });
+      writeFileSync(smartConfigPath, JSON.stringify(inferred, null, 2) + '\n', 'utf-8');
+      console.log(`  ${c.green}✅${c.reset} Created: ${c.cyan}.docguard.json${c.reset} ${c.dim}(profile: standard, type: ${detectedType}, ${canonical.length} canonical doc(s) from the plan)${c.reset}\n`);
+    } else {
+      console.log(`  ${c.yellow}⏭️${c.reset}  .docguard.json ${c.dim}(already exists)${c.reset}\n`);
+    }
+    // Smart init still honors explicit workflow/scaffolder requests after the
+    // plan, with the same ordering and stop-on-failure semantics as skeletons.
+    if (Array.isArray(flags.with) && flags.with.length > 0) {
+      await runScaffolders(projectDir, config, flags, flags.with);
+    }
+    return result;
   }
 
   const profileName = flags.profile || 'standard';
@@ -195,7 +549,7 @@ export async function runInit(projectDir, config, flags) {
   console.log(`${c.dim}   Profile:   ${profileName} — ${profile.description}${c.reset}\n`);
 
   // Detect project type
-  const detectedType = detectProjectType(projectDir);
+  const detectedType = autoDetectProjectType(projectDir);
   console.log(`  ${c.dim}Auto-detected project type: ${c.cyan}${detectedType}${c.reset}\n`);
 
   // ── Doc catalog ────────────────────────────────────────────────────────
@@ -208,6 +562,16 @@ export async function runInit(projectDir, config, flags) {
     { key: 'REQUIREMENTS', file: 'docs-canonical/REQUIREMENTS.md', template: 'REQUIREMENTS.md.template', desc: 'Functional requirements, user stories (spec-kit aligned)', defaultYes: true },
   ];
 
+  // Default paths of roles an adopted or configured mapping already places
+  // elsewhere. Scaffolding these would create the duplicate directory that
+  // adoption exists to avoid.
+  const mappedDefaults = mappedDefaultPaths(config);
+  // Roles this run adopted, plus any the loaded config already mapped.
+  const adoptedOrConfiguredRoles = { ...(config.docs?.roles || {}) };
+  if (mappedDefaults.size) {
+    console.log(`  ${c.dim}Mapped documents are read in place; skipping ${mappedDefaults.size} default template(s).${c.reset}\n`);
+  }
+
   let selectedDocs;
 
   if (flags.skipPrompts || flags.force || flags.fix) {
@@ -216,7 +580,7 @@ export async function runInit(projectDir, config, flags) {
     // must never block on prompts (CI / headless / agent use). The create-loop
     // below already skips existing files, so --fix only fills gaps.
     const profileCanonical = profile.requiredFiles?.canonical || allDocs.map(d => d.file);
-    selectedDocs = allDocs.filter(d => profileCanonical.includes(d.file));
+    selectedDocs = allDocs.filter(d => profileCanonical.includes(d.file) && !mappedDefaults.has(d.file));
     console.log(`  ${c.dim}Non-interactive mode — using ${profileName} profile defaults${c.reset}\n`);
   } else {
     // Interactive — ask about each doc
@@ -224,7 +588,7 @@ export async function runInit(projectDir, config, flags) {
     console.log(`  ${c.dim}(press Enter for default, type y or n)${c.reset}\n`);
 
     selectedDocs = [];
-    for (const doc of allDocs) {
+    for (const doc of allDocs.filter(d => !mappedDefaults.has(d.file))) {
       const defaultLabel = doc.defaultYes ? 'Y/n' : 'y/N';
       const answer = await askQuestion(`    ${doc.key} — ${doc.desc} [${defaultLabel}]: `);
       const trimmed = answer.trim().toLowerCase();
@@ -294,52 +658,27 @@ export async function runInit(projectDir, config, flags) {
   // ── Create .docguard.json ──────────────────────────────────────────────
   const configPath = resolve(projectDir, '.docguard.json');
   if (!existsSync(configPath)) {
-    const typeDefaults = {
-      cli:     { needsEnvVars: false, needsEnvExample: false, needsE2E: false, needsDatabase: false },
-      library: { needsEnvVars: false, needsEnvExample: false, needsE2E: false, needsDatabase: false },
-      webapp:  { needsEnvVars: true,  needsEnvExample: true,  needsE2E: true,  needsDatabase: true },
-      api:     { needsEnvVars: true,  needsEnvExample: true,  needsE2E: false, needsDatabase: true },
-      unknown: { needsEnvVars: true,  needsEnvExample: true,  needsE2E: false, needsDatabase: true },
-    };
-
-    const ptc = typeDefaults[detectedType] || typeDefaults.unknown;
-
-    const defaultConfig = {
-      // v0.15-P4: $schema reference enables VS Code / IDE autocomplete +
-      // validation for .docguard.json fields. Picked up by any
-      // JSON-Schema-aware editor; ignored by DocGuard itself.
-      $schema: 'https://raccioly.github.io/docguard/schemas/docguard-config.schema.json',
-      projectName: config.projectName,
-      version: CURRENT_SCHEMA_VERSION, // single source of truth (shared.mjs) — never hardcode
-      profile: profileName,
-      projectType: detectedType,
-      projectTypeConfig: ptc,
-      requiredFiles: {
-        canonical: selectedDocs.map(d => d.file),
-      },
-      validators: profile.validators || {
-        structure: true,
-        docsSync: true,
-        drift: true,
-        changelog: true,
-        architecture: false,
-        testSpec: true,
-        security: false,
-        environment: true,
-        freshness: true,
-      },
-      // Per-validator severity overrides (v0.5+).
-      //   'high':   warnings from this validator fail CI (exit 1)
-      //   'medium': default — warnings exit 2 (informational)
-      //   'low':    warnings ignored for exit code (exit 0)
-      // Empty by default — every validator uses 'medium'. Add entries to dial
-      // strictness up (CI-critical checks) or down (experimental validators).
-      severity: {},
-    };
-
+    const defaultConfig = buildInitConfig({
+      projectDir, config, profileName, profile, detectedType,
+      canonical: selectedDocs.map(d => d.file), adoptedOrConfiguredRoles,
+    });
     writeFileSync(configPath, JSON.stringify(defaultConfig, null, 2) + '\n', 'utf-8');
     created.push('.docguard.json');
     console.log(`  ${c.green}✅${c.reset} Created: ${c.cyan}.docguard.json${c.reset} ${c.dim}(${selectedDocs.length} docs selected, type: ${detectedType})${c.reset}`);
+  } else if (adoptedRoles) {
+    // An adoption decided in this run must survive even when the config file
+    // already exists, otherwise the mapping is announced and then thrown away.
+    const existing = JSON.parse(readFileSync(configPath, 'utf-8'));
+    existing.docs = { ...(existing.docs || {}), roles: { ...adoptedRoles } };
+    existing.requiredFiles = {
+      ...(existing.requiredFiles || {}),
+      canonical: [...new Set([
+        ...(existing.requiredFiles?.canonical || []).filter(p => !mappedDefaults.has(p)),
+        ...Object.values(adoptedRoles),
+      ])].sort(),
+    };
+    writeFileSync(configPath, JSON.stringify(existing, null, 2) + '\n', 'utf-8');
+    console.log(`  ${c.green}✅${c.reset} .docguard.json now reads documents from their mapped locations`);
   } else {
     skipped.push('.docguard.json');
     console.log(`  ${c.yellow}⏭️${c.reset}  .docguard.json ${c.dim}(already exists)${c.reset}`);
@@ -390,80 +729,46 @@ poetry.lock
   }
 
   // ── Spec-Kit Integration (Extension-First) ────────────────────────────
-  // Delegate LLM/IDE detection and spec-kit skill install to `specify init`
-  // v0.16-P8: --no-spec-kit lets users skip the .specify/.agent/commands
-  // scaffolding (minimalist library projects, CI containers, etc.).
-  const specKitAvailable = isSpecKitAvailable();
-  const specKitInitialized = isSpecKitInitialized(projectDir);
-
+  // Delegate agent scaffolding to `specify init`, then register DocGuard's own
+  // packaged extension so its workflow hooks run. The subprocess contract lives
+  // in cli/spec-kit-delegation.mjs (specs/014-specify-init-delegation); this
+  // block only renders its structured result and never reports a failed step as
+  // done. --no-spec-kit skips Spec Kit entirely (no `specify` call, no
+  // .specify/); DocGuard's own skills below still install, because they are
+  // not Spec Kit (docguard.spec-kit-integration-honesty#FR-007).
+  //
   // v0.24 (field report #1): the `starter` profile is "minimal, for side
-  // projects" — it skips the heavy Spec Kit framework scaffold (.specify/
-  // templates/scripts/memory, ~30 files) by default. DocGuard's own canonical
-  // docs and its lightweight agent skills/commands still install (ensureSkills
-  // below). Opt back in with --spec-kit. Other profiles are unaffected.
+  // projects" — it skips the heavy Spec Kit framework scaffold by default.
+  // Opt back in with --spec-kit. Other profiles are unaffected.
   const starterSkipsSpecKit = profileName === 'starter' && !flags.specKit;
+  const skipSpecKit = Boolean(flags.noSpecKit || starterSkipsSpecKit);
+  const delegationStart = Date.now();
+  const delegation = delegateSpecKitInit(projectDir, { skip: skipSpecKit });
+  renderSpecKitDelegation(delegation, flags);
 
-  if (flags.noSpecKit || starterSkipsSpecKit) {
-    const why = flags.noSpecKit
-      ? '--no-spec-kit'
-      : 'starter profile is minimal — pass --spec-kit to include the framework scaffold';
-    console.log(`\n  ${c.dim}⏭️  Spec Kit framework scaffold skipped (${why}).${c.reset}`);
-  } else if (specKitAvailable && !specKitInitialized) {
-    console.log(`\n  ${c.bold}🌱 Spec Kit Integration${c.reset}`);
-
-    // Detect which AI agent is in use (matches spec-kit's --ai flag).
-    // v0.21.1 (issue #190): the returned value is allowlist-validated inside
-    // getDetectedAgent, so an attacker-controlled `.specify/init-options.json`
-    // can no longer inject shell metacharacters here.
-    const detectedAgent = detectAIAgent(projectDir);
-    const aiArgs = detectedAgent
-      ? ['--ai', detectedAgent]
-      : ['--ai', 'generic', '--ai-commands-dir', '.agent/commands/'];
-
-    console.log(`  ${c.dim}Running specify init (agent: ${detectedAgent || 'generic'})...${c.reset}`);
-    try {
-      // v0.21.1 (issue #190): execFileSync via safeSpawnSpecify — args pass
-      // through as an array, no shell interpolation.
-      const scriptArgs = process.platform === 'win32' ? ['--script', 'ps'] : ['--script', 'sh'];
-      safeSpawnSpecify(
-        ['init', '--here', '--force', ...aiArgs, '--ai-skills', '--ignore-agent-tools', '--no-git', ...scriptArgs],
-        { cwd: projectDir, encoding: 'utf-8', stdio: 'pipe', timeout: 30000 }
-      );
-      console.log(`  ${c.green}✅${c.reset} Spec Kit initialized ${c.dim}(.specify/, spec-kit skills, agent: ${detectedAgent || 'generic'})${c.reset}`);
-      created.push('.specify/ (spec-kit foundation)');
-    } catch (err) {
-      console.log(`  ${c.yellow}⚠️${c.reset}  Spec Kit init had issues ${c.dim}(continuing with DocGuard standalone)${c.reset}`);
-      if (flags.debug) console.log(`     ${c.dim}${err.message}${c.reset}`);
-    }
-  } else if (specKitInitialized) {
-    const agent = getDetectedAgent(projectDir);
-    console.log(`\n  ${c.green}✅${c.reset} Spec Kit already initialized${agent ? ` ${c.dim}(agent: ${agent})${c.reset}` : ''}`);
-  } else {
-    console.log(`\n  ${c.red}┌─────────────────────────────────────────────────────────────┐${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}  ${c.bold}⚠️  Spec Kit not installed — running in standalone mode${c.reset}     ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}                                                              ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}  DocGuard is designed as a Spec Kit extension.               ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}  Without Spec Kit, you get ${c.bold}4 skills${c.reset}. With it: ${c.bold}13 skills${c.reset}.    ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}                                                              ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}  ${c.bold}What you're missing:${c.reset}                                       ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}   • 9 Spec Kit AI skills (specify, plan, tasks, implement)  ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}   • Project constitution (${c.cyan}constitution.md${c.reset})                 ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}   • Full SDD + CDD integrated workflow                     ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}   • AI agent auto-detection and config                     ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}                                                              ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}  ${c.bold}Install with:${c.reset}                                              ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}  ${c.cyan}uv tool install specify-cli \\${c.reset}                              ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}  ${c.cyan}  --from git+https://github.com/github/spec-kit.git${c.reset}       ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}                                                              ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}  ${c.dim}Alternative: ${c.cyan}pip install specify-cli${c.reset}                       ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}                                                              ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}│${c.reset}  ${c.dim}Then re-run: ${c.cyan}docguard init${c.reset}                                 ${c.red}│${c.reset}`);
-    console.log(`  ${c.red}└─────────────────────────────────────────────────────────────┘${c.reset}`);
-  }
+  // DocGuard's own skills and commands, where this project's agent reads them
+  // (docguard.spec-kit-integration-honesty#FR-009). Installed before the
+  // summary and the next steps, so both describe what is now on disk. Thread
+  // the spec-kit skip decision through so ensureSkills doesn't re-trigger the
+  // framework scaffold we just declined.
+  console.log('');
+  const assets = ensureSkills(projectDir, { ...flags, noSpecKit: skipSpecKit, specKitHandled: true }, readAgentSurface(projectDir));
 
   // ── Summary ────────────────────────────────────────────────────────────
+  // Every number is a count of files (docguard.spec-kit-integration-honesty#FR-010).
+  const genericCommands = delegation.commands?.written || [];
+  const agentFiles = assets.written.length + genericCommands.length;
+  const specKitFiles = ['initialized', 'already-initialized'].includes(delegation.status)
+    ? countSpecKitWrites(projectDir, delegationStart, genericCommands)
+    : 0;
   console.log(`\n${c.bold}  ─────────────────────────────────────${c.reset}`);
-  console.log(`  ${c.green}Created:${c.reset} ${created.length} files`);
+  console.log(`  ${c.green}Created:${c.reset} ${created.length} DocGuard file${created.length === 1 ? '' : 's'}`);
+  if (agentFiles > 0) {
+    console.log(`  ${c.green}Agent files:${c.reset} ${agentFiles} installed or updated`);
+  }
+  if (specKitFiles > 0) {
+    console.log(`  ${c.green}Spec Kit:${c.reset} ${specKitFiles} file${specKitFiles === 1 ? '' : 's'} written by specify`);
+  }
   if (skipped.length > 0) {
     console.log(`  ${c.yellow}Skipped:${c.reset} ${skipped.length} files (already exist)`);
   }
@@ -473,8 +778,13 @@ poetry.lock
   console.log(`  ${c.dim}Auto-guard on commit:${c.reset}  ${c.cyan}docguard hooks --type pre-commit${c.reset}`);
   console.log(`  ${c.dim}Auto-guard on push:${c.reset}   ${c.cyan}docguard hooks --type pre-push${c.reset}`);
 
-  // ── Next Steps (LLM-First) ─────────────────────────────────────────────
+  // ── Next Steps ─────────────────────────────────────────────────────────
+  // A slash command is named only when its file exists for this project's
+  // agent; anything else is the CLI command (docguard.spec-kit-integration-
+  // honesty#FR-006).
   const agentMode = detectAgentMode(projectDir);
+  const surface = readAgentSurface(projectDir);
+  const guardHint = commandHint(projectDir, surface, 'guard');
   const createdDocs = created.filter(f => f.startsWith('docs-canonical/'));
 
   if (createdDocs.length > 0) {
@@ -482,12 +792,12 @@ poetry.lock
     console.log(`  ${c.dim}The files above are skeleton templates. Your AI agent should fill them.${c.reset}`);
 
     if (agentMode === 'llm') {
-      // LLM-first: show skill commands
-      console.log(`\n  ${c.bold}Use these skills in your AI agent:${c.reset}`);
-      if (isSpecKitInitialized(projectDir)) {
-        console.log(`  ${c.cyan}1. /speckit.constitution${c.reset} ${c.dim}← establish project principles${c.reset}`);
-      }
-      console.log(`  ${c.cyan}${isSpecKitInitialized(projectDir) ? '2' : '1'}. /docguard.guard${c.reset}    ${c.dim}← validate documentation${c.reset}`);
+      const constitution = agentCommand(projectDir, surface, 'constitution', '', { speckit: true });
+      const steps = [];
+      if (constitution) steps.push([constitution, 'establish project principles']);
+      steps.push([guardHint, 'validate documentation']);
+      console.log(`\n  ${c.bold}In your AI agent:${c.reset}`);
+      steps.forEach(([cmd, why], i) => console.log(`  ${c.cyan}${i + 1}. ${cmd}${c.reset} ${c.dim}← ${why}${c.reset}`));
 
       const docNameMap = {
         'docs-canonical/ARCHITECTURE.md': 'architecture',
@@ -499,12 +809,12 @@ poetry.lock
 
       const fixTargets = createdDocs.map(d => docNameMap[d]).filter(Boolean);
       if (fixTargets.length > 0) {
-        console.log(`\n  ${c.dim}Fix individual docs with the docguard-fix skill:${c.reset}`);
+        console.log(`\n  ${c.dim}Get a research prompt for each document:${c.reset}`);
         for (const target of fixTargets) {
-          console.log(`  ${c.cyan}/docguard.fix --doc ${target}${c.reset}`);
+          console.log(`  ${c.cyan}${commandHint(projectDir, surface, 'fix', `--doc ${target}`)}${c.reset}`);
         }
       }
-      console.log(`\n  ${c.dim}Then verify:${c.reset} ${c.cyan}/docguard.guard${c.reset}`);
+      console.log(`\n  ${c.dim}Then verify:${c.reset} ${c.cyan}${guardHint}${c.reset}`);
     } else {
       // CLI fallback
       console.log(`\n  ${c.dim}Get a full remediation plan:${c.reset}`);
@@ -512,18 +822,11 @@ poetry.lock
       console.log(`  ${c.dim}Then verify:${c.reset} ${c.cyan}docguard guard${c.reset}`);
     }
     console.log('');
+  } else if (agentMode === 'llm') {
+    console.log(`\n  ${c.dim}Use${c.reset} ${c.cyan}${guardHint}${c.reset} ${c.dim}to check for issues.${c.reset}\n`);
   } else {
-    if (agentMode === 'llm') {
-      console.log(`\n  ${c.dim}Use${c.reset} ${c.cyan}/docguard.guard${c.reset} ${c.dim}in your AI agent to check for issues.${c.reset}\n`);
-    } else {
-      console.log(`\n  ${c.dim}Run${c.reset} ${c.cyan}docguard diagnose${c.reset} ${c.dim}to check for issues.${c.reset}\n`);
-    }
+    console.log(`\n  ${c.dim}Run${c.reset} ${c.cyan}docguard diagnose${c.reset} ${c.dim}to check for issues.${c.reset}\n`);
   }
-
-  // Auto-install DocGuard's own skills and commands. Thread the spec-kit skip
-  // decision through so ensureSkills doesn't re-trigger the framework scaffold
-  // we just declined for the starter profile (or --no-spec-kit).
-  ensureSkills(projectDir, { ...flags, noSpecKit: flags.noSpecKit || starterSkipsSpecKit });
 
   // v0.20: `docguard init --with agents,hooks,ci,badge,llms,publish` runs
   // the named scaffolders after init has finished. Each one runs in sequence

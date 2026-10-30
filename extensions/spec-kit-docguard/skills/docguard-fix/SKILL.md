@@ -3,15 +3,21 @@ name: docguard-fix
 description: AI-driven documentation repair with structured research workflow, template-aware
   generation, and quality validation loops. Generates or fixes canonical documentation
   by researching the actual codebase, not using placeholders. Iterates until guard passes.
-compatibility: Requires DocGuard CLI installed (npm i -g docguard-cli or npx docguard-cli)
+compatibility: Requires DocGuard CLI installed (npm i -g docguard-cli, or npx --yes docguard-cli@0.45.1)
 metadata:
   author: docguard
-  version: 0.34.1
+  version: 0.45.1
   source: extensions/spec-kit-docguard/skills/docguard-fix
 ---
-<!-- docguard:version: 0.34.1 -->
+<!-- docguard:version: 0.45.1 -->
 
 # DocGuard Fix Skill
+
+## Running DocGuard
+
+Run `docguard` from PATH when it is installed. Otherwise run
+`npx --yes docguard-cli@0.45.1`, the release these instructions ship with, in its
+place. Every `docguard …` command below means one of the two.
 
 ## User Input
 
@@ -25,7 +31,7 @@ If no arguments, fix ALL issues found by `docguard diagnose`.
 
 ## Goal
 
-Research the actual codebase to generate or repair canonical documentation that passes DocGuard's 19-validator guard suite. This skill replaces generic templates with real, project-specific content and iterates until quality checks pass.
+Research the actual codebase to generate or repair canonical documentation that passes DocGuard's configurable guard suite. This skill replaces generic templates with real, project-specific content and iterates until quality checks pass.
 
 ## Operating Constraints
 
@@ -34,24 +40,35 @@ Research the actual codebase to generate or repair canonical documentation that 
 - **Maximum 3 validation iterations** — if still failing after 3 rounds, report remaining issues and stop
 - **Research before writing** — understand the codebase first, then generate documentation
 
+## Scope: `act` findings only
+
+Read `disposition` from `docguard guard --format json` before repairing anything.
+
+- **`act`** — DocGuard asserts a defect and names the correction. In scope.
+- **`escalate`** — DocGuard observed a signal and the judgement belongs to a human (freshness history, diff-overlap suspicion, documented-endpoint absence). **Out of scope for this skill.** Report them for review; never edit a document to silence one. A history heuristic saying a review is DUE is not evidence that the document is wrong, and stamping a new review date to clear it destroys the signal without doing the review.
+
+Also read `parserTier`: a finding produced by `regex-fallback` or `fallback-language` came from a pattern match rather than a syntax tree, so verify the underlying source before rewriting a document around it.
+
 ## Execution Flow
 
 ### Step 0: Apply Mechanical Fixes First (no AI needed)
 
 ```bash
-npx docguard-cli fix --write 2>&1
+docguard fix --write 2>&1
 ```
 
 Removes endpoints documented in `docs-canonical/API-REFERENCE.md` that the OpenAPI
 spec confirms no longer exist (table row + detail block). Only edits
-`docguard:generated` docs, idempotent, prints what changed. Don't hand-edit these.
+`docguard:generated` whole documents. Mapped human docs expose only unique
+`source=code` sections, and `--force` cannot bypass ownership. The operation is
+idempotent and prints what changed. Don't hand-edit generated sections.
 
 ### Step 1: Diagnose Current State
 
 Run the diagnostic to identify all issues (each tagged `mechanical` or `agent`):
 
 ```bash
-npx docguard-cli diagnose 2>&1
+docguard diagnose 2>&1
 ```
 
 Parse the output to build an issue inventory:
@@ -170,7 +187,7 @@ After writing/fixing each document:
 
 1. **Run guard on the specific validator**:
    ```bash
-   npx docguard-cli guard 2>&1
+   docguard guard 2>&1
    ```
 
 2. **Parse results** for the affected validators
@@ -203,7 +220,7 @@ After all fixes are applied, output:
 - [Issue description] — [Why it couldn't be auto-fixed]
 
 ### Suggested Next Steps
-- Run `/docguard.guard` to verify full compliance
+- Run the `docguard-guard` skill to verify full compliance
 - Review generated content for accuracy
 - Commit with: `docs: fix CDD documentation [list of docs fixed]`
 ```
@@ -217,12 +234,29 @@ After all fixes are applied, output:
 - **Log deviations** — if you deviate from canonical expectations, add `// DRIFT: reason` in DRIFT-LOG.md
 - **Never include secrets** — document variable/secret NAMES only, never actual values
 
+## Evidence Findings
+
+Run `docguard verify --evidence --format json` when guard returns an `EVD` code.
+Repair invalid, missing, ambiguous, stale, or unsupported evidence at the named
+source. For `EVD002`, inspect the approved requirement and implementation before
+editing either side; current code does not automatically override canonical
+intent. Rerun evidence verification after the targeted change. Never broaden a
+statement template or remove an evidence declaration merely to make guard pass.
+
 ## Integration with Spec Kit
 
 If `.specify/` directory exists:
 - Check `constitution.md` for project principles before generating docs
 - Align documentation language with constitutional requirements
 - If `specs/*/spec.md` exists, cross-reference requirements with TEST-SPEC.md
+
+## When DocGuard says it is old
+
+If DocGuard's output says its version was released more than 14 days ago, tell
+the user and offer to run `docguard upgrade`, which checks npm for a newer
+version only when it runs. Never upgrade DocGuard without the user's agreement,
+and never treat the note as a failure: it says a newer version may exist, not
+that one does.
 
 ## Context
 

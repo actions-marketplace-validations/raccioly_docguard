@@ -1,24 +1,40 @@
 /**
+ * @implements docguard.language-repository-coverage#FR-009
+ * @implements docguard.language-repository-coverage#FR-010
+ * @implements docguard.language-repository-coverage#FR-011
+ * @implements docguard.coverage-followups#FR-001
+ */
+import { assertMappedFullDocumentWrites, docRolePath, isMappedDocPath, mappedRolesForPath, resolveDocRole } from '../shared-doc-roles.mjs';
+/**
  * Generate Command — Reverse-engineer canonical docs from an existing codebase
  * Scans source code and creates documentation templates pre-filled with project data.
  * 
  * This is the "killer feature" — take any project and auto-generate CDD docs.
  */
 
-import { existsSync, readFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve, extname, basename, relative } from 'node:path';
 import { c } from '../shared.mjs';
+import { runGenerateAsBuilt } from './generate-as-built.mjs';
 import { walkFiles as sharedWalkFiles } from '../shared-ignore.mjs';
 import { detectDocTools } from '../scanners/doc-tools.mjs';
 import { scanRoutesDeep } from '../scanners/routes.mjs';
 import { scanSchemasDeep } from '../scanners/schemas.mjs';
 import { buildMemoryPlan } from '../scanners/memory-plan.mjs';
-import { upsertSection } from '../writers/sections.mjs';
-import { safeWrite, registerGeneratedCanonicalDocs, surfaceConfidence } from '../writers/generate-io.mjs';
+import { scanComponents as scanModules, scanTestInventory } from '../scanners/inventory.mjs';
+import { detectIntegrations } from '../scanners/integrations.mjs';
+import { collectEnvVars } from '../shared-source.mjs';
+import { detectCodeTechnologies } from '../scanners/tech-stack.mjs';
+import { detectRouteFramework } from '../validators/api-surface.mjs';
+import { collectCodeTests } from '../validators/docs-diff.mjs';
+import { assertOwnedCodeSection, getSection, replaceSection, upsertSection } from '../writers/sections.mjs';
+import { registerGeneratedCanonicalDocs, surfaceConfidence, writeOwnedSections } from '../writers/generate-io.mjs';
+import { detectProjectProfile } from '../scanners/project-type.mjs';
 import {
   generateArchitecture, generateApiReference, generateDataModel,
   generateEnvironment, generateTestSpec, generateSecurity, generateRootFiles,
 } from '../writers/doc-generators.mjs';
+import { readAgentSurface, commandHint } from '../agent-surface.mjs';
 
 const IGNORE_DIRS = new Set([
   'node_modules', '.git', '.next', 'dist', 'build', 'coverage',
@@ -43,6 +59,28 @@ export function runGeneratePlan(projectDir, config, flags) {
   if (flags.profile) config = { ...config, profile: flags.profile };
   const plan = buildMemoryPlan(projectDir, config);
 
+  // Existing mapped human documents grant ownership section-by-section. Check
+  // every target before the first write so one malformed later file cannot
+  // leave an earlier document partially updated.
+  if (flags.write) {
+    for (const doc of plan.docs) {
+      const full = resolve(projectDir, doc.path);
+      if (!isMappedDocPath(config, doc.path)) continue;
+      if (!existsSync(full)) {
+        if (mappedRolesForPath(config, doc.path).length > 1) {
+          throw new Error(`Mapped document ${doc.path} serves multiple roles; whole-document scaffolding is unavailable.`);
+        }
+        continue;
+      }
+      const content = readFileSync(full, 'utf8');
+      const fullyOwned = /^[ \t]*<!--\s*docguard:generated\s+true\s*-->[ \t]*$/mi.test(content);
+      if (fullyOwned) assertMappedFullDocumentWrites(projectDir, config, mappedRolesForPath(config, doc.path));
+      else for (const sec of doc.sections.filter(item => item.source === 'code')) {
+        assertOwnedCodeSection(content, sec.id, doc.path);
+      }
+    }
+  }
+
   if (flags.format === 'json') {
     console.log(JSON.stringify({
       project: config.projectName,
@@ -51,7 +89,10 @@ export function runGeneratePlan(projectDir, config, flags) {
         frameworks: plan.profile.frameworks,
         polyglot: plan.profile.polyglot,
         kind: plan.profile.kind,
-        ecosystems: plan.profile.ecosystems.map(e => ({ dir: e.dir, language: e.language, framework: e.framework, kind: e.kind })),
+        ecosystems: plan.profile.ecosystems.map(e => ({
+          dir: e.dir, language: e.language, framework: e.framework,
+          ...(e.libraries?.length ? { libraries: e.libraries } : {}), kind: e.kind,
+        })),
       },
       surface: {
         endpoints: plan.surface.endpoints.length,
@@ -61,7 +102,10 @@ export function runGeneratePlan(projectDir, config, flags) {
         modules: plan.surface.modules.length,
         tests: { files: plan.surface.tests.totalFiles, cases: plan.surface.tests.totalCases },
         envVars: plan.surface.envVars.length,
-        confidence: surfaceConfidence(plan.profile.kind),
+        // Pattern-tier facts lower confidence whatever the kind
+        // (docguard.python-extraction#FR-012).
+        confidence: plan.surface.parserTiers?.degraded ? 'low' : surfaceConfidence(plan.profile.kind),
+        parserTiers: plan.surface.parserTiers,
       },
       docs: plan.docs.map(d => ({
         path: d.path,
@@ -78,24 +122,41 @@ export function runGeneratePlan(projectDir, config, flags) {
 
   // --write: scaffold the skeleton docs with code sections + agent-task placeholders.
   if (flags.write) {
-    const docsDir = resolve(projectDir, 'docs-canonical');
-    if (!existsSync(docsDir)) mkdirSync(docsDir, { recursive: true });
     let wrote = 0;
     for (const doc of plan.docs) {
       const full = resolve(projectDir, doc.path);
       const title = basename(doc.path, '.md').replace(/-/g, ' ');
-      let content = existsSync(full)
-        ? readFileSync(full, 'utf-8')
-        : `# ${title}\n\n<!-- docguard:generated true -->\n`;
+      const before = existsSync(full) ? readFileSync(full, 'utf-8') : null;
+      let content = before ?? `# ${title}\n\n<!-- docguard:generated true -->\n`;
+      const boundedMapped = isMappedDocPath(config, doc.path) && before !== null
+        && !/^[ \t]*<!--\s*docguard:generated\s+true\s*-->[ \t]*$/mi.test(content);
+      let previous = null;
       for (const sec of doc.sections) {
+        const prior = previous;
+        previous = sec.id;
+        if (boundedMapped && sec.source !== 'code') continue;
+        const existing = getSection(content, sec.id);
+        if (existing) {
+          // docguard.generated-docs-consistency#FR-009: a human section is
+          // insert-only — re-running the plan used to replace an agent's prose
+          // with the task placeholder. A pinned code section is hand-kept, as
+          // `sync` already honours.
+          if (sec.source !== 'code' || existing.attrs?.pinned !== undefined) continue;
+          content = replaceSection(content, sec.id, sec.body).content;
+          continue;
+        }
+        if (boundedMapped) continue;
         const body = sec.source === 'code'
           ? sec.body
           : `> **AI task:** ${sec.task}\n<!-- docguard:pending agent writes this section -->`;
-        content = upsertSection(content, sec.id, body, { source: sec.source }).content;
+        // A section with a heading is titled (FR-003); one without continues
+        // the section before it.
+        const position = !sec.heading && prior ? `after:${prior}` : 'end';
+        content = upsertSection(content, sec.id, body, { source: sec.source, heading: sec.heading || null, position }).content;
       }
-      // Route through safeWrite: creates the parent dir (docs-implementation/ may
-      // not exist yet — was an ENOENT crash) and snapshots a .bak before writing.
-      safeWrite(full, content);
+      // writeOwnedSections creates the parent dir (docs-implementation/ may not
+      // exist yet) and keeps a .bak only when a byte a person owns would change.
+      writeOwnedSections(full, before, content);
       wrote++;
     }
     // B7: register the scaffolded canonical docs so guard doesn't flag them.
@@ -108,7 +169,7 @@ export function runGeneratePlan(projectDir, config, flags) {
     for (const note of plan.notes || []) {
       console.log(`  ${c.yellow}ℹ️  ${note}${c.reset}`);
     }
-    console.log(`  ${c.dim}Now run your AI agent (/docguard.fix) to write the prose sections, then ${c.cyan}docguard guard${c.dim}.${c.reset}\n`);
+    console.log(`  ${c.dim}Now have your AI agent write the prose sections (${c.cyan}${commandHint(projectDir, readAgentSurface(projectDir), 'fix', '--doc <name>')}${c.dim} gives the prompt), then ${c.cyan}docguard guard${c.dim}.${c.reset}\n`);
     return;
   }
 
@@ -116,6 +177,17 @@ export function runGeneratePlan(projectDir, config, flags) {
   console.log(`${c.bold}🔮 DocGuard Generate Plan — ${config.projectName}${c.reset}`);
   console.log(`${c.dim}   ${plan.profile.polyglot ? 'Polyglot' : 'Single-language'}: ${plan.profile.languages.join(', ')} | frameworks: ${plan.profile.frameworks.join(', ') || '—'} | kind: ${plan.profile.kind}${c.reset}\n`);
   console.log(`  ${c.bold}Code-truth surface:${c.reset} ${plan.surface.modules.length} modules · ${plan.surface.tests.totalFiles} test files (${plan.surface.tests.totalCases} cases) · ${plan.surface.endpoints.length} endpoints · ${plan.surface.entities.length} entities · ${plan.surface.screens.length} screens · ${plan.surface.envVars.length} env vars\n`);
+  const tiers = plan.surface.parserTiers;
+  if (tiers && (tiers.endpoints.tier !== 'not-applicable' || tiers.entities.tier !== 'not-applicable')) {
+    const color = tiers.degraded || tiers.patternRead ? c.yellow : c.dim;
+    // docguard.coverage-followups#FR-001: say which surfaces a pattern read
+    // because their language has no parser — partial, not low confidence.
+    const patternRead = ['endpoints', 'entities'].filter(k => tiers[k].patternRead);
+    const patternNote = patternRead.length
+      ? ` (${patternRead.join(' and ')} read by pattern: no parser for ${(tiers.patternLanguages || []).join(', ') || 'that language'}; partial)`
+      : '';
+    console.log(`  ${color}Parser tier: endpoints ${tiers.endpoints.tier} · entities ${tiers.entities.tier}${tiers.degraded ? ' (low confidence)' : ''}${patternNote}${c.reset}\n`);
+  }
   const webSurface = plan.surface.endpoints.length + plan.surface.entities.length + plan.surface.screens.length + plan.surface.components.length;
   if (surfaceConfidence(plan.profile.kind) === 'low' && webSurface > 0) {
     console.log(`  ${c.yellow}⚠️  Low-confidence surface:${c.reset} ${c.dim}this looks like a ${plan.profile.kind} (not a web app), so the HTTP/SDK/route surface above may be pattern-matches in your OWN source — not real usage. Verify before documenting; pin any corrected code section with ${c.cyan}pinned="reason"${c.dim}.${c.reset}\n`);
@@ -137,6 +209,10 @@ export function runGeneratePlan(projectDir, config, flags) {
 }
 
 export function runGenerate(projectDir, config, flags) {
+  // --spec <area>: an as-built Spec Kit spec for one area (specs/024-as-built-specs).
+  if (flags.spec) {
+    return runGenerateAsBuilt(projectDir, config, flags);
+  }
   // --plan: emit the AI-powered "memory plan" — the agent task manifest. The CLI
   // builds the code-truth skeleton (marked sections) + tells the agent exactly
   // what prose to write per section. This is the language-aware Generate path.
@@ -172,10 +248,16 @@ export function runGenerate(projectDir, config, flags) {
   }
 
   // ── 3. Scan Project Structure ──
-  const scan = scanProject(projectDir);
+  // Facts the checks read come from the checks' own scanners, so guard run
+  // straight after generate agrees with what was written
+  // (docguard.generated-docs-consistency#FR-008, FR-010).
+  const scan = scanProject(projectDir, config);
 
   // ── 4. Deep Scan Routes ──
-  const deepRoutes = scanRoutesDeep(projectDir, stack, docTools, { config });
+  // The ecosystem-aware framework guard's API-surface check uses (a FastAPI,
+  // Django or Gin project has no package.json framework to read).
+  const routeFramework = [detectRouteFramework(projectDir, config), stack.framework].filter(Boolean).join(' ');
+  const deepRoutes = scanRoutesDeep(projectDir, { ...stack, framework: routeFramework }, docTools, { config });
   if (deepRoutes.length > 0) {
     console.log(`  ${c.bold}Route Scanning:${c.reset} ${deepRoutes.length} endpoints found (source: ${deepRoutes[0]?.source || 'code'})`);
   }
@@ -188,17 +270,23 @@ export function runGenerate(projectDir, config, flags) {
   console.log('');
 
   // ── 6. Generate Documents ──
-  const docsDir = resolve(projectDir, 'docs-canonical');
-  if (!existsSync(docsDir)) {
-    mkdirSync(docsDir, { recursive: true });
-  }
+  // Preflight every mapped whole-document target before the first generator
+  // writes. Existing targets are skipped unless --force, so they do not need
+  // ownership merely to run ordinary generation.
+  const candidateRoles = ['architecture', ...(deepRoutes.length > 0 ? ['apiReference'] : []),
+    'dataModel', 'environment', 'testSpec', 'security'];
+  const writableRoles = candidateRoles.filter(role => {
+    const target = resolveDocRole(projectDir, config, role);
+    return !existsSync(target) || flags.force;
+  });
+  assertMappedFullDocumentWrites(projectDir, config, writableRoles);
 
   // ── Safety: warn if --force will overwrite existing files ──
   if (flags.force) {
     const targetFiles = [
-      'docs-canonical/ARCHITECTURE.md', 'docs-canonical/API-REFERENCE.md',
-      'docs-canonical/DATA-MODEL.md', 'docs-canonical/ENVIRONMENT.md',
-      'docs-canonical/TEST-SPEC.md', 'docs-canonical/SECURITY.md',
+      docRolePath(config, 'architecture'), docRolePath(config, 'apiReference'),
+      docRolePath(config, 'dataModel'), docRolePath(config, 'environment'),
+      docRolePath(config, 'testSpec'), docRolePath(config, 'security'),
       'AGENTS.md', 'CHANGELOG.md', 'DRIFT-LOG.md',
     ];
     const existing = targetFiles.filter(f => existsSync(resolve(projectDir, f)));
@@ -245,9 +333,9 @@ export function runGenerate(projectDir, config, flags) {
   // B7: keep guard coherent — register the canonical docs we emitted so the
   // traceability validator doesn't flag the generator's own output.
   const registered = registerGeneratedCanonicalDocs(projectDir, [
-    'docs-canonical/ARCHITECTURE.md', 'docs-canonical/API-REFERENCE.md',
-    'docs-canonical/DATA-MODEL.md', 'docs-canonical/ENVIRONMENT.md',
-    'docs-canonical/TEST-SPEC.md', 'docs-canonical/SECURITY.md',
+    docRolePath(config, 'architecture'), docRolePath(config, 'apiReference'),
+    docRolePath(config, 'dataModel'), docRolePath(config, 'environment'),
+    docRolePath(config, 'testSpec'), docRolePath(config, 'security'),
   ]);
 
   console.log(`\n${c.bold}  ─────────────────────────────────────${c.reset}`);
@@ -332,7 +420,12 @@ function detectStack(dir) {
   // Check for Python
   if (existsSync(resolve(dir, 'requirements.txt')) || existsSync(resolve(dir, 'pyproject.toml'))) {
     stack.language = 'Python';
-    if (existsSync(resolve(dir, 'manage.py'))) stack.framework = 'Django';
+    // The framework comes from the same detector as init and generate --plan
+    // (docguard.python-extraction#FR-010), so an app under app/main.py is
+    // still scanned for routes.
+    const eco = detectProjectProfile(dir).ecosystems.find(e => e.language === 'Python' && e.framework);
+    if (eco) stack.framework = eco.framework;
+    else if (existsSync(resolve(dir, 'manage.py'))) stack.framework = 'Django';
     else if (existsSync(resolve(dir, 'app.py')) || existsSync(resolve(dir, 'main.py'))) stack.framework = 'FastAPI/Flask';
   }
 
@@ -356,7 +449,7 @@ function detectStack(dir) {
 
 
 
-function scanProject(dir) {
+function scanProject(dir, config = {}) {
   const scan = {
     routes: [],
     models: [],
@@ -375,7 +468,10 @@ function scanProject(dir) {
   scanTests(dir, scan);
   scanComponents(dir, scan);
   scanMiddlewares(dir, scan);
-  scanEnvVars(dir, scan);
+  scan.envVars = collectEnvVars(dir, config);
+  scan.modules = scanModules(dir, config);
+  scan.technologies = detectCodeTechnologies(dir, config);
+  scan.authLibraries = detectIntegrations(dir, config).filter(i => i.category === 'Auth');
 
   // Count files and lines
   countFilesAndLines(dir, scan);
@@ -388,6 +484,15 @@ function scanProject(dir) {
   scan.services = scan.services.filter(f => !isTestFile(f));
   scan.components = scan.components.filter(f => !isTestFile(f));
   scan.middlewares = scan.middlewares.filter(f => !isTestFile(f));
+  // Every test file the test-drift check (DDF002) and the plan's inventory see.
+  // Files under a test directory count only when they are test files, so
+  // fixtures and helpers are not listed as tests.
+  const isTestLike = (f) => /(?:\.(?:test|spec)\.[^./]+|(?:^|\/)test_[^/]*\.py|(?:^|\/)tests\.py|_test\.(?:py|go)|_spec\.rb)$/.test(f);
+  scan.tests = [...new Set([
+    ...scan.tests.filter(isTestLike),
+    ...collectCodeTests(dir, config),
+    ...scanTestInventory(dir, config).files.map(t => t.file),
+  ].map(f => f.replace(/\\/g, '/')))].sort();
 
   return scan;
 }
@@ -524,21 +629,6 @@ function scanMiddlewares(dir, scan) {
   });
 }
 
-
-function scanEnvVars(dir, scan) {
-  // Parse .env.example for env vars
-  const envExample = resolve(dir, '.env.example');
-  if (existsSync(envExample)) {
-    const content = readFileSync(envExample, 'utf-8');
-    const lines = content.split('\n');
-    for (const line of lines) {
-      const match = line.match(/^([A-Z][A-Z0-9_]+)\s*=\s*(.*)/);
-      if (match) {
-        scan.envVars.push({ name: match[1], example: match[2] || '<required>' });
-      }
-    }
-  }
-}
 
 function countFilesAndLines(dir, scan) {
   walkDir(dir, (filePath) => {

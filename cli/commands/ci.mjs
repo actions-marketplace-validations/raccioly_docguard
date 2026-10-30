@@ -18,6 +18,7 @@ import { runGuardInternal } from './guard.mjs';
 import { runScoreInternal } from './score.mjs';
 import { appendHistory } from '../writers/history.mjs';
 import { getHeadInfo, isGitRepo } from '../shared-git.mjs';
+import { buildReadinessAssessment } from '../assessment.mjs';
 
 export function runCI(projectDir, config, flags) {
   const threshold = parseInt(flags.threshold || '0', 10);
@@ -42,14 +43,30 @@ export function runCI(projectDir, config, flags) {
   // ── Get score ──
   const scoreData = runScoreInternal(projectDir, config);
 
+  // The exit code answers "does the pipeline stop". It cannot answer "is there
+  // work to do, and whose". A green-but-escalating run and a green-and-silent
+  // run exit 0 alike, so `ci` reports the split beside the verdict rather than
+  // letting a consumer infer "nothing to look at" from the exit code.
+  // `unclassified` = a legacy string-only validator that carries no channel.
+  const ciFindings = guardData.findings || [];
+  const dispositionCounts = {
+    act: ciFindings.filter(f => f.disposition === 'act').length,
+    escalate: ciFindings.filter(f => f.disposition === 'escalate').length,
+    unclassified: ciFindings.filter(f => f.disposition !== 'act' && f.disposition !== 'escalate').length,
+  };
+
   // Status reflects EVERY gate, not just guard (L3): a threshold or
   // --fail-on-warning failure exits 1 and must not be recorded as PASS in
   // history or the JSON consumers parse.
   const thresholdMet = threshold <= 0 || scoreData.score >= threshold;
-  const status =
-    hasErrors || !thresholdMet || (failOnWarning && hasWarnings) ? 'FAIL'
-    : hasWarnings ? 'WARN'
-    : 'PASS';
+  const assessment = buildReadinessAssessment(guardData, scoreData, {
+    threshold,
+    thresholdMet,
+    failOnWarning,
+  });
+  const status = assessment.status === 'BLOCKED'
+    ? 'FAIL'
+    : assessment.status === 'ATTENTION' ? 'WARN' : 'PASS';
 
   // ── Record history (unless opted out) ──
   if (!flags.noHistory) {
@@ -62,6 +79,7 @@ export function runCI(projectDir, config, flags) {
       errors: guardData.errors,
       warnings: guardData.warnings,
       baselineSuppressed: guardData.baselineSuppressed || 0,
+        checkCoverage: guardData.checkCoverage,
       passed: guardData.passed,
       total: guardData.total,
       status,
@@ -74,6 +92,8 @@ export function runCI(projectDir, config, flags) {
       project: config.projectName,
       profile: config.profile || 'standard',
       projectType: config.projectType || 'unknown',
+      scoreKind: scoreData.scoreKind,
+      assurance: scoreData.assurance,
       score: scoreData.score,
       grade: scoreData.grade,
       guard: {
@@ -81,11 +101,13 @@ export function runCI(projectDir, config, flags) {
         total: guardData.total,
         status: guardData.status,
         baselineSuppressed: guardData.baselineSuppressed || 0,
+        dispositionCounts,
         validators: guardData.validators.filter(v => v.status !== 'skipped'),
       },
       threshold,
       thresholdMet,
       status,
+      assessment,
       timestamp: new Date().toISOString(),
     };
     // Machine output must survive a pipe: stdout.write + natural exit, never
@@ -101,14 +123,24 @@ export function runCI(projectDir, config, flags) {
       : `${c.green}✅ PASS${c.reset}`;
 
     console.log(`  ${c.bold}Guard:${c.reset}  ${guardStatus}  (${guardData.passed}/${guardData.total})`);
+    if (dispositionCounts.act > 0 || dispositionCounts.escalate > 0) {
+      const parts = [];
+      if (dispositionCounts.act > 0) parts.push(`${c.cyan}${dispositionCounts.act} to fix${c.reset}${c.dim}`);
+      if (dispositionCounts.escalate > 0) parts.push(`${c.yellow}${dispositionCounts.escalate} to review${c.reset}${c.dim}`);
+      console.log(`  ${c.dim}        ${parts.join(' · ')}${c.reset}${c.dim} (fix = DocGuard names the correction; review = the judgement is yours)${c.reset}`);
+    }
     if (guardData.baselineSuppressed > 0) {
       console.log(`  ${c.dim}📋 ${guardData.baselineSuppressed} pre-existing finding(s) suppressed by the committed baseline${c.reset}`);
     }
-    console.log(`  ${c.bold}Score:${c.reset}  ${scoreData.score}/100 (${scoreData.grade})`);
+    console.log(`  ${c.bold}Structural Maturity:${c.reset}  ${scoreData.score}/100 (${scoreData.grade})`);
 
     if (threshold > 0) {
       console.log(`  ${c.bold}Threshold:${c.reset}  ${thresholdMet ? `${c.green}✅ ≥${threshold}` : `${c.red}❌ <${threshold}`}${c.reset}`);
     }
+
+    const readinessColor = assessment.status === 'READY' ? c.green : assessment.status === 'ATTENTION' ? c.yellow : c.red;
+    console.log(`  ${c.bold}Readiness:${c.reset}  ${readinessColor}${c.bold}${assessment.status}${c.reset}`);
+    console.log(`  ${c.dim}${assessment.summary}${c.reset}`);
 
     console.log('');
   }

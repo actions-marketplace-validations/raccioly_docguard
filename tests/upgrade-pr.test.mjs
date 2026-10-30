@@ -2,7 +2,7 @@
  * v0.14-P4 — `docguard upgrade --apply --pr` opens a migration PR.
  *
  * Full PR creation requires a real git remote + gh authentication, so the
- * deep test is manual (and validated in the dry-run on wu-whatsappinbox).
+ * deep test is manual (and validated in the dry-run on downstream-project).
  * Here we verify the structural pieces:
  *   - --pr flag is parsed
  *   - upgrade.mjs exports work when --pr is set
@@ -72,8 +72,8 @@ describe('upgrade --pr', () => {
       '.docguard.json': JSON.stringify({ projectName: 't', version: '0.4', profile: 'starter' }),
     });
     const r = spawnSync('node', [CLI, 'upgrade', '--apply'], { cwd: dir, encoding: 'utf-8' });
-    // The 0.4 → 0.5 migration is real and should print the version arrow.
-    assert.match(r.stdout, /Schema migrated 0\.4 → 0\.5/,
+    // The migration chain reaches the current schema and prints the full arrow.
+    assert.match(r.stdout, /Schema migrated 0\.4 → 0\.6/,
       `expected migration banner, got: ${r.stdout.slice(0, 400)}`);
   });
 });

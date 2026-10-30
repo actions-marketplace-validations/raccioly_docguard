@@ -1,295 +1,354 @@
 # CI Recipes
 
-<!-- docguard:quality negation-load off — operational doc: "read-only, never modifies your repo", "fork PRs won't run", "don't commit X" are precise prohibitions; positive rephrasing would reduce clarity -->
-
-<!-- docguard:section id=overview source=human -->
-This document covers the GitHub Action and CI integration patterns DocGuard ships.
-Each recipe is a copy-pasteable workflow you can drop into `.github/workflows/`.
-
-DocGuard exposes itself as a composite action at `raccioly/docguard@<tag>` and
-also ships starter workflow templates under
-`extensions/spec-kit-docguard/templates/github-workflows/`. Pin to a specific
-tag (e.g. `@v0.12.0`) in production — `@main` is fine for tracking the bleeding edge.
-<!-- /docguard:section -->
+<!-- docguard:last-reviewed 2026-10-13 -->
+<!-- docguard:status active -->
 
 ## Recipe 1 — Guard (mandatory CI gate)
 
-Runs all 27 validators. Read-only — never modifies your repo.
+Run `docguard init --with ci` to create `.github/workflows/docguard.yml`. Existing workflows are preserved; explicit `--force` backs up and replaces the file. The standalone `docguard ci` command continues to execute checks. Start from `templates/ci/github-actions.yml` or the Spec Kit guard workflow in `extensions/spec-kit-docguard/templates/github-workflows/`. These checked-in templates are the maintained source for action pins, runtime selection, and report handling. Copying a template does not configure repository branch protection; require its check independently.
 
-```yaml
-name: DocGuard Guard
-on:
-  push: { branches: [main] }
-  pull_request: { branches: [main] }
-permissions:
-  contents: read
-jobs:
-  guard:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }   # Freshness validator needs git history
-      - uses: raccioly/docguard@v0.12.0
-        with:
-          command: guard
-          fail-on-warning: 'false' # flip to true once your repo is clean
+Use a fixed tool version, full Git history for freshness, and explicit warning policy. Run the check against the actual revision proposed for merging. A missing executable, malformed report, or unexpected nonzero exit is a tool failure, not a successful scan. Configure merge-queue triggers if the repository uses a merge queue.
+
+```sh
+node_modules/.bin/docguard ci --format json --no-history > docguard-report.json
 ```
 
-Inputs that matter:
-- `command: guard` (default)
-- `fail-on-warning` — `false` (default) treats warnings as exit 0, `true` fails the job
-- `format: json` — emits machine-readable output for downstream steps
+The CLI exits 0 for pass, 1 for failure, and 2 for warning-only results. A plain shell step treats both 1 and 2 as failures. To permit warnings, capture the exit status explicitly and allow only 0 or 2. To block warnings, use `ci --fail-on-warning`. Severity overrides retain their configured meaning.
+
+To adopt the gate on a repository that already has findings, run `guard --update-baseline` once and commit `.docguard.baseline.json`. Guard and `ci` then suppress up to the frozen number of each finding, report how many they suppressed, and gate everything new; `--no-baseline` shows everything for one run. A finding is matched by its code, file path without line number, and message with numbers masked. TRC004's trailing IR soft-match hint is left out, so adding an unrelated test file does not bring a frozen finding back. A baseline written by an earlier release still matches, and `--update-baseline` rewrites it in the current form (`specs/052-baseline-stable-fingerprint`).
+
+When `.docguard-evidence.json` exists, guard also evaluates its declarations.
+Contradictions are high-confidence errors. Stale input digests, missing or
+ambiguous targets, malformed evidence, and unsupported report shapes remain
+visible warnings. Inspect the complete contract with:
+
+```bash
+npx docguard-cli verify --evidence --format json
+```
+
+This direct command exits 0 when every configured declaration is verified, 2
+when evidence is stale, inconclusive, or unsupported, and 1 when a declaration
+is contradicted or the manifest is invalid. CI that permits unresolved evidence
+must explicitly allow only status 2; a contradiction is always a failed gate.
+
+Generate oasdiff or Buf reports in an earlier pinned CI step, save their machine
+output, and declare SHA-256 identities for every repository input. DocGuard
+consumes those artifacts; it does not install or invoke either producer. Keep
+the broad freshness and semantic review paths enabled because exact evidence
+does not cover undeclared prose.
 
 ## Recipe 2 — Auto-Fix (PR-time mechanical fixes)
 
-Applies deterministic fixes — version bumps, count drift, removed endpoints,
-changelog stubs — and commits them back to the PR branch.
+Run `fix --write` on a controlled checkout when documentation mutation is intended. Review the resulting diff and rerun guard. Preserve human-authored intent; a disagreement may require fixing implementation rather than rewriting the specification.
 
-```yaml
-name: DocGuard Auto-Fix
-on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-permissions:
-  contents: write          # commit back to PR branch
-  pull-requests: write     # post summary comment
-jobs:
-  autofix:
-    runs-on: ubuntu-latest
-    if: github.event.pull_request.head.repo.full_name == github.repository
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0
-      - uses: raccioly/docguard@v0.12.0
-        with:
-          command: fix
-          auto-commit: 'true'
-          comment-on-pr: 'true'
-```
+Mechanical replacements require their existing provenance and generated-section safeguards. A scheduled or PR repair workflow should create a reviewable branch/PR and deduplicate existing repair work. Grant write privileges only to that explicitly enabled workflow. Fork contributions should receive read-only verification unless a separate trusted process handles repair.
 
-What gets fixed automatically (no AI involved):
-- `replace-version` — bump `package.json`-derived version mentions in docs.
-- `replace-count` — fix line/file/endpoint counts in canonical docs.
-- `insert-changelog-unreleased` — drop an Unreleased stub when missing.
-- `remove-endpoint` — strip an endpoint block from `API-REFERENCE.md` when the route was deleted from code (gated by a generated marker).
-
-What does NOT get fixed automatically (run `/docguard.fix` from your editor):
-- Entire prose rewrites — these need AI judgement.
-- New endpoint documentation — needs human description of behavior.
-- Schema docs for entities that don't have an obvious template.
-
-**Fork PRs are skipped by design.** GitHub's branch protections won't let an
-Action push to a fork, and the workflow refuses to try.
+The shipped auto-fix template and composite action expose optional commit/comment behavior. Review those flags and their permissions before enabling them. A generated workflow is executable code and deserves the same review as another repository change.
 
 ## Recipe 3 — Sync (memory refresh on a schedule or pre-merge)
 
-`sync --write` regenerates code-truth doc sections marked
-`<!-- docguard:section source=code -->`. Use it on a schedule for "always up
-to date" guarantees, or pre-merge as a stricter version of Recipe 2.
+`sync --write` regenerates sections declared as code-derived. Human sections retain judgment and rationale. Cache identity reflects relevant inputs, so ordinary source edits invalidate a prior plan. `--since <ref>` refreshes only the sections whose sources changed (`specs/029-sync-section-scope`). A section drawn from incomplete evidence, such as a `module-graph` on a runner without `python3` for a Python project, is skipped unless `--allow-partial`; run the refresh where the evidence is complete.
+
+On a schedule, produce a diff, check for an existing repair PR, and create a new proposal only when meaningful work remains. Keep clean runs quiet. Set an owner and response expectation for unresolved findings. Scheduled source scans cannot detect every external deployment or vendor change; operational checks need their own evidence.
+
+## Recipe 3a — Protected scheduled releases
+
+The repository's scheduled release workflow opens a reviewable `release/vX.Y.Z`
+pull request because `main` requires pull requests and six checks: four runtime checks (`test (18/20/22/24)`) and the supply-chain checks `osv-scan-pr / osv-scan` and `websec`. GitHub
+places pull-request workflows created with the repository `GITHUB_TOKEN` into an
+approval-required state. Explicit `workflow_dispatch` events run, but their jobs
+do not satisfy branch protection's required pull-request checks, and their
+completion does not produce a downstream `workflow_run` when the repository token
+authored the dispatch. GitHub documents a personal token or GitHub App as the
+fully automated alternative. DocGuard instead keeps the repository token and one
+explicit maintainer action: select **Approve workflows to run** on the generated
+PR. No credential is stored for the release PR or its merge; the only release
+secret is the Homebrew tap deploy key described below.
+
+After approval, ordinary pull-request CI supplies the six required contexts.
+Before the branch is pushed, the trusted scheduler validates the base repository,
+bot author, branch/title/version agreement, next-version increment, synchronized
+package surfaces, and changed-file allowlist. It then arms GitHub's native squash
+auto-merge. Native auto-merge remains blocked by the six required checks, binds
+eligibility to the current PR head, and resets when that head changes. The
+scheduler waits up to ten minutes for the merge and then dispatches the
+idempotent release workflow. Approvals rarely arrive inside that wait, so a
+tag-driven release sweep every 10 minutes is the usual publication route (#447);
+tagged versions exit after the small detect job. If publication is interrupted,
+either the sweep or the next release
+schedule sees the current package version without a tag and retries publication
+before considering another bump. An orphaned release branch fails closed; an
+existing open release PR is reused and has auto-merge re-armed.
+
+The scheduler is four jobs, so no test runs beside a write token
+(`specs/068-release-least-privilege`). `cut` (read-only) decides whether a
+release is due, bumps the version, cuts the changelog, synchronizes the package
+surfaces, runs the candidate validation above, and uploads the result as a
+patch before any test runs. `verify` (read-only) applies that patch and runs the
+suite and guard. `open-pr` holds the write scopes and runs no repository code:
+it checks every path in the patch against the release path list, applies it,
+pushes the branch, opens the pull request, arms auto-merge and waits.
+`recover` holds only `actions: write` and dispatches the release workflow when
+the current version has no tag. In the release workflow, the test job is
+read-only, the Spec Kit ZIP, the Claude Desktop bundle and the PyPI
+distribution are built without credentials, and `attach-assets` and
+`publish-pypi` receive only the built files.
+
+The bump is `auto` unless a maintainer dispatches `patch` or `minor`
+(`specs/026-release-readiness`). `.github/scripts/release-changelog.mjs infer`
+reads the curated `## [Unreleased]` section. Any populated `### Added`,
+`### Removed` or `### Deprecated` heading makes a minor release; otherwise the
+release is a patch. The same script's `cut` moves the curated notes under the
+new `## [x.y.z]` heading and lists the merged commit subjects under
+`### Commits`, so the published notes are the reviewed ones. The release PR
+also moves `action.yml`'s `DOCGUARD_RELEASED_VERSION` and the copyable
+`raccioly/docguard@vX.Y.Z` examples in `README.md` and `docs/ai-integration.md`.
+`.github/scripts/sync-release-version.mjs` updates every versioned surface in one
+fail-closed pass, including the checked-in `.agent/skills/` and `.agent/commands/`
+copies, which mirror their sources byte for byte; the release commit stages them
+and the changed-file allowlist (`RELEASE_PATH_ALLOWLIST`) admits them
+(`specs/051-release-cut-green`).
+
+After npm serves the new tarball, the `publish-homebrew` job renders
+`packaging/homebrew/docguard.rb` from it and pushes the result to
+`raccioly/homebrew-tap`. The tarball is checked against npm's `dist.integrity`
+first. The push uses a write deploy key that can reach only the tap, stored as
+the Actions secret `HOMEBREW_TAP_DEPLOY_KEY`. Without the secret the job warns
+and skips. With it, the 10-minute sweep retries until the tap serves the
+released version.
+
+Do not use a post-approval `workflow_run` listener as the release continuation.
+The approval-required completion is the event that listener observes; approving
+the held run executes its jobs without producing a second completion event for
+the listener. Release PR #380 demonstrated this boundary while publishing
+v0.40.1. Release PR #383 then proved repository-token native auto-merge, while
+also proving that its resulting push is recursion-suppressed and cannot be the
+sole publication trigger. The bounded wait catches the rare fast approval; the
+10-minute tag sweep publishes everything else without continuous polling or
+another credential.
+
+The v0.40.3 release is the retained end-to-end proof. Scheduled run
+`34922506777` opened repository-token PR #386 and armed native auto-merge. After
+one maintainer workflow approval, CI run `34922605581` and supply-chain run
+`34922605917` passed, GitHub merged
+`e27d6bf0203708ee8206a1434eb292520f4c4494`, and the bounded wait dispatched
+publication run `34922784629`. That run published npm, PyPI, GHCR, the GitHub
+Release, extension ZIP, and MCPB and refreshed the catalog reminder.
+
+Catalog submission remains an explicit human action. The release and manual
+catalog workflows maintain one open reminder in this repository: each run
+refreshes the newest matching issue to the current version and closes older
+matching reminders as superseded.
+
+## Recipe 3b — Spec completion and post-hoc reconciliation
+
+Run `docguard reconcile --since <merge-base> --format json` when implementation
+may have changed approved behavior outside the original Spec Kit flow. Review
+unsupported files and intent-change classifications; write mode can refresh only
+DocGuard-owned mechanical sections. After declared tasks, source and test
+evidence, and affected canonical docs are reviewed, run `docguard specs complete --id <spec-id>
+--since <merge-base> --check` as the merge gate. Apply the same command with
+`--write --reason "<reviewed outcome>"` on a clean controlled checkout to record
+verification. A taskless living verification contract is eligible only when every
+requirement has qualified evidence. Keep living specs current; archive only when the registry reports
+that the selected persistence model is ready.
+
+`--since` sets the starting revision only for a spec's first completion. A
+spec with a recorded revision reconciles from it, so its maintenance gate is
+`specs complete --id <spec-id> --check` with no `--since`. There `--since` may
+name the recorded revision or an ancestor of it. A commit between the recorded
+revision and `HEAD` is accepted only when the recorded range exceeds the diff
+budgets even when read in batches; the outcome then records the skipped
+commits as `narrowedFrom`. Any other `--since` blocks with SPC006 and writes
+nothing (`specs/028-completion-revision-anchoring`).
+
+Under squash merges, run completions on a branch whose HEAD is the default
+branch's tip, run as many `specs complete --write` as needed (the registry,
+active context and outcome blocks they write do not count as changes), and
+commit once. Every outcome then records a revision that stays on the default
+branch. A completion recorded on a PR branch's own commit would be discarded by
+the squash, and `specs complete` warns when that is about to happen. Guard
+reports such a revision as `SPR008`; `docguard specs reanchor --id <spec-id>
+--write` moves it to the first commit on HEAD's first-parent history whose
+evidence files are byte-identical (`specs/028-completion-revision-anchoring`).
+When no commit carries those bytes, or the old revision no longer resolves,
+`--to <merge commit> --reason "<why>"` records an attested anchor and the
+evidence files that differ. When one spec has dangling revisions from different
+merges, add `--from <revision>` so each is attested to its own merge.
+
+## Recipe 3c — Spec-first gate
+
+Require every pull request that changes governed code to name its spec. Declare the
+governed paths in `.docguard.json` (`"specFirst": { "paths": ["src/**"] }`; unset, every
+changed path except Markdown, `specs/**` and tests is governed), then run:
 
 ```yaml
-name: DocGuard Nightly Sync
-on:
-  schedule:
-    - cron: '0 6 * * *'   # daily at 06:00 UTC
-  workflow_dispatch: {}
-permissions:
-  contents: write
-  pull-requests: write
-jobs:
-  sync:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - uses: raccioly/docguard@v0.12.0
-        with:
-          command: sync
-          auto-commit: 'true'   # opens a commit on default branch
-          commit-message: 'docs: nightly DocGuard memory sync'
+- uses: actions/checkout@<sha>
+  with: { fetch-depth: 0 }
+- uses: raccioly/docguard@<sha>
+  with: { command: spec-first }
 ```
 
-For the PR variant (run sync against a PR rather than scheduled), use the same
-config as Recipe 2 but with `command: sync` instead of `command: fix`.
+The command is `docguard specs require --since origin/<base> --message-file <body>`. It passes
+when the PR description or a commit message names an existing `specs/<dir>` path or Spec ID,
+when the change edits a spec's own files, or on one line `Spec-Exempt: <kind> — <reason>`
+(kinds `release`, `deps`, `typo`, `test-only` unless `specFirst.exemptKinds` says otherwise;
+reason of 10+ characters). An invented reference never passes. Exit 1 means uncovered and exit
+2 means inconclusive (unknown base, shallow history, oversized inventory); both should fail
+the job. When calling the CLI from your own workflow, pass the PR body through `env` into a
+file. Never splice `${{ github.event.pull_request.body }}` into a `run:` script.
+
+## Recipe 3d — Agent instruction budget
+
+`guard` measures every `AGENTS.md` chain the way Codex loads it: root to working directory,
+with `AGENTS.override.md` replacing `AGENTS.md`. It reports `STR004` above
+`agentInstructions.maxBytes` (default 32768, Codex's `project_doc_max_bytes`). The recipe
+needs no extra step: it runs inside Recipe 1.
+
+For a monorepo that is already over budget, freeze the debt instead of raising the budget
+for everyone. The key is the chain's deepest file:
+
+```json
+{ "agentInstructions": { "allowances": { "packages/api/AGENTS.md": 61440 } } }
+```
+
+A chain may shrink under its allowance, and one byte of growth past it fails again.
+`STR005` asks you to lower an allowance once the chain has shrunk by 1 KiB or more, so every
+increase stays a reviewed diff.
+
+## Recipe 3e — Non-regression budgets
+
+The `budget` job in `ci.yml` checks the PR's base commit out beside the head
+and runs `node tools/budget.mjs ab`. Guard runs interleaved over the same
+targets for both CLIs, so the time comparison measures the code, not the
+runner. Each tree also reports its own agent-facing output sizes (context pack,
+task packets, MCP responses, llms bundles), its packed package weight, its
+runtime dependencies and its self-guard findings. `budgets.json` holds the
+ratios and floors. A breach fails the job unless the PR body declares
+`Budget-Exempt: <metric> — <reason>`; the full table goes to the job summary.
+An unmeasurable base is inconclusive, never a pass. To reproduce the table
+locally, run `git worktree add ../base origin/main` and then
+`npm run budget -- --base ../base` (`specs/031-non-regression-budgets`).
+
+Guard time is each tree's median of `samples` rounds (5 in `budgets.json`),
+and the tree that runs first alternates between rounds. A median of N samples
+ignores up to (N − 1) / 2 slowed samples of either tree: with five rounds, two
+guard runs delayed by a load burst, however long, cannot pull a median above
+the slowest of the other three. A load that rises steadily through the run
+moves the two medians only one sample apart. A difference under the floor
+(150 ms) never fails. Below three samples there is no outlier margin: with
+`--samples 1`, one delayed process decides the verdict
+(`specs/062-budget-deterministic`).
+
+## Recipe 3f — Requirement anchors under human review
+
+`docguard anchors accept` records a reviewed link in
+`.docguard-anchor-lock.jsonl`, together with a reason, the fingerprints it
+replaced, and a `bulk` flag when it covers more than one link.
+
+**DocGuard authenticates nobody.** An agent can run `accept` as easily as a
+person, so require human review of the lock in the forge. Add this to
+`CODEOWNERS`, and require review from code owners in branch protection:
+
+```text
+.docguard-anchor-lock.jsonl @your-org/requirement-owners
+```
+
+**Merging.** Declare the lock `merge=union` in `.gitattributes`, so two
+branches that review links of the same spec merge without a conflict:
+
+```text
+.docguard-anchor-lock.jsonl merge=union
+```
+
+`docguard anchors accept … --gitattributes` adds that line; DocGuard never
+edits `.gitattributes` without the flag. If a union merge keeps two different
+lines for one link, guard reports ANC009 and treats the link as unreviewed
+until someone accepts it again.
+
+**Adoption.** Run `docguard anchors accept --baseline --bulk --reason "<why>"`
+once, and commit the lock. Baselined links are never counted as reviewed;
+`docguard anchors --format json` reports the baselined share.
+
+**Warnings.** Guard warns on:
+- a link whose code changed (ANC001);
+- a link whose requirement changed (ANC002);
+- a reviewed link whose tag is gone (ANC003).
+
+Read the change, then `docguard anchors accept --link '<key>' --reason "<what you checked>"`.
+
+**Failures.** Under the default `anchors.failOn: reviewed-exact`, ANC001 and
+ANC003 fail guard only for a link that was accepted as reviewed, is anchored
+to a symbol, statement or route, and was read by Babel or python3's `ast`.
+Everything else stays a warning. Set `"anchors": { "failOn": "none" }` to keep
+anchors advisory.
+
+`docguard specs complete` never counts the completing spec's own failing
+anchors toward SPC007. It lists them with their accept commands instead,
+because completing a spec is how its links get reviewed.
 
 ## Recipe 4 — Score (track CDD maturity over time)
 
-Posts the CDD score as a PR comment so reviewers see whether docs are getting
-better or worse with each change.
+`score --format json` reports structural maturity. Its numeric threshold is stable, while `assurance` explicitly states that factual accuracy remains unverified. Comparing scores is meaningful only with the same tool/configuration and a comparable coverage scope.
 
-```yaml
-name: DocGuard Score
-on:
-  pull_request: { branches: [main] }
-permissions:
-  contents: read
-  pull-requests: write
-jobs:
-  score:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: raccioly/docguard@v0.12.0
-        with:
-          command: score
-          format: json
-          score-threshold: '70'   # fail PRs that drop below 70/100
-```
+Use guard findings and declared verification evidence for enforcement. A high score alone does not establish current documentation, correct prose, or regulatory compliance.
 
 ## Recipe 1b — GitLab CI / Jenkins (JUnit output)
 
-Not on GitHub? `guard --format junit` emits one testcase per validator, which
-GitLab and Jenkins render natively in their test UIs:
+`guard --format sarif` emits SARIF 2.1.0 for GitHub Code Scanning and enterprise dashboards. Every result carries the finding's channels in `properties`: `disposition` (`act` when DocGuard names the correction, `escalate` when the judgement is the reader's), `confidence`, `evidence` (`measured` or `not-measured`), `parserTier`, `reportable`, `suggestionKind`, and the intrinsic and effective severities. Gate automation on `disposition` rather than severity alone — a blocking result can still be an escalation, and applying an automated fix to one silences a signal without resolving it. `parserTier` of `regex-fallback` or `fallback-language` means no syntax tree was available for that file, so absence of a result there is weak evidence.
 
-```yaml
-# .gitlab-ci.yml
-docguard:
-  image: node:20
-  script:
-    - npx docguard-cli guard --format junit > docguard-junit.xml
-  allow_failure:
-    exit_codes: [2]        # warnings stay visible but don't block the pipeline
-  artifacts:
-    when: always
-    reports:
-      junit: docguard-junit.xml
-```
-
-```groovy
-// Jenkinsfile — gate on errors (exit 1); treat warnings-only (exit 2) as unstable
-stage('DocGuard') {
-  steps {
-    sh '''
-      set +e
-      npx docguard-cli guard --format junit > docguard-junit.xml
-      rc=$?
-      [ "$rc" -eq 2 ] && exit 0   # warnings: report, don't fail the stage
-      exit $rc
-    '''
-  }
-  post { always { junit 'docguard-junit.xml' } }
-}
-```
-
-Exit codes match `guard` (1 = errors, 2 = warnings). Both recipes gate on
-errors while letting warnings-only runs pass with the findings visible in the
-test report.
+`guard --format junit` emits a test report suitable for GitLab/Jenkins ingestion. Install a fixed DocGuard version in the job, capture the exit status, and upload the report even on failures. Permitting exit 2 is an explicit warning policy; other nonzero statuses remain failures.
 
 ## Recipe 4b — Score history across ephemeral CI runs
 
-`docguard ci` appends each run to `.docguard/history.jsonl` (local-first —
-the directory is gitignored). CI workspaces are fresh every run, so restore
-and save the file with a cache step to keep `docguard score --trend` and
-`docguard report` seeing the full trajectory:
-
-```yaml
-jobs:
-  ci:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache@v4
-        with:
-          path: .docguard/history.jsonl
-          key: docguard-history-${{ github.ref_name }}-${{ github.run_id }}
-          restore-keys: docguard-history-${{ github.ref_name }}-
-      - run: npx docguard-cli ci --threshold 70
-      - run: npx docguard-cli score --trend   # print the trajectory in the job log
-```
+`ci` records history by default. `--no-history` opts out. Ephemeral runners need an explicitly configured artifact or cache policy if trends are to span runs. Treat restored history as informational data, not proof that the current checkout was verified. Avoid sharing writable caches between untrusted pull requests and privileged release workflows.
 
 ## Recipe 4c — Multi-repo scorecard (no extra tooling)
 
-For an org-wide view, run the gate per repo and collect the JSON — no
-dedicated command needed:
+Run `ci --format json` per repository and retain project, revision, tool version, configuration, status, and assurance scope. Aggregate findings by code while preserving their repository ownership. Report unsupported and unclassified coverage alongside successful checks.
 
-```bash
-for d in repo-a repo-b repo-c; do
-  (cd "$d" && npx docguard-cli ci --format json --no-history \
-    | jq -r '[.project, .score, .grade, .status] | @tsv')
-done | column -t
+## Recipe 4d — Detector precision regression
+
+Run the network-free synthetic corpus on ordinary pull requests:
+
+```sh
+node benchmarks/run.mjs --baseline benchmarks/baseline.json
 ```
 
-Each line is `project  score  grade  PASS|WARN|FAIL`. Pipe to a dashboard,
-spreadsheet, or a scheduled Slack post. (A first-class cross-repo dashboard
-is the Phase 5 roadmap item — this recipe is the zero-dependency version.)
+Run the full pinned public corpus in a separate trusted, network-enabled job when detector or scanner behavior changes:
+
+```sh
+node benchmarks/run.mjs --external --baseline benchmarks/baseline.json
+```
+
+Treat a core comparison failure as a quality regression. In the network-free run the pinned public baseline cases were not selected; they appear under `comparison.core.outOfSelection` and are not regressions. The loader validates the baseline envelope before the run starts and refuses one whose metrics or caveat no longer match its cases. Persisted runtime snapshots stay advisory even when environment labels match. Apply the 20-percent gate only to at least five controlled samples from the same paired comparison session. Updating the baseline is a reviewed change: inspect every added or removed case, label, unsupported result, and confidence limit before using `--replace-baseline`.
 
 ## Pre-commit hook (no GitHub Actions required)
 
-Run guard locally before every commit so you catch drift at typing time, not
-in CI. Works with [husky](https://typicode.github.io/husky/),
-[lefthook](https://github.com/evilmartians/lefthook), or plain Git hooks.
+`docguard hooks --type pre-commit` installs a local gate that prefers the repository's installed DocGuard binary. The hook blocks an unavailable runtime. When husky, lefthook or simple-git-hooks owns the hook, DocGuard writes nothing and prints the line to add to that manager's configuration. `--auto-fix` additionally applies mechanical fixes and stages their output; enable it only when that mutation is intended.
 
-```yaml
-# .lefthook.yml
-pre-commit:
-  commands:
-    docguard:
-      run: npx docguard-cli guard --changed-only
-      glob: '**/*.{ts,tsx,js,jsx,py,go,rs,java,kt,rb}'
-```
+A Git hook lives in the shared `.git/hooks` and is active on every branch and linked worktree, while `.docguard.json` is a branch-local tracked file. The installed hook therefore skips any working tree with no `.docguard.json` and lets the commit through, and treats guard exit `3` (errors in an uninitialised project) as allowed rather than blocking. A project that never adopted DocGuard is not blocked by a hook installed from another branch; adopted projects are gated exactly as before.
 
-`--changed-only` ships in v0.12 and runs only Docs-Sync, Environment, and
-API-Surface against the staged files (instead of all 27 validators against
-the whole repo). See Recipe 5 below.
+Regenerate installed hooks after upgrading to pick up changes in hook behavior. The pre-push score hook parses real JSON and enforces its configured minimum; it complements the full CI gate. Local hooks can be bypassed, so protected merges remain necessary for shared enforcement.
 
 ## Recipe 5 — Pre-commit lite (changed files only)
 
-For developers who want zero-cost feedback before push:
-
-```bash
-npx docguard-cli guard --changed-only --since HEAD~1
-```
-
-This runs a curated subset of validators (Docs-Sync, Environment, API-Surface)
-against files modified since the given ref. Designed to complete in under 2
-seconds on average repos. See `docs-canonical/ARCHITECTURE.md` for the
-selected-validators rationale.
+`guard --changed-only --since <ref>` runs its curated validator subset with changed-file scoping, plus explicitly escalated validators. Use a full guard at the merge boundary. The entry point and `guard.mjs` define the current subset; a copied list in this recipe would drift.
 
 ## Permissions cheatsheet
 
-| Recipe | `contents` | `pull-requests` | Notes |
-|--------|------------|-----------------|-------|
-| Guard | `read` | none (or `write` for score comment) | Safe on fork PRs. |
-| Auto-Fix | `write` | `write` | Skips fork PRs automatically. |
-| Sync | `write` | `write` (PR variant only) | Schedule variant pushes to default branch. |
-| Score | `read` | `write` | Always safe. |
+| Operation | Default authority | Additional authority |
+|---|---|---|
+| Guard, score, report | Repository read | Artifact storage if configured |
+| Mechanical repair | Read/write controlled checkout | Branch/PR publication only when enabled |
+| Feedback preview | Local analysis | User submits reviewed public metadata voluntarily |
+| External precision corpus | Public read-only Git fetch | Network access to exact pinned commits; no project script execution |
+| Scheduled review | Repository read | Notification or publication only when explicitly configured |
 
 ## Action inputs reference
 
-| Input | Default | Used by |
-|-------|---------|---------|
-| `command` | `guard` | all |
-| `working-directory` | `.` | all |
-| `node-version` | `20` | all |
-| `format` | `text` | guard / score / diff |
-| `fail-on-warning` | `false` | guard |
-| `score-threshold` | `0` | score |
-| `auto-commit` | `false` | fix / sync |
-| `commit-message` | `docs: apply DocGuard mechanical fixes` | fix / sync |
-| `comment-on-pr` | `false` | fix / sync (also score has its own comment) |
-| `bot-name` | `docguard-bot` | fix / sync |
-| `bot-email` | `docguard-bot@users.noreply.github.com` | fix / sync |
+`action.yml` is the authoritative composite-action input contract. Review command selection, CLI version (`docguard-version`; empty installs the version the action release was published with), warning policy, score threshold, working directory, and optional commit/comment flags. Pin the action to a reviewed commit and retain the corresponding release label for maintenance.
 
 ## Action outputs reference
 
-| Output | Type | Set by |
-|--------|------|--------|
-| `score` | number (0-100) | command=score |
-| `grade` | string (A+..F) | command=score |
-| `result` | JSON | command=score, format=json |
-| `fixes-applied` | number (file count) | command=fix or sync |
-| `changed-files` | newline-separated paths | command=fix or sync |
-| `committed` | `"true"` / `"false"` | auto-commit=true |
-
-Wire these into downstream steps:
-
-```yaml
-- id: fix
-  uses: raccioly/docguard@v0.12.0
-  with: { command: fix, auto-commit: 'true' }
-- if: steps.fix.outputs.fixes-applied != '0'
-  run: echo "Applied ${{ steps.fix.outputs.fixes-applied }} fixes"
-```
+Read the outputs declared in `action.yml` and the command's JSON schema before wiring downstream steps. Preserve unknown/unverified values. An integrity digest detects changes to covered report data; it is neither a trusted signature nor proof of a correct scanner.

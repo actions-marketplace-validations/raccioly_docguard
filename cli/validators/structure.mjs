@@ -1,16 +1,27 @@
+import { remapDocPath } from '../shared-doc-roles.mjs';
 /**
  * Structure Validator — Checks that all required CDD files exist
  *
- * v0.29: migrated to structured findings (STR001–STR003). Messages are
+ * v0.29: migrated to structured findings (STR001–STR003).
+ * STR004/STR005 measure agent instruction chains against a byte budget.
+ *
+ * @implements docguard.agent-instruction-budget#FR-002 {scope=file}
+ * @implements docguard.agent-instruction-budget#FR-003 {scope=file}
+ * @implements docguard.agent-instruction-budget#FR-004 {scope=file} Messages are
  * byte-identical to the legacy strings — resultFromFindings derives the
  * errors/warnings arrays from the same findings, so counts, exit codes, and
  * existing tests are unaffected; guard just renders richer output.
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 import { docHasSection } from '../shared.mjs';
+import { isUneditedScaffold, scaffoldEvidence } from '../shared-scaffold.mjs';
 import { mkFinding, resultFromFindings } from '../findings.mjs';
+import { measureInstructionChains, DEFAULT_INSTRUCTION_BUDGET } from '../scanners/agent-instructions.mjs';
+
+// An allowance this far above the chain's size is slack in the ratchet.
+const ALLOWANCE_SLACK_BYTES = 1024;
 
 export function validateStructure(projectDir, config) {
   const findings = [];
@@ -81,6 +92,49 @@ export function validateStructure(projectDir, config) {
     findings.push(missingFile(config.requiredFiles.driftLog));
   }
 
+  // Agent instruction budget (docguard.agent-instruction-budget#FR-002–FR-004).
+  // An agent silently stops reading past its limit, so an oversized chain means
+  // the instructions written are not the instructions read.
+  const budgetCfg = config.agentInstructions || {};
+  const maxBytes = Number.isInteger(budgetCfg.maxBytes) && budgetCfg.maxBytes > 0 ? budgetCfg.maxBytes : DEFAULT_INSTRUCTION_BUDGET;
+  const allowances = budgetCfg.allowances && typeof budgetCfg.allowances === 'object' ? budgetCfg.allowances : {};
+  for (const chain of measureInstructionChains(projectDir)) {
+    total++;
+    const allowance = Number.isInteger(allowances[chain.leaf]) ? allowances[chain.leaf] : null;
+    const limit = allowance ?? maxBytes;
+    const via = chain.files.length > 1 ? ` (${chain.files.join(' + ')})` : '';
+    if (chain.bytes > limit) {
+      findings.push(mkFinding({
+        code: 'STR004',
+        validator: 'structure',
+        severity: 'warn',
+        confidence: 'high',
+        disposition: 'escalate',
+        message: `Agent instruction chain for ${chain.leaf} is ${chain.bytes} bytes${via}, over its ${allowance === null ? 'budget' : 'allowance'} of ${limit}; an agent stops reading at the limit and the last (most specific) rules are the ones dropped`,
+        location: chain.leaf,
+        suggestion: {
+          kind: 'review',
+          text: 'Move procedures into linked docs, cut duplicated rules, or record an allowance in agentInstructions.allowances so any further growth is a reviewed change',
+        },
+      }));
+      continue;
+    }
+    passed++;
+    if (allowance !== null && allowance - chain.bytes >= ALLOWANCE_SLACK_BYTES) {
+      findings.push(mkFinding({
+        code: 'STR005',
+        validator: 'structure',
+        // Informational by its registered default (CODES.STR005.defaultLevel).
+        severity: 'warn',
+        confidence: 'high',
+        disposition: 'act',
+        message: `Agent instruction chain for ${chain.leaf} is ${chain.bytes} bytes, well under its allowance of ${allowance}; lower the allowance so the chain cannot grow back`,
+        location: chain.leaf,
+        suggestion: { kind: 'fix', text: `Set agentInstructions.allowances["${chain.leaf}"] to ${Math.max(chain.bytes, maxBytes)}${chain.bytes <= maxBytes ? ' (or remove it: the chain is within the default budget)' : ''}` },
+      }));
+    }
+  }
+
   return { name: 'structure', ...resultFromFindings(findings, { passed, total }) };
 }
 
@@ -105,7 +159,8 @@ export function validateDocSections(projectDir, config) {
       : ['## Setup Steps'], // Always need setup steps, env vars optional
   };
 
-  for (const [file, sections] of Object.entries(requiredSections)) {
+  for (const [defaultFile, sections] of Object.entries(requiredSections)) {
+    const file = remapDocPath(config, defaultFile);
     const fullPath = resolve(projectDir, file);
     if (!existsSync(fullPath)) continue;
 
@@ -144,7 +199,7 @@ export function validateDocSections(projectDir, config) {
       } else {
         findings.push(mkFinding({
           code: 'STR003',
-          validator: 'structure',
+          validator: 'docSections',
           severity: 'warn',
           message: `${file}: missing section "${section}". ` +
             `If genuinely not applicable, add: <!-- docguard:section ${slug} n/a — your reason -->`,
@@ -156,6 +211,29 @@ export function validateDocSections(projectDir, config) {
           },
         }));
       }
+    }
+
+    // An unedited scaffold: nothing a reader wrote beyond the template. The
+    // owner and status placeholders alone never trigger it (generate leaves
+    // them) but are named as evidence when it does. A reasoned section N/A
+    // marker (including `scaffold n/a`) makes the document owned, not a scaffold.
+    // @implements docguard.doc-validator-fidelity#FR-007
+    if (isUneditedScaffold(content, basename(defaultFile, '.md'))) {
+      const evidence = scaffoldEvidence(content);
+      findings.push(mkFinding({
+        code: 'STR006',
+        validator: 'docSections',
+        severity: 'warn',
+        message: `${file}: unedited scaffold — nothing beyond the template` +
+          (evidence.length ? ` (${evidence.join('; ')})` : '') +
+          `. Write the document, or if it is intentionally blank add: <!-- docguard:section scaffold n/a — your reason -->`,
+        location: file,
+        suggestion: {
+          kind: 'suppress',
+          text: 'Write the document, run `docguard generate --plan --write`, or own the absence with the inline N/A marker',
+          pragma: '<!-- docguard:section scaffold n/a — your reason -->',
+        },
+      }));
     }
   }
 

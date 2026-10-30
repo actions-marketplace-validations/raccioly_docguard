@@ -24,10 +24,77 @@ Usage: speckit-submission.py (--url|--body) <version> <download_url>
 """
 import sys
 import json
+from pathlib import Path
 from urllib.parse import urlencode, quote
 
 FORM_URL = "https://github.com/github/spec-kit/issues/new"
 TEMPLATE = "extension_submission.yml"
+MANIFEST = Path(__file__).resolve().parents[2] / "extensions/spec-kit-docguard/extension.yml"
+
+
+def _scalar(value: str) -> str:
+    return value.split(" #", 1)[0].strip().strip("\"'")
+
+
+# @implements docguard.extension-manifest-hygiene#FR-005
+def manifest_metadata(path: Path = MANIFEST):
+    """Read the catalog-facing fields from the manifest, the single source.
+
+    Repeating them here is how the catalog entry went stale (5 tags against
+    the manifest's 9, and a Spec Kit floor of >=0.1.0 while the hooks needed
+    0.11.2). specs/018-extension-manifest-hygiene FR-005.
+    """
+    meta = {"tags": []}
+    section = None
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        content = raw.lstrip()
+        indent = len(raw) - len(content)
+        if indent == 0:
+            section = content[:-1] if content.endswith(":") else None
+            continue
+        key, _, value = content.partition(":")
+        if section == "extension" and indent == 2 and key in ("description", "category", "effect"):
+            meta[key] = _scalar(value)
+        elif section == "requires" and indent == 2 and key == "speckit_version":
+            meta["speckit_version"] = _scalar(value)
+        elif section == "tags" and content.startswith("- "):
+            meta["tags"].append(_scalar(content[2:]))
+    missing = [k for k in ("description", "category", "effect", "speckit_version") if not meta.get(k)]
+    if missing or not meta["tags"]:
+        raise RuntimeError(f"Could not read {missing or ['tags']} from {path}")
+    return meta
+
+
+def manifest_inventory(path: Path = MANIFEST):
+    """Read command and hook names from the extension manifest without PyYAML."""
+    commands, hooks = [], []
+    section = subsection = None
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        content = line.lstrip()
+        indent = len(line) - len(content)
+
+        if indent == 0:
+            section = content[:-1] if content.endswith(":") else None
+            subsection = None
+            continue
+
+        if section == "provides":
+            if indent == 2:
+                subsection = content[:-1] if content.endswith(":") else None
+            elif (subsection == "commands" and indent == 4
+                  and content.startswith("- name:")):
+                commands.append(content.split(":", 1)[1].strip().strip("\"'"))
+        elif section == "hooks" and indent == 2 and content.endswith(":"):
+            hooks.append(content[:-1])
+
+    if not commands or not hooks:
+        raise RuntimeError(f"Could not read commands and hooks from {path}")
+    return commands, hooks
 
 
 def changelog_section(version: str) -> str:
@@ -56,19 +123,16 @@ def changelog_section(version: str) -> str:
 
 
 def build(version: str, download_url: str):
+    commands, hooks = manifest_inventory()
+    meta = manifest_metadata()
+    command_count, hook_count = len(commands), len(hooks)
     catalog_entry = {
         "docguard": {
             "name": "DocGuard — CDD Enforcement",
             "id": "docguard",
-            "description": (
-                "The only doc-integrity engine with an MCP server, "
-                "SARIF/JUnit output, and a deterministic zero-LLM core. "
-                "Validates, scores, and traces documentation against code — "
-                "27 validators, stable finding codes, adoption baseline for "
-                "legacy repos, compliance-evidence reports, GitHub Action "
-                "with PR annotations, spec-kit hooks. Pure Node.js, one "
-                "pinned dep."
-            ),
+            "description": meta["description"],
+            "category": meta["category"],
+            "effect": meta["effect"],
             "author": "raccioly",
             "version": version,
             "download_url": download_url,
@@ -83,16 +147,13 @@ def build(version: str, download_url: str):
             ),
             "license": "MIT",
             "requires": {
-                "speckit_version": ">=0.1.0",
+                "speckit_version": meta["speckit_version"],
                 "tools": [
                     {"name": "node", "version": ">=18.0.0", "required": True}
                 ],
             },
-            "provides": {"commands": 6, "hooks": 3},
-            "tags": [
-                "documentation", "validation", "quality", "cdd",
-                "traceability", "ai-agents", "enforcement", "spec-kit",
-            ],
+            "provides": {"commands": command_count, "hooks": hook_count},
+            "tags": meta["tags"],
             "verified": False,
             "downloads": 0,
             "stars": 0,
@@ -115,32 +176,31 @@ def build(version: str, download_url: str):
          catalog_entry["docguard"]["documentation"]),
         ("changelog", "Changelog URL (optional)",
          "https://github.com/raccioly/docguard/blob/main/CHANGELOG.md"),
-        ("speckit-version", "Required Spec Kit Version", ">=0.1.0"),
+        ("speckit-version", "Required Spec Kit Version", meta["speckit_version"]),
         ("required-tools", "Required Tools (optional)",
          "- node (>=18.0.0) - required\n"
          "- npx - required\n"
          "- specify - optional (auto-initializes the SDD workflow during docguard init)"),
-        ("commands-count", "Number of Commands", "6"),
-        ("hooks-count", "Number of Hooks (optional)", "3"),
-        ("tags", "Tags",
-         "documentation, validation, quality, cdd, traceability, ai-agents, enforcement, spec-kit"),
+        ("commands-count", "Number of Commands", str(command_count)),
+        ("hooks-count", "Number of Hooks (optional)", str(hook_count)),
+        ("tags", "Tags", ", ".join(meta["tags"])),
         ("features", "Key Features",
-         "- 19-validator quality gate with severity triage and a remediation plan\n"
+         "- Configurable quality gate with severity triage and a remediation plan\n"
          "- AI-driven documentation repair with codebase research and validation loops\n"
          "- Cross-document semantic consistency analysis (read-only review)\n"
          "- CDD maturity score with an ROI-based improvement roadmap\n"
          "- Reverse-engineers canonical docs from an existing codebase\n"
-         "- spec-kit workflow hooks (after_implement, before_tasks, after_tasks)"),
+         f"- spec-kit workflow hooks ({', '.join(hooks)})"),
         ("testing", "Testing Checklist", None),
         ("requirements", "Submission Requirements", None),
         ("testing-details", "Testing Details",
-         "**Tested on:** Linux + macOS with the spec-kit CLI.\n\n"
+         "**Release verification:** Record the platforms and results actually tested before submission.\n\n"
          "**Install:**\n```bash\n"
          f"specify extension add docguard --from {download_url}\n```\n\n"
-         "**Scenarios verified:**\n"
+         "**Scenarios to verify for this release:**\n"
          "1. Extension installs from the release ZIP without manifest validation errors.\n"
-         "2. All six `speckit.docguard.*` commands resolve and run.\n"
-         "3. The three workflow hooks register against spec-kit's lifecycle."),
+         f"2. All {command_count} declared `speckit.docguard.*` commands resolve and run.\n"
+         f"3. All {hook_count} declared workflow hooks register against spec-kit's lifecycle."),
         ("example-usage", "Example Usage",
          "```bash\n"
          "# Install the extension\n"
@@ -179,7 +239,7 @@ def render_body(fields, checkbox_items) -> str:
     blocks = []
     for fid, label, value in fields:
         if value is None:  # checkbox group
-            ticked = "\n".join(f"- [x] {item}" for item in checkbox_items[fid])
+            ticked = "\n".join(f"- [ ] {item}" for item in checkbox_items[fid])
             blocks.append(f"### {label}\n\n{ticked}")
         else:
             blocks.append(f"### {label}\n\n{value}")

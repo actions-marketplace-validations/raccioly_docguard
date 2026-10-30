@@ -1,13 +1,13 @@
 # Data Model
 
-<!-- docguard:version 0.5.0 -->
+<!-- docguard:version 0.17.0 -->
 <!-- docguard:status active -->
-<!-- docguard:last-reviewed 2026-07-03 -->
+<!-- docguard:last-reviewed 2026-10-13 -->
 
 | Metadata | Value |
 |----------|-------|
 | **Status** | ![Status](https://img.shields.io/badge/status-active-brightgreen) |
-| **Version** | `0.4.0` |
+| **Version** | `0.17.0` |
 | **Database** | None — DocGuard is a stateless CLI tool |
 | **Storage** | File-system only (reads project files, writes generated docs) |
 
@@ -15,7 +15,7 @@
 
 ## Entities
 
-DocGuard has **no database**. It is a stateless CLI tool that reads project files and produces output. The "data model" consists of the configuration schemas, validator output formats, and document metadata structures documented below. All data is file-system based — DocGuard reads `.docguard.json`, scans the project directory, and validates canonical documents against the codebase.
+DocGuard uses filesystem artifacts for configuration, optional caches, and history. Commands read project files and produce structured output. The "data model" consists of the configuration schemas, validator output formats, and document metadata structures documented below. All data is file-system based — DocGuard reads `.docguard.json`, scans the project directory, and validates canonical documents against the codebase.
 
 ## Configuration: `.docguard.json`
 
@@ -29,7 +29,7 @@ The primary data structure. Controls all CLI behavior.
 | `version` | `string` | No | `"0.1"` | Config schema version |
 | `projectType` | `string` | No | Auto-detected | One of: `cli`, `webapp`, `api`, `library`, `monorepo` |
 | `requiredFiles.canonical` | `string[]` | No | 5 docs-canonical files | Paths to required CDD documents |
-| `requiredFiles.agentFile` | `string[]` | No | `["AGENTS.md", "CLAUDE.md"]` | AI agent config file options |
+| `requiredFiles.agentFile` | `string[]` \| `string` | No | `["AGENTS.md", "CLAUDE.md"]` | AI agent config file options; any one suffices. A single string is read as a one-element list |
 | `requiredFiles.changelog` | `string` | No | `"CHANGELOG.md"` | Changelog file path |
 | `requiredFiles.driftLog` | `string` | No | `"DRIFT-LOG.md"` | Drift log file path |
 
@@ -49,9 +49,25 @@ The primary data structure. Controls all CLI behavior.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `validators.*` | `boolean` | No | `true` | Enable/disable individual validators |
+| `validators.docSections` / `severity.docSections` | `boolean` / `string` | No | follows `structure` | Doc Sections (STR003, and STR006 for an unedited scaffold). Unset, the `structure` switch, severity and N/A marker apply to it |
 | `collections.*` | `string` (glob) | No | — | Binds a documentation noun to a code collection: `"extractors": "src/extractors/*.py"` lets Metrics-Consistency flag a documented count that disagrees with the file count |
 | `docs.dirs` | `string[]` | No | Auto-detected | EXTENDS the auto-detected documentation homes (docs/, documentation/, guides/, …) with non-standard dirs; exclude via `.docguardignore` |
 | `severity.*` | `"high" \| "medium" \| "low"` | No | `"medium"` | Per-validator exit-code weight — `high` promotes warnings to blocking, `low` demotes them (display unchanged) |
+| `findingSeverity.<CODE>` | `"high" \| "medium" \| "low"` | No | — | Exact stable-code enforcement; takes precedence over validator policy. Intrinsic errors require an exact code entry to be demoted. |
+| `agentInstructions.maxBytes` | `integer` | No | `32768` | Byte budget per `AGENTS.md` chain (STR004) and per harness and path (PSR003). For Claude Code the total includes files pulled in by `@path` imports (relative to the importing file, up to 5 hops); a missing import is PSR002 |
+| `agentInstructions.allowances.<file>` | `integer` | No | — | Per-chain allowance keyed by the chain's deepest file; slack of 1 KiB or more reports STR005 |
+| `specFirst.paths` / `specFirst.exemptKinds` | `string[]` | No | Everything except Markdown, `specs/**` and tests / `release, deps, typo, test-only` | Governed paths and allowed `Spec-Exempt` kinds for `specs require` |
+| `validators.docDependency` / `pathScopedRules` / `docOwnership` / `requirementAnchors` | `boolean` | No | `true` | Each applies only when its input exists: a `covers=` declaration, agent instruction files, an `ownership` block or `.devin/wiki.json`, an anchor lock or `anchors.enabled` |
+| `anchors` | `object` | No | — | Requirement anchors (specs/070-requirement-anchors): opt-in before a lock exists (`enabled`), which suspect and lost links fail guard (`failOn`: `reviewed-exact` or `none`), foreign tag formats (`import`, `importMap`), the ripple cap (`fanOutLimit`), where `--orphans` looks (`orphanPaths`), the tree-sitter artifacts (`treeSitter.artifacts`) and the TestGuard files read (`testguard.evidence`, `testguard.claims`). `docs/configuration.md` lists each key's default |
+| `detection.includeNonProduct` | `boolean` | No | `false` | Read test, fixture, example and mock directories as product code during surface detection (routes, env vars, frameworks). Package segments such as `src/main/java/com/example` or a Go `internal/example` package are always product code |
+| `diagrams.moduleGraph.depth` / `maxNodes` / `include` | `integer` / `integer` / `string[]` | No | `2` / `30` (cap 60) / every product source file | Shape of the `module-graph` section |
+| `memory.symbolMap.maxBytes` | `integer` | No | `4096` (256–16384) | Budget of the symbol map `memory --pack --symbols` adds |
+| `devinWiki.maxPages` | `integer` | No | `30` (up to 80) | Page cap for linting `.devin/wiki.json`; 80 on Devin enterprise plans |
+| `ownership` | `object` | No | — | Doc ownership map, described below |
+| `baseline` | `boolean` | No | `true` | `false` ignores a committed `.docguard.baseline.json`, as `--no-baseline` does on every run |
+| `ignore` / `securityIgnore` / `todoIgnore` | `string[]` | No | `[]` | Path patterns skipped by every validator / Security only / TODO-Tracking only. `ignore` is merged with the active `.docguardignore` entries at load. Plain patterns: no reason, no expiry |
+| `validators.suppressions` | `boolean` | No | `true` | `.docguardignore` entry hygiene (IGN001–IGN003); not applicable when the file has no entries |
+| `suppressions.requireReason` | `boolean` | No | `false` | Report IGN002 for each `.docguardignore` entry with no `# reason`; the entry still applies |
 
 ### Example Configuration
 
@@ -92,6 +108,323 @@ The primary data structure. Controls all CLI behavior.
 }
 ```
 
+## Retirement Manifest: `.docguard-archive.json`
+
+The manifest is an append-only recovery ledger for documentation removed from
+active context by `docguard retire`. Git content remains authoritative; the
+manifest stores no retired prose.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `schemaVersion` | `number` | Manifest contract version; currently `1` |
+| `strategy` | `"git-history"` | Recovery storage strategy |
+| `entries[].path` | `string` | Former repository-relative document path |
+| `entries[].archivedAt` | ISO timestamp | Historical field name for retirement time |
+| `entries[].archivedFrom` | Git object ID | Source revision containing the exact document |
+| `entries[].blob` | Git object ID | Exact retired content identity; length follows repository object format |
+| `entries[].reason` | `string` | Reviewed retirement rationale |
+| `entries[].supersededBy` | `string` | Optional current replacement document |
+| `entries[].evidence` | `string[]` | Optional clean documents containing consolidated outcomes |
+| `entries[].requirementIds` | `string[]` | Requirement identities declared by the retired file; traceability keeps them as tombstones and never treats them as active requirements |
+| `entries[].retentionRef` | `string` | Branch ref proven to contain the source revision |
+| `entries[].objectFormat` | `"sha1" \| "sha256"` | Git repository object format |
+| `entries[].recoverability` | `"verified"` | Result of the retained-ref ancestor check at retirement time |
+| `entries[].restore` | `string` | Convenience command derived from structured source/path fields |
+
+Existing manifests may carry one shared top-level `retention` record for a
+batch created before per-entry retention metadata was introduced. The spec
+registry projects both forms into one normalized tombstone model. Lifecycle
+and traceability consumers reject incomplete recovery entries; an unverified
+manifest cannot suppress active-context or orphan-reference findings.
+
+## Spec Lifecycle Registry: `.docguard-specs.json`
+
+<!-- docguard:section id=spec-registry source=human covers="schemas/docguard-specs.schema.json, cli/commands/specs.mjs#completeSpec, cli/commands/specs.mjs#reanchorSpec" -->
+The committed registry indexes which specifications govern the project and what
+the repository can prove about them. It never copies requirement prose. Its
+normative JSON Schema is `schemas/docguard-specs.schema.json`.
+
+| Field | Authority | Description |
+|-------|-----------|-------------|
+| `$schema`, `schemaVersion` | Contract | Exact schema URL and version `2`; version 1 is read for migration and projects stale until refreshed |
+| `specs[].specId` | Spec metadata | Immutable lowercase namespaced identity; never generated or reused |
+| `specs[].path` | Projection | Current spec path or former path for a retired record |
+| `specs[].reviewed.lifecycle` | Human review | Orthogonal approval, delivery, context, retirement reason, storage, and persistence policy. `specs approve` records approval and a `planned`, `in_progress` or `implemented` delivery; `specs complete` records `verified` |
+| `specs[].reviewed.relations` | Human review | `extends`, `duplicates`, `conflictsWith`, `supersedes`, and `supersededBy` spec-ID edges |
+| `specs[].reviewed.scope.canonicalDocs` | Human review | Canonical documents affected by the specification |
+| `specs[].reviewed.scope.sourcePaths` | `generate --spec --write` | Optional. Code areas an as-built spec describes; SPR007 re-scans them. Serialized only when set |
+| `specs[].reviewed.scope.assetPaths` | Human review | Optional. Files the spec owns that cannot carry a spec annotation (digest-pinned fixtures, recorded outputs): `dir/` covers a directory, any other entry one file, no wildcards. Reconciliation links changes under them to the spec; an entry covering no tracked file is SPR009. Serialized only when set |
+| `specs[].reviewed.lifecycle.origin` | `generate --spec --write` | Optional. `as_built` marks a spec that records existing behaviour. Absent for forward specs, so older registries stay byte-identical |
+| `specs[].reviewed.reconciliation.lastReviewedRevision` | Human review | Exact Git revision whose doc impact was reviewed, or `null` |
+| `specs[].reviewed.reconciliation.outcomes` | Human review | Up to 20 reviewed implementation outcomes with revision, bounded rationale, evidence paths, deviations, and optional successor. Evidence paths and deviations are deduplicated and sorted (`localeCompare`); `specs complete` writes them in that order whatever order they were given in |
+| `specs[].reviewed.reconciliation.outcomes[].reanchoredFrom` | `specs reanchor` | Optional: the discarded revision an outcome was recorded at, and `method` — `blob-equal` (evidence compared) or `attested` (with a `reason`, and `differing` evidence paths when the target's bytes differ). Serialized only when set |
+| `specs[].reviewed.reconciliation.outcomes[].narrowedFrom` | `specs complete` | Optional: the review reconciled from a newer `--since` because the recorded revision's range exceeded the diff budgets even when read in batches — `revision` (the recorded one), `since`, `skippedCommits` (not reconciled) and `reason` (the budget). Serialized only when set |
+| `specs[].intent.requirements` | Projection | `specId#requirementId` identities parsed from the active spec |
+| `specs[].observed.artifacts` | Projection | Paths and SHA-256 content identities for spec, plan, and tasks |
+| `specs[].observed.taskCompletion` | Projection | Checked and total Markdown task boxes; not proof of delivery |
+| `specs[].observed.testEvidence` | Projection | Explicitly spec-qualified test annotations or labels only |
+| `specs[].observed.implementationEvidence` | Projection | Explicit `@implements specId#requirementId` source annotations only; names and proximity do not earn completion credit |
+| `tombstones[]` | Recovery projection | Retired identities linked to source revision, blob, retention ref, object format, and recoverability |
+
+`docguard specs --write` regenerates only projected fields and preserves the
+entire `reviewed` block. Unknown reviewed fields, invalid lifecycle values,
+duplicate identities, and archive/storage contradictions fail closed. The
+output omits timestamps and sorts unordered collections, so `specs --check`
+can compare a byte-stable result in CI. A non-current projection exposes up to
+25 bounded `differences` with a JSON-style field path, kind, and explanation.
+Order-only differences use kind `order`; changed, missing, and unexpected
+content remain distinct. Additional differences are reported as truncated.
+
+`docguard specs complete` requires a clean Git revision (changes confined to DocGuard's
+own `.docguard/` state directory still count as clean), coverage for every
+requirement through qualified implementation or test evidence, existing affected
+canonical documents, a supported reconciliation plan, and a guard result without
+errors. Declared task ledgers must be non-empty and fully checked. An approved
+`living` verification contract may omit the task ledger because its qualified
+requirement evidence is the durable completion proof; other persistence models
+still require one. Its staged transaction updates the bounded outcome,
+registry, feature-spec outcome index, and `.docguard/current-context.json` as one
+validated set. The context file contains pointers and content hashes rather than
+copying governing prose, and excludes every retired spec. A verified or released
+living spec can append a status-preserving maintenance outcome only when a new
+linked source, test, canonical document, or decision changed after the last
+reviewed revision. Generated registry and outcome updates do not satisfy that
+gate.
+<!-- /docguard:section -->
+
+## Doc Dependency Lock: `.docguard-doc-lock.json`
+
+A documentation section can declare the code it describes, on its marker:
+
+```markdown
+<!-- docguard:section id=pricing source=human covers="src/pricing.mjs#discount, src/rules/**" -->
+```
+
+`covers` entries are `path` (the file's bytes), `path#symbol` (a top-level
+declaration, or a member path at any depth such as `Class.method` or
+`outer.helper`) or a glob (the matching set). Paths are
+relative to the project; absolute paths, `..`, symlinks and `.docguardignore`d
+paths are refused. Only `docguard review` writes it: `--accept` records a
+review and `--prune` removes entries whose section dropped its `covers` attribute. Normative schema: `schemas/docguard-doc-lock.schema.json`.
+
+| Field | Meaning |
+|---|---|
+| `schemaVersion` | `1` |
+| `sections["<doc>#<id>"].dependencies["<covers entry>"]` | `{ tier, fingerprint }`: `ast` (normalized JS/TS AST of the symbol; formatting, comments and line moves do not change it), `python-ast` (`ast.dump` of the definition), `content` (sha256 of the file), or `glob` (hash of the sorted per-file fingerprints of the tracked files it matches; the working tree outside git) |
+| `sections[…].reviewedRevision` | HEAD at acceptance, or `null`; used only to print the diff command, so squash merges and shallow clones do not break comparison |
+| `sections[…].reviewedAt` | UTC date of acceptance |
+| `sections[…].reason` | What the reviewer checked (8–500 characters) |
+
+Keys are sorted at every level. A project with no `covers=` has no lock and no
+new findings.
+
+The fingerprints are the `doclock-v0` algorithm in `cli/scanners/fingerprint.mjs`.
+Every accepted section is pinned to it, so it stays fixed.
+
+When a `python-ast` fingerprint differs, DocGuard re-reads the symbol at
+`reviewedRevision` with today's `python3`. A match there means only the
+interpreter changed: the dependency is reported unverifiable. Accepting the
+section again records the current interpreter's fingerprint.
+
+## Requirement anchors
+
+`docguard anchors` (specs/070-requirement-anchors) resolves each
+`@implements` / `@req` tag in a non-test file to a **link**:
+
+| Field | Meaning |
+|---|---|
+| `key` | `<requirement>\|<file>\|<anchor>\|<scope>`, with `\|` and `%` percent-encoded inside parts |
+| `requirement` | `<specId>#<REQ>` when the declaring document has a Spec ID, else `<path>#<REQ>` |
+| `scope` | `file`, `symbol`, `statement` or `route` |
+| `anchor` | `*` (file), a qualified symbol (`Cart.total`, `Server.Run`), `<owner>>stmt:<requirement>#<n>` (the n-th statement tag for that requirement inside that owner), or `route:<METHOD> <path>` |
+| `tier` | `babel@7`, `python-ast@<major.minor>`, `pattern@<n>` or `file` |
+| `exact`, `floor`, `req` | `dg1:sha256:<hex>`: the resolving tier's code fingerprint, the pattern-tier floor over the same span, and the normalized requirement block |
+
+The `v1` code fingerprint covers decorators, parameters, the body, literals
+and directive comments (`@ts-ignore`, `//go:build`, `# type: ignore`, ...).
+Positions, whitespace, ordinary comments, docstrings and the symbol's own
+name are left out. A rename with an unchanged body therefore keeps its
+fingerprint, and adding a directive changes it.
+
+### Anchor lock: `.docguard-anchor-lock.jsonl`
+
+This file holds the reviewed state of links. Normative schema:
+`schemas/docguard-anchor-lock.schema.json`.
+
+**Layout:**
+- Line 1 is `{"kind":"docguard-anchor-lock","schemaVersion":1}`.
+- Every other line is one entry with sorted keys: `key`, `requirement`,
+  `file`, `anchor`, `scope`, `tier`, `code`, `floor` and `req` (the
+  fingerprints at accept time), `prev` (the fingerprints this accept
+  replaced, or `null`), `state` (`reviewed` or `baselined`), `revision`
+  (HEAD, used only to show the diff), `date`, `reason` (10–500 characters)
+  and `bulk`.
+
+**Reading and writing:**
+- The reader accepts any line order. Identical duplicates collapse.
+- Two different lines for one key are a conflict (ANC009), and the link
+  reads as unreviewed.
+- Only `docguard anchors accept` writes the file.
+
+**Link state:** derived from the lock and the current fingerprints.
+
+| State | Meaning |
+|---|---|
+| `unreviewed` | No entry |
+| `baselined`, `reviewed` | Every fingerprint matches |
+| `suspect` (`code`, `requirement` or `both`) | ANC001 / ANC002 |
+| `lost` | An entry whose tag is gone (ANC003) |
+| `retired-target` | The tag cites a retired requirement (ANC008) |
+| `unverifiable` | No comparison is possible |
+
+**Comparison:** when the tier is unchanged, the exact fingerprints are
+compared. Otherwise the pattern-tier floor is compared.
+
+## Doc Ownership Map: `ownership`
+
+The `ownership` block in `.docguard.json` maps doc sections to the source
+paths they are responsible for (specs/034-doc-ownership-map). People write it;
+DocGuard only reads it.
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `roots` | `string[]` | No | Directories whose source must be owned (default: top-level source modules) |
+| `entries[].doc` | `string` | Yes | Project-relative `.md` path |
+| `entries[].section` | `string` | No | A `docguard:section` id or heading anchor in `doc` |
+| `entries[].purpose` | `string` | No | What the section explains about these paths |
+| `entries[].paths` | `string[]` | Yes | Project-relative files, directories or globs |
+
+Each tracked file resolves to at most one owner: an exact path beats any glob,
+and a longer literal directory prefix beats a shorter one; two equal matches
+are a tie (OWN002). A malformed block is an error (OWN007), and every owner
+lookup reports that error until the block is fixed.
+
+## Adoption Baseline: `.docguard.baseline.json`
+
+`docguard guard --update-baseline` writes this file at the project root, to be
+committed so the team and CI share it. Guard and `ci` suppress up to the frozen
+number of each finding and gate everything else; `--no-baseline` or
+`"baseline": false` ignores the file.
+
+| Field | Meaning |
+|---|---|
+| `_comment` | Fixed explanation of the file and how to regenerate it |
+| `version` | `2`: each fingerprint carries an occurrence count |
+| `generatedAt` | ISO timestamp of the write; guard reports the baseline's age from it and never enforces one |
+| `count` | Number of distinct fingerprints |
+| `fingerprints` | Fingerprint → occurrence count, keys sorted |
+
+A fingerprint is the first 16 hex characters of SHA-256 over
+`code|path|message`. `code` is the finding code (`UNCODED` when absent), `path`
+is the location without its trailing `:line`, and `message` has every digit run
+replaced by `#` and whitespace collapsed. Before masking, an advisory tail
+declared for the code in `ADVISORY_TAILS` (`cli/writers/baseline.mjs`) is
+removed: text a validator appends that changes when unrelated files change.
+TRC004's ` — IR soft-match: …` hint is the only one, so every other code's
+fingerprint is the same as before (specs/052-baseline-stable-fingerprint).
+
+Guard matches a finding against its stable fingerprint first and then against
+the legacy fingerprint (the full message), so a baseline written by an earlier
+release keeps suppressing what it froze; `--update-baseline` rewrites it in the
+stable form. One finding consumes one unit from one entry. A malformed file, or
+one with no positive counts, is treated as absent, so every finding surfaces.
+
+## Ignore file: `.docguardignore`
+
+One entry per pattern line (specs/057-ignore-reasons):
+
+```text
+pattern  [expires:YYYY-MM-DD]  [# reason]
+```
+
+A line starting with `#` is a comment. `#` starts the reason only after
+whitespace; `expires:` is read only as the last word before the reason. A line
+with neither means what it meant before the grammar existed.
+`parseDocguardIgnore` (`cli/shared-ignore.mjs`) returns, per entry:
+
+| Field | Meaning |
+|---|---|
+| `pattern` | The pattern, or `null` when the line has only an expiry or reason |
+| `reason` | Text after the `#`, or `null` |
+| `expires` | The `YYYY-MM-DD` day, or `null` (absent or unreadable) |
+| `state` | `active`; `expired` (the UTC day is past); `invalid` (unreadable expiry or no pattern) |
+| `problem` | `no-pattern`, `unreadable-expiry` or `null` |
+| `line` | 1-based line number |
+
+Only `active` entries exclude anything: `loadDocguardIgnore` returns their
+patterns, so every validator and command applies the same rule. Patterns are matched by
+`globToRegex` (same file): gitignore wildcards, `?`, bracket expressions, `\`
+escapes and a leading-`/` root anchor; a middle slash does not anchor and a
+leading `!` is literal ([pattern syntax](../docs/configuration.md), "Excluding paths").
+
+### Suppression model
+
+`docguard ignore --format json` (`collectSuppressions`,
+`cli/scanners/suppressions.mjs`) lists every native suppression:
+
+| Field | Meaning |
+|---|---|
+| `asOf` | The UTC day expiries were judged against |
+| `entries[].kind` | `path`, `code` (inline pragma), `validator` / `section` (N/A marker), `fingerprint` (baseline) |
+| `entries[].pattern` / `codes` / `key` | The glob or fingerprint / the pragma's codes (`null` = any code; `docguard:ignore-secret` is `["SEC*"]`) / the validator key or section id |
+| `entries[].scope` | `all-validators`, `validator:<key>`, `section:<id>`, `line` (the pragma's line and the next), `finding` |
+| `entries[].reason` | What the author wrote, or `null`. Never synthesised |
+| `entries[].expires` | `YYYY-MM-DD` or `null`; only `.docguardignore` carries one |
+| `entries[].state` | `active`, `expired`, `invalid` (does not apply), `disabled` (baseline off) |
+| `entries[].source` | `{ file, line }` or `{ file, key }` |
+| `coverage.inlineScan` | `complete`, or `partial` when files could not be read |
+| `export` | The claimspec export report: `exported`, `candidates`, `omitted[]` (`at`, `pattern`, `why`), `rewritten[]` (`at`, `from`, `to`), `notRepresentable[]` (`category`, `count`, `why`), `complete` |
+
+### claimspec `ignore` export
+
+`docguard ignore --format claimspec` writes a claimspec v1 `ignore` document
+(`schemaVersion: 1`, `entries[]` of `kind: "path"`, `pattern`, `reason`,
+optional `expires`). Only `.docguardignore` entries are exported, and only when
+the reason is 8–2000 characters, the expiry is readable or absent, and gitignore
+syntax states the pattern's DocGuard scope exactly (`**/` is prefixed to an
+unanchored pattern containing a slash, a trailing `/` is dropped, and a leading
+`!`, a `**` inside a segment, an unclosed `[` or a POSIX class is refused). `expires` is the
+first instant after the stated day. The schemas are vendored byte-identical in
+`schemas/claimspec/v1/` from raccioly/testguard at the revision recorded in
+`cli/claimspec-schema.mjs`, and every document is validated before it is printed.
+
+## Generated caches and budgets
+
+| File | Written by | Shape |
+|---|---|---|
+| `.docguard/plan.cache.json` | the memory plan (guard, sync, generate) | `{ v, configKey, treeHash, plan, writtenAt }`. `v` is `"3"`: code sections may carry `completeness: "partial"` and a `partialReason`. A cache with another version, config key or tree hash is a miss and is rebuilt |
+| `.docguard/anchors.cache.json` | `docguard anchors` and the Requirement-Anchors validator, never in CI or with `--no-cache` | `{ v, identity, files }`: `v` is `1`, `identity` names the extractor (algorithm and tier versions), and `files` maps a path to `{ sha, value }`, where `sha` is the sha256 of the working-tree bytes. Another version or identity, or a different `sha`, is a miss. Ignored and reported (ANC010) while git tracks any file under `.docguard/` |
+| `.docguard/ts/<sha256>/` | the opt-in tree-sitter anchor tier | Copies of the configured runtime and grammar files whose sha256 matched the shipped manifest, named by that hash; the child process loads only these |
+| `budgets.json` | maintainers | `schemaVersion: 1`; sample count, guard targets, the time and byte budgets, and the agent tasks and MCP calls `tools/budget.mjs` measures |
+| `tools/suite-runtime-reference.json` | maintainers, with `tools/suite-runtime-budget.mjs reference` from CI test TAP | Per-test durations (ms) at reference-runner speed, with the runs they came from (`sources`, `inputs`), `speedFactorRange` and `maxNormalizedTestMs`. Used only to measure a run's speed factor for the per-test ceiling; refreshed when a run shares too few tests with it to measure that factor (`MIN_COMMON` in the tool; specs/051-release-cut-green FR-007) |
+| `benchmarks/agent-context/manifest-v2.json` | frozen once, before any run | Agent-context protocol v2: conditions `task-only`, `context-pack`, `context-pack-symbols`, six tasks with fixture and hidden-evaluator digests, and the promotion rule. Never run: its CLI version and model are unavailable on ChatGPT-account Codex (superseded by v3). `run.mjs` holds its digest and loads it only while every byte matches. Schemas: `docguard-agent-context-benchmark-v2.schema.json`, `docguard-agent-context-result-v2.schema.json` |
+| `benchmarks/agent-context/manifest-v3.json` | frozen once (2026-10-10), before any run | Agent-context protocol v3: v2 with only the executable pin (`model.cliVersion`, `model.id`) changed. `run.mjs` holds its digest, loads it only while every byte matches, and rejects it if anything outside the pin differs from v2. Results: `results/observed-v3.json` in the v2 result format |
+
+`.docguard/` holds only local state: the plan and anchor caches and the staged tree-sitter files above, score history, fix memory, feedback records, the nudge throttle, the context pack and the active context. It ignores itself: the first write creates `.docguard/.gitignore` containing `*` and keeps an existing one, so the project's own `.gitignore` stays as the project wrote it. `git rm -r --cached .docguard` untracks files that an earlier version let a project commit. DocGuard's dirty checks leave `.docguard/` out either way.
+
+## Task Context Packet
+
+`docguard agent --task <text> --format json` emits a transient
+`docguard.task-context` object governed by
+`schemas/docguard-task-context.schema.json`. The command does not persist the
+task or packet.
+
+| Field | Description |
+|-------|-------------|
+| `task.digest`, `task.characters` | Normalized task identity and bounded length; raw task text is omitted |
+| `provenance.git`, `provenance.registry` | Captured Git and lifecycle-registry state |
+| `assurance` | Retrieval-only scope, unknown factual accuracy, and unverified status |
+| `selection` | Targeted or abstained state, threshold, candidate/omission counts, excluded lifecycle documents, and fixed budgets |
+| `excerpts[]` | Repository-relative path, line range, content/file hashes, kind, optional spec ID, score, reasons, and bounded content |
+| `pointers[]` | Safe task, cited-source, implementation, or test paths with hashes and qualified requirements |
+| `verification[]` | Commands and purposes that still need execution |
+| `navigation` | Safe canonical-document inventory and approved current spec paths |
+| `limitations`, `coreDigest` | Explicit epistemic limits and deterministic packet-core identity |
+
+Selection reads at most 32 documents and 256 chunks, emits at most six
+16-line excerpts totaling 6,000 characters and eight pointers, and limits task
+input to 2,000 characters. An abstention emits no excerpts or pointers.
+
 ## Document Metadata Headers
 
 Every CDD document includes DocGuard metadata as HTML comments at the top:
@@ -113,16 +446,84 @@ Every CDD document includes DocGuard metadata as HTML comments at the top:
 
 ## Validator Output Format
 
-Each validator returns a standardized result object:
+Validators emit findings and aggregate counts. The guard adapter adds names and statuses:
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | `string` | Validator name (e.g., `"structure"`, `"changelog"`) |
+| `key` | `string` | Stable result key, unique per result (`structure`, `docSections`, `changelog`, …) |
+| `parent` | `string` | Present on a result a validator module emits beside its own (Doc Sections: `"structure"`); such a result is a check, not a separate validator module |
 | `status` | `string` | `"pass"`, `"warn"`, or `"fail"` |
-| `checks` | `object[]` | Array of individual check results |
-| `checks[].label` | `string` | Human-readable check description |
-| `checks[].passed` | `boolean` | Whether the check passed |
-| `checks[].message` | `string` | Details about the result |
+| `findings` | `object[]` | Stable code, validator, intrinsic `severity`, `effectiveSeverity`, enforcement source/key, `confidence`, `disposition`, `evidence`, `parserTier`, location, message, and normalized suggestion |
+| `passed`, `total` | `number` | Applicable check counts |
+| `errors`, `warnings` | `string[]` | Compatibility message arrays |
+| `applicable` | `boolean` | Optional applicability indicator; false becomes N/A |
+| `effectiveErrors`, `effectiveWarnings`, `effectiveInfos` | `number` | Exit-code counts after exact-code and validator policy |
+| `effectiveStatus` | `string` | Per-validator `pass`, `warn`, or `fail` after policy; intrinsic `status` remains available |
+
+## Precision evidence contract
+
+`guard` results carry `precisionEvidence`, scoped to the finding codes that run emitted (`schemas/docguard-precision-evidence.schema.json`). The unit of evidence is the finding code. DocGuard defines many more codes than the reviewed corpus measures, so a code the corpus never exercised reports `status: "not-measured"`, carries no ratio, and never inherits the measured precision of another code in the same validator. A measured code whose own precision denominator is below `minN` is marked `quotable: false` with a reason, and may carry a `backoff` to a coarser measured tier that names that tier (`validator` or `aggregate`). `measures` is always `benchmark-precision`; `caveat` is the sentence a consumer must show beside any quoted ratio; `source.matchesRunningVersion` is false when the numbers were measured on a different build than the one reporting them. `coverage` counts codes in the run by measurement status.
+
+The block is served from `cli/precision-evidence-data.mjs`, a generated module derived from `benchmarks/baseline.json` by `npm run generate:precision-evidence`, because `benchmarks/` is not part of the published package. A test compares the committed module against that projection, so a stale number fails the suite rather than shipping. Findings are written verbatim into feedback records, so their shape is a contract: it grows only by specification, and a test pins the exact key set.
+
+## Finding channels
+
+<!-- docguard:section id=finding-channels source=human covers="cli/findings.mjs#mkFinding, cli/findings.mjs#PARSER_TIERS" -->
+A finding answers three independent questions, one field each. A single `confidence` field had to serve all three, so a certain observation read as an uncertain one, and the feedback loop sampled only the findings its own label already doubted.
+
+| Field | Question | Values |
+|-------|----------|--------|
+| `severity` / `effectiveSeverity` | Does CI block? | `error`, `warn`, `info` (effective only: from `findingSeverity`, validator `severity`, or a code registered as informational, such as `STR005`; `enforcement.source` says which: `finding`, `validator`, `code` or `intrinsic`) |
+| `disposition` | Who decides — the tool or the reader? | `act`, `escalate` |
+| `confidence` | How sure is the detector of its **observation**? | `high`, `low` |
+| `evidence` | Has the reviewed corpus ever measured this code? | `{ status: 'measured' \| 'not-measured', … }` |
+| `parserTier` | Which analyzer produced it? | `js-ast`, `py-ast`, `regex-fallback`, `fallback-language`, `mixed`, `not-applicable` |
+
+`disposition` is `act` when DocGuard asserts a defect and names the correction, `escalate` when it reports a signal whose judgement belongs to the reader. A detector may set it explicitly; otherwise it derives from `suggestion.kind` (`fix`/`suppress` → `act`; `review`/`report` → `escalate`), and falls back to `escalate` when the suggestion is absent or malformed — a finding DocGuard can describe but can only describe is one a human should read. The three channels vary independently: FRS002 counts commits read directly from Git, so it is `confidence: high` and `disposition: escalate`. The count is a fact; the inference to staleness remains the reader's call.
+
+`evidence` is projected per finding code from the reviewed baseline by the same checked projection that serves `precisionEvidence` (`docguard.precision-evidence-loop#FR-019`). A `measured` entry carries `n`, its Wilson 95% interval, and a point estimate once `n` meets the published floor; an unmeasured code reports `not-measured` and always stands alone, inheriting no sibling's number. The object is frozen and shared per code, so a large run allocates one evidence object per code rather than one per finding.
+
+`reportable` is true when `evidence.status` is `not-measured` **or** `confidence` is `low`. Under the previous rule, which read confidence alone, the default feedback sample omitted the population where a wrong label costs most: a confident label on a code the corpus has yet to measure.
+
+`location` is always a string (`path` or `path:line`) or `null`. A detector that supplies `{ file, line }` is normalized at construction. Under the previous contract such findings rendered as `[object Object]`, and the SARIF location parser dropped them, so six codes reached GitHub Code Scanning with no file annotation at all.
+<!-- /docguard:section -->
+
+## Route records and the plan's parser tiers
+
+A route the scanners report (`scanRoutesDeep` in `cli/scanners/routes.mjs`)
+carries `method`, `path`, `file`, `source`, `auth`, its file's `tier` and
+`tierReason` when its reader records one, and `caseInsensitive: true` when its
+framework matches it ignoring case: every ASP.NET Core route, and Express,
+Koa, Fastify and NestJS routes as their settings decide
+(`cli/scanners/route-case.mjs`). Endpoint
+comparison (`compareEndpoints` in `cli/scanners/api-doc.mjs`) folds case only
+for such a route. The non-enumerable `scan.unresolved` lists every route a
+reader saw and left out of the surface, as `{ framework, code, file, line, target }`:
+the NestJS, Worker, Cloudflare Pages and router-library (Hono, itty-router,
+Koa) readers' limitations, Express and Fastify route paths and Express mount
+prefixes that are not literal (`route-unresolved-path`,
+`route-unresolved-prefix`), the Actix, Axum, Rocket, Symfony and Laravel
+readers' (`route-unresolved-path`, `route-unresolved-prefix`,
+`route-unresolved-method`, `route-unresolved-declaration`: a declaration the
+reader recognised but could not turn into a route), and the Python reader's
+(`python-unresolved-route-path`, `python-unresolved-include`,
+`django-unresolved-route`, `django-unresolved-include`), minus those in test,
+fixture, example or ignored files (specs 058, 063, 064, 071). `scan.caseNotes` lists
+each case setting whose value is an expression rather than a literal, as
+`{ framework, file, line, reason }`; the routes it may govern compare exactly.
+
+`generate --plan --format json` reports `surface.parserTiers` with one entry
+per surface (`endpoints`, `entities`) and three plan-wide fields (spec 063):
+
+| Field | Meaning |
+|---|---|
+| `tier`, `reason` | The surface's tier, and the reason for any tier below a full syntax tree |
+| `degraded` | A file whose language has a parser was read by `regex-fallback`; `surface.confidence` is `low` |
+| `patternRead`, `patternLanguages` | Facts in a language with no parser (`fallback-language`), and those languages; coverage is partial, confidence unchanged |
+
+Either flag marks the surface's sections `completeness: partial`. A `mixed`
+tier sets neither on its own.
 
 ## Fix Command Issue Format
 
@@ -150,10 +551,10 @@ The `score --format json` output:
 |-------|------|-------------|
 | `score` | `number` | CDD maturity score (0-100) |
 | `grade` | `string` | Letter grade: `A+`, `A`, `B`, `C`, `D`, `F` |
-| `breakdown` | `object` | Per-category scores |
-| `breakdown.structure` | `number` | Points for docs-canonical/ structure |
-| `breakdown.content` | `number` | Points for document completeness |
-| `breakdown.freshness` | `number` | Points for recently updated docs |
+| `categories` | `object` | Per-category score, weight, weighted contribution, and axis |
+| `scoreKind` | `string` | `structural-maturity` |
+| `assurance` | `object` | Factual accuracy remains unverified; extracted candidate count is heuristic |
+| `memory` | `object` | Completeness and structural alignment proxies; accuracy is null |
 
 ---
 
@@ -161,5 +562,107 @@ The `score --format json` output:
 
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
+| 0.17.0 | 2026-10-13 | DocGuard Team | Freshness review after specs 070–078: the `anchors` configuration block and `validators.requirementAnchors`; the anchor cache and staged tree-sitter files in `.docguard/`; `tools/suite-runtime-reference.json` (spec 051 FR-007) |
+| 0.16.0 | 2026-10-10 | DocGuard Team | Route records' `caseInsensitive` flag (ASP.NET Core, Express, Koa, Fastify, NestJS), `scan.caseNotes`, and `scan.unresolved` with Python limitations; the plan's `patternRead`/`patternLanguages` beside `degraded` (spec 063) |
+| 0.15.0 | 2026-10-10 | DocGuard Team | `.docguardignore` reasons and expiries, the suppression model, the claimspec `ignore` export, `validators.suppressions` and `suppressions.requireReason` (spec 057) |
+| 0.14.0 | 2026-10-10 | DocGuard Team | Freshness review for specs 038–053: the adoption baseline file and its fingerprint preimage, including the advisory-tail exclusion and legacy match (spec 052); the `baseline` key; `requiredFiles.agentFile` as a string (spec 050); Go `internal/example` as product code |
+| 0.13.0 | 2026-09-30 | DocGuard Team | Guard result `key`/`parent` and the `docSections` key; Claude Code `@path` imports in instruction budgets; tracked-only `glob` fingerprints (spec 049) |
+| 0.12.0 | 2026-09-30 | DocGuard Team | `.docguard/` ignores itself, and dirty checks leave it out (spec 042) |
+| 0.11.0 | 2026-09-30 | DocGuard Team | Freshness review for specs 028–037: configuration keys for the doc lock, path-scoped rules, ownership, diagrams and the symbol map; `review --prune` as a doc-lock writer; the plan cache (version 3), `budgets.json` and the frozen agent-context protocol v2 |
+| 0.10.0 | 2026-09-29 | DocGuard Team | Add registry `lifecycle.origin` / `scope.sourcePaths` for as-built specs, the `specKit` coverage tier, and the `agentInstructions` and `specFirst` configuration |
+| 0.9.0 | 2026-09-15 | DocGuard Team | Add bounded field-level spec-registry differences and direct evidence verification exit semantics |
+| 0.6.0 | 2026-09-14 | DocGuard Team | Add the document-retirement recovery manifest, retained-ref proof, and retired requirement tombstones |
 | 0.4.0 | 2026-03-13 | DocGuard Team | Complete rewrite — documented all config formats, output schemas, metadata headers |
 | 0.1.0 | 2026-03-13 | DocGuard Generate | Auto-generated skeleton |
+
+## Score assurance contract
+
+The numeric CDD score estimates structural maturity. Factual accuracy and regulatory assurance require separate evidence. Existing score and grade thresholds remain stable. Score JSON identifies its scope as `structural-maturity`. `memory.accuracy` is nullable: `null` represents unverified factual accuracy; the former proxy is exposed as `memory.structuralAlignment`. Consumers must preserve null as an unknown value.
+
+An `assurance` object accompanies score, diagnose, CI, and report output. It contains `status` (`unverified`), `factualAccuracy` (`null`), and `unverifiedClaims` (a count of extracted candidates, or null if extraction failed). Even zero extracted candidates leaves prose unverified. Claim discovery uses a bounded heuristic. These fields explain evidence limits while existing CI thresholds retain their numeric meaning.
+
+## Evidence verification contract: `.docguard-evidence.json`
+
+The optional version-1 manifest contains at most 128 declarations. Each immutable
+ID owns an `always` applicability declaration, one Markdown target, one source,
+and one compatible predicate. Unknown fields, duplicate IDs, unsafe paths, and
+ambiguous predicate combinations invalidate the manifest.
+
+| Source adapter | Required contract | Compatible predicate |
+|---|---|---|
+| `json-pointer` | Safe JSON file plus an RFC 6901 pointer | `equals` with an explicit JSON type, or `set-equals` for a duplicate-free string array |
+| `collection-count` | One bounded repository-relative glob and explicit `allowEmpty` policy | `count-equals` |
+| `python-literal-count` | Safe `.py` path, one ASCII module-level symbol, one uniquely assigned static list/tuple/set/dict literal, and explicit `allowEmpty` policy | `count-equals` |
+| `oasdiff` | Saved bounded JSON array, adapter version, producer version, `breaking` or `changelog` command, and current input hashes | `no-findings` |
+| `buf` | Saved bounded JSON Lines, adapter version, producer version, `breaking` command, and current input hashes | `no-findings` |
+
+Every result contains the declaration ID, stable claim and evidence identities,
+document location, adapter, predicate, captured input hashes, evidence hash,
+reason code, and scope limitation. The state is exactly one of
+`verified-within-scope`, `contradicted`, `stale`, `inconclusive`, or
+`unsupported`. Line movement and unrelated file edits preserve identity;
+changes to the selected statement, declaration, source, report, producer
+metadata, or declared inputs invalidate it. A verified declaration removes a
+heuristic claim from the unverified count only through a unique same-line,
+same-value match.
+
+`docguard verify --evidence` exits `0` for `verified-within-scope` and for an
+unconfigured manifest, `2` for `attention-required` (stale, inconclusive, or
+unsupported evidence), and `1` for `contradicted` or `invalid`. The JSON status
+and process status therefore carry the same enforcement meaning in direct CI use.
+
+## Feedback contribution contract
+
+## Adjudicated disagreements
+
+A reported false positive the maintainers review and decline to act on used to leave no trace. `assertContributionReady` refuses `ambiguous` and `policy_disagreement` — correctly, since a detector behaving as designed has a "this no longer fires" test it can never satisfy — and every other contribution path produces exactly that test. The corpus could therefore only ever absorb a false positive that had already been repaired, which made the measured precision a property of the contribution pipeline rather than of the detectors.
+
+`buildAdjudicationRow()` produces the missing artifact: a corpus case classified `ambiguous` or `policy_disagreement`, carrying the same synthetic and redaction attestations and the same opposite control as a measured case, plus an `adjudication` record (`rationale`, `adjudicatedAt`) so a later reviewer can audit the decision. Such a case declares an empty `expected` and `forbidden` set, because it asserts nothing about what the detector should emit.
+
+These rows are counted and kept outside every ratio. Scoring one as a false positive would let a user who dislikes a rule move its measured precision; scoring it as a true positive would let a maintainer turn disagreement into validation. Both would misreport, so `metrics.mjs` and the per-code derivation report `adjudicated: { policyDisagreements, ambiguous }` beside every rate and inside none of them, at corpus, per-code and run scope (`precisionEvidence.coverage.adjudicated`). A code appearing only in adjudication rows reports `not-measured` with its counts, standing alone as any unmeasured code does. Removing such a row fails baseline comparison as `case-removed`, which keeps a recorded disagreement auditable.
+
+`feedback` defaults to findings whose code is unmeasured or whose confidence is low, and reports what that leaves out (`excluded.findings`, `excluded.codes`). Selecting on confidence alone meant the channel that would validate the confidence label sampled only findings that label already doubted: on a repository with 17 confident findings across never-benchmarked codes, the default selected zero. `--code <CODE>` selects a finding regardless of confidence; `--all` includes all active findings. Classifications are `false_positive`, `false_negative`, `unsupported_syntax`, `ambiguous`, and `policy_disagreement`. False-negative and unsupported intake require a strict synthetic fixture manifest with an exact expected identity, explicit interestingness predicate, same-path opposite control, parser tier, bounded configuration, and synthetic/redaction attestations.
+
+`--fixture-manifest` verifies the reproduction and its control in separate temporary projects. `--reduce` removes fixture lines in deterministic order only while the declared predicate remains true. Duplicate identity hashes detector code, classification, parser tier, and normalized synthetic shape; preview returns all/open/closed GitHub searches and never submits. `--contribution tests/<name>.test.mjs` requires test-only, scope, and benchmark-delta evidence before writing a generated regression test. `--preview` skips every local write.
+
+## Precision benchmark contract
+
+`benchmarks/corpus.json` is a strict versioned manifest. Cases carry immutable ID, split, repository and causal groups, parser tier, classification, exact source revision or fixture digest, bounded config, scoped expected/forbidden identities, mutation preconditions, opposite control, and repair outcome. `benchmarks/baseline.json` is a strict envelope (`schemas/docguard-benchmark-baseline.schema.json`, envelope `schemaVersion` 2 around core `schemaVersion` 1) storing the reviewed deterministic core, grouped metrics, Wilson 95% confidence bounds, and separately identified environment/timing observations. Zero denominators remain `null`. The `review` block carries provenance: `status` (`candidate` from `--write-baseline`, `reviewed` only with `reviewedAt` and `reviewer`), `methodology`, `limitations`, `measures` (always `benchmark-precision` — never a calibrated probability), and `caveat`, the sentence a consumer must show beside any quoted ratio. `caveat` and `core.metrics` are derived from `core.cases`; `benchmarks/lib/baseline.mjs` recomputes both on load and rejects an envelope where either disagrees, an envelope with unknown fields, unsorted cases, or the pre-provenance `schemaVersion` 1 shape. Every run report also carries `provenance.{measures,caveat}` and `selection.{split,includeExternal,caseIds}`. Baseline comparison fails on case removal, new false positives, new false negatives, or new supported-case abstention even when aggregate warning count improves; baseline cases outside the run's selection (for example pinned public cases in a network-free run) are listed under `outOfSelection` and are not counted as removed.
+
+## Check coverage and document roles
+
+Guard's `coverage` object inventories Markdown documents by tier: `canonical`, `specKit` (Spec Kit feature artifacts under top-level `specs/` plus the constitution), `tracked`, `ignored`, and `unclassified[]` (paths under no tier). `specKit` is additive. Before it existed, Spec Kit artifacts were reported under `unclassified`.
+
+Each guard validator adds applicability with status and reason. checkCoverage contains counts by status, limitations naming checks that were not fully performed, and an explanatory limitation. These fields describe coverage independently from legacy status, totals, findings, and exit codes. CI/report consumers preserve them, including disabled-check counts.
+
+Document discovery does not depend on the default filenames alone. A filename is
+normalised to letters and digits — separators, case and Markdown extension are
+noise — and matched against an alias table per role, so `data_model.md`,
+`datamodel.md`, `Data Model.md` and `DATA-MODEL.md` all resolve to the same
+role, and `API.md` resolves to the API-Reference role. Directory detection is
+deliberately tight: a directory must hold at least two distinct roles before it
+counts as a canonical home, so a lone root-level `SECURITY.md` — GitHub's
+security policy, not a design document — never triggers a match on its own.
+This also removes an accidental platform dependency: literal-path probing was
+case-insensitive only on case-insensitive filesystems, so the same repository
+was judged differently on macOS and Linux.
+
+Optional docs.roles maps canonical roles to safe project-relative Markdown paths. Configuration normalization replaces each mapped default in requiredFiles.canonical and documentTypes. A mapped write is authorized either for a unique `source=code` section in an existing human file or for a missing/explicitly generated single-role whole document. Marker shape, role cardinality, and ownership are validated before mutation; `--force` does not alter that model. The configuration schema and docs/configuration.md define the role names and operation-specific contract.
+
+Repository-root guidance is an ephemeral diagnostic and is never persisted in
+project configuration. Its machine shape is
+`{selectedDir,suggestedDir,reason,evidence,packagePath,gitRoot,rerun,automaticScopeChange}`.
+`reason` is `ancestor_docguard_config`, `npm_workspace`, or `pnpm_workspace`;
+`automaticScopeChange` is always false. Machine modes wrap it with type
+`docguard.repository-root-guidance` on stderr so their primary stdout schema is
+unchanged.
+
+## Readiness assessment contract
+
+CI, diagnose, and report include `assessment`. Its status is `BLOCKED` when
+guard enforcement fails, a configured structural threshold fails, or CI is set
+to block warnings; `ATTENTION` means advisory guard warnings remain; `READY`
+means guard and configured gates pass. The object carries reason codes, raw
+guard status, effective finding counts, structural maturity, and threshold
+state. It does not replace legacy status, score, grade, assurance, or exit-code
+fields.

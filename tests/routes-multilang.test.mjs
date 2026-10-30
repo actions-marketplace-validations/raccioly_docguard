@@ -1,3 +1,6 @@
+/**
+ * @req docguard.go-spring-rails-routes#FR-001
+ */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -82,7 +85,11 @@ describe('routes — multi-language scanners', () => {
     const keys = routes.map(r => `${r.method} ${r.path}`);
     assert.ok(keys.includes('GET /ping'));
     assert.ok(keys.includes('POST /users'));
-    assert.ok(keys.includes('DELETE /users/:id'));
+    // gin serves a route on `api := r.Group("/api")` under /api. This line
+    // asserted `DELETE /users/:id`, pinning the missing group prefix
+    // (specs/047-go-spring-rails-routes, SC-002).
+    assert.ok(keys.includes('DELETE /api/users/:id'));
+    assert.ok(!keys.includes('DELETE /users/:id'));
   });
 
   it('Rust: Axum + Actix + Rocket', () => {

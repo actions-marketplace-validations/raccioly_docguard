@@ -13,10 +13,12 @@
  * Local-first by design: `.docguard/` is gitignored, so history accumulates
  * per checkout. In ephemeral CI, persist it across runs with a cache/artifact
  * step (see CI-RECIPES) — the file format is stable and merge-friendly.
+ * @implements docguard.read-only-commands#FR-005
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
+import { ensureStateDir } from './state-dir.mjs';
 
 const HISTORY_PATH = '.docguard/history.jsonl';
 
@@ -32,6 +34,7 @@ const MAX_ENTRIES = 1000;
 export function appendHistory(projectDir, entry) {
   try {
     const p = resolve(projectDir, HISTORY_PATH);
+    ensureStateDir(projectDir);
     mkdirSync(dirname(p), { recursive: true });
     appendFileSync(p, JSON.stringify(entry) + '\n');
     // Occasional trim, checked cheaply by size (~200 KB ≫ MAX_ENTRIES rows).

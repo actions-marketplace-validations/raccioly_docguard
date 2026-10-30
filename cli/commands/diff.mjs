@@ -1,16 +1,24 @@
 /**
  * Diff Command — Show differences between canonical docs and implementation
  * Compares what's documented vs what's actually in the code.
+ * @implements docguard.fallback-language-coverage#FR-004
+ * @implements docguard.dogfood-round-2#FR-001
+ * @implements docguard.dogfood-round-2#FR-004
+ * @implements docguard.dogfood-round-2#FR-008
+ * @implements docguard.coverage-followups#FR-006
+ * @implements docguard.coverage-followups#FR-009
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { resolve, join, extname, basename } from 'node:path';
+import { join, extname, basename } from 'node:path';
 import { c } from '../shared.mjs';
 import { walkFiles as sharedWalkFiles } from '../shared-ignore.mjs';
-import { collectPackageJsons, detectDocker, grepEnvUsage, resolveSourceRoots } from '../shared-source.mjs';
+import { collectEnvVars, describeLanguageCounts, grepEnvUsage } from '../shared-source.mjs';
+import { detectCodeTechnologyEvidence } from '../scanners/tech-stack.mjs';
+import { resolveDocRole } from '../shared-doc-roles.mjs';
 import { parseApiReferenceDoc, compareEndpoints } from '../scanners/api-doc.mjs';
 import { resolveApiSurface } from '../validators/api-surface.mjs';
-import { collectCodeTests } from '../validators/docs-diff.mjs';
+import { collectCodeTests, documentedTestRegex, extractDocumentedTests, diffTechStack as guardDiffTechStack } from '../validators/docs-diff.mjs';
 import { scanSchemasDeep } from '../scanners/schemas.mjs';
 import { detectDocTools } from '../scanners/doc-tools.mjs';
 
@@ -60,6 +68,9 @@ export function runDiff(projectDir, config, flags) {
 
   for (const result of results) {
     if (!result) continue;
+    // Where a detected item came from (the tech stack names each source file).
+    const source = (item) => result.evidence?.[item]
+      ? `  ${c.dim}(${result.evidence[item].file}: ${result.evidence[item].signal})${c.reset}` : '';
 
     console.log(`  ${c.bold}${result.icon} ${result.title}${c.reset}`);
 
@@ -75,20 +86,22 @@ export function runDiff(projectDir, config, flags) {
       hasAnyDiff = true;
       console.log(`    ${c.red}In code but not documented:${c.reset}`);
       for (const item of result.onlyInCode) {
-        console.log(`      ${c.red}+ ${item}${c.reset}`);
+        console.log(`      ${c.red}+ ${item}${c.reset}${source(item)}`);
       }
     }
 
     if (result.matched.length > 0 && flags.verbose) {
       console.log(`    ${c.green}Matched (${result.matched.length}):${c.reset}`);
       for (const item of result.matched) {
-        console.log(`      ${c.green}✓ ${item}${c.reset}`);
+        console.log(`      ${c.green}✓ ${item}${c.reset}${source(item)}`);
       }
     }
 
     if (result.onlyInDocs.length === 0 && result.onlyInCode.length === 0) {
       console.log(`    ${c.green}✓ In sync${c.reset}`);
     }
+
+    if (result.limitation) console.log(`    ${c.dim}${result.limitation}${c.reset}`);
 
     console.log('');
   }
@@ -103,9 +116,11 @@ export function runDiff(projectDir, config, flags) {
 // ── Diff Functions ─────────────────────────────────────────────────────────
 
 export function diffRoutes(dir, config = {}) {
-  // Documented surface: prefer the dedicated API reference, fall back to ARCHITECTURE.md.
-  const apiRefPath = resolve(dir, 'docs-canonical/API-REFERENCE.md');
-  const archPath = resolve(dir, 'docs-canonical/ARCHITECTURE.md');
+  // Documented surface: prefer the API reference, fall back to the
+  // architecture document — each resolved as guard resolves it (docs.roles,
+  // or a nested canonical document) (docguard.coverage-followups#FR-006).
+  const apiRefPath = resolveDocRole(dir, config, 'apiReference');
+  const archPath = resolveDocRole(dir, config, 'architecture');
   const docPath = existsSync(apiRefPath) ? apiRefPath : (existsSync(archPath) ? archPath : null);
   if (!docPath) return null;
 
@@ -119,12 +134,19 @@ export function diffRoutes(dir, config = {}) {
     compareEndpoints(documented, surface.endpoints);
 
   const fmt = (e) => `${e.method} ${e.path}`;
+  // A case setting the reader could not read leaves those routes compared
+  // exactly; say where (docguard.coverage-followups#FR-009).
+  const notes = surface.scan?.caseNotes || [];
+  const limitation = notes.length
+    ? `Compared case-sensitively because a setting could not be read: ${notes.slice(0, 3).map(n => `${n.framework} ${n.file}:${n.line} (${n.reason})`).join('; ')}${notes.length > 3 ? '; …' : ''}.`
+    : null;
   return {
     title: 'API Routes',
     icon: '🛣️',
     onlyInDocs: documentedButAbsent.map(fmt),
     onlyInCode: presentButUndocumented.map(fmt),
     matched: matched.map(fmt),
+    ...(limitation ? { limitation } : {}),
   };
 }
 
@@ -134,8 +156,28 @@ const CODE_ENTITY_NOISE = new Set([
   'models', 'model', 'utils', 'helpers', 'constants', 'config', 'common', 'base',
 ]);
 
+const ENTITY_TABLE_HEADERS = new Set(['entity', 'entities', 'model', 'models', 'table', 'tables']);
+
+/**
+ * First-column values of every Markdown table whose first header cell is
+ * Entity/Model/Table. HTML comments (template placeholders) are ignored.
+ * @implements docguard.generated-docs-consistency#FR-002
+ */
+export function entityTableNames(content) {
+  const lines = String(content).replace(/<!--[\s\S]*?-->/g, '').split('\n');
+  const cells = (line) => line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+  const names = [];
+  for (let i = 0; i + 1 < lines.length; i++) {
+    if (!/^\s*\|/.test(lines[i]) || !/^\s*\|?\s*:?-{3,}/.test(lines[i + 1])) continue;
+    const head = cells(lines[i])[0].replace(/[`*]/g, '').trim().toLowerCase();
+    if (!ENTITY_TABLE_HEADERS.has(head)) continue;
+    for (let j = i + 2; j < lines.length && /^\s*\|/.test(lines[j]); j++) names.push(cells(lines[j])[0]);
+  }
+  return names;
+}
+
 export function diffEntities(dir, config = {}) {
-  const dataModelPath = resolve(dir, 'docs-canonical/DATA-MODEL.md');
+  const dataModelPath = resolveDocRole(dir, config, 'dataModel');
   if (!existsSync(dataModelPath)) return null;
 
   const content = readFileSync(dataModelPath, 'utf-8');
@@ -156,19 +198,25 @@ export function diffEntities(dir, config = {}) {
     'Testing', 'Deployment', 'Monitoring', 'Operations', 'Security',
   ]);
 
-  // Extract entity names ONLY from "### EntityName" headings. The previous
-  // table-cell extractor produced garbage tokens (table, index, foreign, string…);
-  // headings are the only reliable entity source in a DATA-MODEL doc.
+  const addEntity = (raw) => {
+    const name = String(raw).replace(/[`*]/g, '').trim();
+    if (name.startsWith('<!--') || name.length <= 2) return;
+    if (HEADER_NOISE.has(name) || HEADER_NOISE.has(name.toLowerCase())) return;
+    // An entity name is a single PascalCase/snake_case identifier — not a phrase.
+    if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(name)) return;
+    docEntities.add(name.toLowerCase());
+  };
+
+  // Entity names come from "### EntityName" headings...
   const headerRegex = /^#{3,4}\s+(.+)$/gm;
   let match;
-  while ((match = headerRegex.exec(content)) !== null) {
-    const name = match[1].replace(/[`*]/g, '').trim();
-    if (name.startsWith('<!--') || name.length <= 2) continue;
-    if (HEADER_NOISE.has(name) || HEADER_NOISE.has(name.toLowerCase())) continue;
-    // Entity headings are a single PascalCase/snake_case identifier — not a phrase.
-    if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(name)) continue;
-    docEntities.add(name.toLowerCase());
-  }
+  while ((match = headerRegex.exec(content)) !== null) addEntity(match[1]);
+  // ...and from the first column of an entity table — the shape
+  // `generate --plan` writes (docguard.generated-docs-consistency#FR-002). Only
+  // a table whose first header cell names an entity counts, so the cells of a
+  // Field or Index table are never read as entities (the garbage-token problem
+  // the old any-table extractor had).
+  for (const name of entityTableNames(content)) addEntity(name);
 
   // Use the REAL exported entity names from scanSchemasDeep, not file basenames
   // (a file `dynamoModels.ts` exports `User`/`Order`/etc. — its basename is not
@@ -203,7 +251,7 @@ export function diffEntities(dir, config = {}) {
 
 // v0.16-P4 (revised in v0.17.1): conservative denylist of system env vars
 // that appear in prose ("the venv `PATH`") but are never user-set app env
-// vars. v0.17.1-B7: trimmed to TRULY-system-only after wu feedback —
+// vars. v0.17.1-B7: trimmed to TRULY-system-only after downstream feedback —
 // NODE_ENV / CI / GITHUB_* are legitimately app env vars when read via
 // process.env. Including them caused diff to falsely flag `NODE_ENV` as
 // "in code but not docs" even when ENVIRONMENT.md documented it.
@@ -229,7 +277,7 @@ const SYSTEM_ENV_VARS = new Set([
 ]);
 
 export function diffEnvVars(dir, config = {}) {
-  const envDocPath = resolve(dir, 'docs-canonical/ENVIRONMENT.md');
+  const envDocPath = resolveDocRole(dir, config, 'environment');
   if (!existsSync(envDocPath)) return null;
 
   const content = readFileSync(envDocPath, 'utf-8');
@@ -246,22 +294,19 @@ export function diffEnvVars(dir, config = {}) {
     docVars.add(match[1]);
   }
 
-  // Code-side truth = .env.example/.env.template entries UNION process.env /
-  // import.meta.env usage across the (monorepo-aware) source roots.
-  const codeVars = new Set();
-  for (const envFile of ['.env.example', '.env.template']) {
-    const envExamplePath = resolve(dir, envFile);
-    if (existsSync(envExamplePath)) {
-      const envContent = readFileSync(envExamplePath, 'utf-8');
-      const envRegex = /^([A-Z][A-Z0-9_]*[A-Z0-9])\s*=/gm;
-      while ((match = envRegex.exec(envContent)) !== null) {
-        codeVars.add(match[1]);
-      }
-    }
-  }
-  for (const name of grepEnvUsage(dir, config)) codeVars.add(name);
+  // Code-side truth = .env.example/.env.template entries UNION the names read
+  // in code — the same set generate and generate --plan document
+  // (docguard.generated-docs-consistency#FR-008).
+  const used = grepEnvUsage(dir, config);
+  const codeVars = new Set(collectEnvVars(dir, config, used).map(v => v.name));
+  // A language with no env patterns makes "documented but not found in code"
+  // weak evidence: say which files were not read, as the Environment validator
+  // does (docguard.fallback-language-coverage#FR-004).
+  const limitation = used.unscanned?.length
+    ? `Not read for env vars: ${describeLanguageCounts(used.unscanned)} (no env patterns for ${used.unscanned.length === 1 ? 'that language' : 'those languages'}), so a variable read there counts as not found.`
+    : null;
 
-  if (docVars.size === 0 && codeVars.size === 0) return null;
+  if (docVars.size === 0 && codeVars.size === 0 && !limitation) return null;
 
   return {
     title: 'Environment Variables',
@@ -269,76 +314,33 @@ export function diffEnvVars(dir, config = {}) {
     onlyInDocs: [...docVars].filter(v => !codeVars.has(v)),
     onlyInCode: [...codeVars].filter(v => !docVars.has(v)),
     matched: [...docVars].filter(v => codeVars.has(v)),
+    ...(limitation ? { limitation } : {}),
   };
 }
 
+/**
+ * The tech-stack comparison guard's DDF001 makes — one reader, so `diff` never
+ * reports a technology guard does not (comments and negations are ignored:
+ * the init template's commented Terraform example is not a claim).
+ * @implements docguard.generated-docs-consistency#FR-006
+ */
 export function diffTechStack(dir, config = {}) {
-  const archPath = resolve(dir, 'docs-canonical/ARCHITECTURE.md');
-  if (!existsSync(archPath)) return null;
-
-  // Monorepo-aware: merge dependencies across root + source-root + workspace packages.
-  const pkgs = collectPackageJsons(dir, config);
-  if (pkgs.length === 0) return null;
-
-  const archContent = readFileSync(archPath, 'utf-8');
-
-  // Extract tech from ARCHITECTURE.md
-  const docTech = new Set();
-  const techPatterns = ['React', 'Next.js', 'Vue', 'Angular', 'Svelte', 'Express', 'Fastify', 'Hono',
-    'PostgreSQL', 'MySQL', 'MongoDB', 'DynamoDB', 'Redis', 'Prisma', 'Drizzle',
-    'TypeScript', 'Tailwind', 'Docker', 'Terraform'];
-
-  for (const tech of techPatterns) {
-    if (archContent.toLowerCase().includes(tech.toLowerCase())) {
-      docTech.add(tech);
-    }
-  }
-
-  // Extract from merged package.json dependencies
-  const codeTech = new Set();
-  const allDeps = {};
-  for (const { pkg } of pkgs) {
-    Object.assign(allDeps, pkg.dependencies || {}, pkg.devDependencies || {});
-  }
-  const depMap = {
-    'react': 'React', 'next': 'Next.js', 'vue': 'Vue', 'express': 'Express',
-    'fastify': 'Fastify', 'hono': 'Hono', 'prisma': 'Prisma', '@prisma/client': 'Prisma',
-    'drizzle-orm': 'Drizzle', 'typescript': 'TypeScript', 'tailwindcss': 'Tailwind',
-    'redis': 'Redis', 'ioredis': 'Redis', 'pg': 'PostgreSQL', 'mysql2': 'MySQL',
-    'mongoose': 'MongoDB', '@aws-sdk/client-dynamodb': 'DynamoDB',
-  };
-
-  for (const [dep, tech] of Object.entries(depMap)) {
-    if (allDeps[dep]) codeTech.add(tech);
-  }
-
-  // Docker via Dockerfile/compose (not an npm dependency).
-  if (detectDocker(dir, config)) codeTech.add('Docker');
-
-  if (docTech.size === 0 && codeTech.size === 0) return null;
-
-  return {
-    title: 'Tech Stack',
-    icon: '⚙️',
-    onlyInDocs: [...docTech].filter(t => !codeTech.has(t)),
-    onlyInCode: [...codeTech].filter(t => !docTech.has(t)),
-    matched: [...docTech].filter(t => codeTech.has(t)),
-  };
+  const result = guardDiffTechStack(dir, config);
+  if (!result) return null;
+  const detected = detectCodeTechnologyEvidence(dir, config);
+  const matched = detected.map(e => e.tech).filter(t => !result.onlyInCode.includes(t));
+  // Every detected technology names the file that shows it (FR-004).
+  const evidence = Object.fromEntries(detected.map(({ tech, file, signal, kind }) => [tech, { file, signal, kind }]));
+  return { ...result, icon: '⚙️', matched, evidence };
 }
 
 function diffTests(dir, config = {}) {
-  const testSpecPath = resolve(dir, 'docs-canonical/TEST-SPEC.md');
+  // The test-spec role, as guard's DDF002 resolves it (docs.roles may map it).
+  const testSpecPath = resolveDocRole(dir, config, 'testSpec');
   if (!existsSync(testSpecPath)) return null;
 
-  // Strip fenced code blocks (shell commands inside ``` ``` were mis-parsed as
-  // test files), then extract whitespace-free test tokens (literals or globs).
-  const content = readFileSync(testSpecPath, 'utf-8').replace(/```[\s\S]*?```/g, '');
-  const docTests = new Set();
-  const testFileRegex = /`([^`\s]*\.(?:test|spec)\.[a-zA-Z0-9]+)`/g;
-  let match;
-  while ((match = testFileRegex.exec(content)) !== null) {
-    docTests.add(match[1]);
-  }
+  // One definition of a documented test, shared with guard's DDF002.
+  const docTests = extractDocumentedTests(readFileSync(testSpecPath, 'utf-8'), config);
 
   // Find actual test files (monorepo-aware: configured patterns + recursive
   // co-located/nested scan under each source root + root-level test dirs).
@@ -355,7 +357,7 @@ function diffTests(dir, config = {}) {
     const entry = String(docEntry).trim();
     const hasSlash = entry.includes('/');
     const target = hasSlash ? entry : basename(entry);
-    const rx = new RegExp('^' + target.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*+/g, '.*') + '$');
+    const rx = documentedTestRegex(target);
 
     return {
       original: docEntry,

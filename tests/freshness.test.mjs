@@ -3,18 +3,28 @@ import { strict as assert } from 'node:assert';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { execSync } from 'node:child_process';
+import childProcess, { execSync } from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 
 import { validateFreshness, readLastReviewedDate } from '../cli/validators/freshness.mjs';
+import { FIXTURE_GIT_SHELL } from './helpers/git.mjs';
+// @implements docguard.test-git-hermeticity#FR-001: this file's fixture git goes through the helper.
 
 const runGit = (args, cwd) => {
-  return execSync(`git ${args}`, { cwd, encoding: 'utf-8', stdio: 'pipe' });
+  return execSync(`git ${FIXTURE_GIT_SHELL} ${args}`, { cwd, encoding: 'utf-8', stdio: 'pipe' });
 };
 
 describe('readLastReviewedDate — future dates cannot mask staleness', () => {
   let dir;
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'fresh-review-')); });
-  afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
+  afterEach(() => {
+    if (dir) rmSync(dir, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 50,
+    });
+  });
 
   it('reads a valid past-dated header', () => {
     const f = join(dir, 'A.md');
@@ -46,7 +56,12 @@ describe('Freshness Validator', () => {
   });
 
   afterEach(() => {
-    rmSync(tmpDir, { recursive: true, force: true });
+    rmSync(tmpDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 50,
+    });
   });
 
   it('skips when the directory is not a git repository', () => {
@@ -218,7 +233,7 @@ describe('Freshness Validator', () => {
     writeFileSync(join(tmpDir, 'docs-canonical', 'ARCHITECTURE.md'), '# Arch');
     runGit('add docs-canonical/ARCHITECTURE.md', tmpDir);
 
-    execSync(`git commit -m "add arch" --date="${oldDateStr}"`, {
+    execSync(`git ${FIXTURE_GIT_SHELL} commit -m "add arch" --date="${oldDateStr}"`, {
       cwd: tmpDir,
       env: { ...process.env, GIT_COMMITTER_DATE: oldDateStr }
     });
@@ -230,7 +245,7 @@ describe('Freshness Validator', () => {
     for (let i = 1; i <= 2; i++) {
       writeFileSync(join(tmpDir, `test${i}.js`), `const a = ${i};`);
       runGit(`add test${i}.js`, tmpDir);
-      execSync(`git commit -m "commit ${i}" --date="${recentDateStr}"`, {
+      execSync(`git ${FIXTURE_GIT_SHELL} commit -m "commit ${i}" --date="${recentDateStr}"`, {
         cwd: tmpDir,
         env: { ...process.env, GIT_COMMITTER_DATE: recentDateStr }
       });
@@ -259,7 +274,7 @@ describe('Freshness Validator', () => {
       for (let i = 1; i <= 3; i++) {
         writeFileSync(join(dir, `code${i}.js`), `const a = ${i};`);
         runGit(`add code${i}.js`, dir);
-        execSync(`git commit -m "code ${i}" --date="${iso}"`, {
+        execSync(`git ${FIXTURE_GIT_SHELL} commit -m "code ${i}" --date="${iso}"`, {
           cwd: dir,
           env: { ...process.env, GIT_COMMITTER_DATE: iso },
         });
@@ -284,7 +299,7 @@ describe('Freshness Validator', () => {
       );
       runGit('add docs-canonical/ARCHITECTURE.md', tmpDir);
       const oldIsoStr = oldIso.toISOString();
-      execSync(`git commit -m "doc" --date="${oldIsoStr}"`, {
+      execSync(`git ${FIXTURE_GIT_SHELL} commit -m "doc" --date="${oldIsoStr}"`, {
         cwd: tmpDir,
         env: { ...process.env, GIT_COMMITTER_DATE: oldIsoStr },
       });
@@ -318,5 +333,92 @@ describe('Freshness Validator', () => {
       assert.strictEqual(arch.status, 'warn',
         'stale header date must not mask a real freshness warning');
     });
+  });
+});
+
+describe('freshness coverage and history reliability', () => {
+  let dir;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'fresh-coverage-'));
+    runGit('init', dir);
+    runGit('config user.name Test', dir);
+    runGit('config user.email test@example.com', dir);
+    for (let i = 0; i < 3; i++) runGit('commit --allow-empty -m baseline', dir);
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('covers configured and nested canonical docs once while excluding private and ignored docs', () => {
+    const files = ['docs-canonical/nested/A.MD', 'specs/design.md', 'custom-agent.md',
+      'docs-canonical/ignored.md', '.local/private.md'];
+    for (const file of files) {
+      mkdirSync(join(dir, file, '..'), { recursive: true });
+      writeFileSync(join(dir, file), '# Design');
+    }
+    writeFileSync(join(dir, '.docguardignore'), 'docs-canonical/ignored.md\n');
+    const results = validateFreshness(dir, { requiredFiles: {
+      canonical: [files[0], files[1], files[4]], agentFile: [files[2]],
+    } });
+    assert.deepEqual(results.map(r => r.doc).sort(), files.slice(0, 3).sort());
+  });
+
+  it('counts additions and deletions in supported languages, and ignores private/generated history', () => {
+    mkdirSync(join(dir, 'docs-canonical'));
+    writeFileSync(join(dir, 'docs-canonical/ARCHITECTURE.md'), '<!-- docguard:last-reviewed 2020-01-01 -->');
+    const extensions = ['cjs', 'jsx', 'go', 'rs', 'rb', 'php'];
+    for (const ext of extensions) {
+      writeFileSync(join(dir, `source.${ext}`), 'source');
+      runGit(`add source.${ext}`, dir);
+      runGit('commit -m addition', dir);
+      rmSync(join(dir, `source.${ext}`));
+      runGit(`add source.${ext}`, dir);
+      runGit('commit -m deletion', dir);
+    }
+    let result = validateFreshness(dir, {}).find(r => r.doc?.endsWith('ARCHITECTURE.md'));
+    assert.equal(result.code, 'FRS002');
+    assert.match(result.message, /12 code commits/);
+    result = validateFreshness(dir, { ignore: ['source.*'] }).find(r => r.message.includes('ARCHITECTURE.md'));
+    assert.equal(result.status, 'pass');
+    assert.match(result.message, /not semantic verification/);
+  });
+
+  it('rejects tomorrow and invalid calendar dates', () => {
+    const file = join(dir, 'A.md');
+    const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+    for (const date of [tomorrow, '2024-02-30']) {
+      writeFileSync(file, `<!-- docguard:last-reviewed ${date} -->`);
+      assert.equal(readLastReviewedDate(file), null);
+    }
+  });
+
+  it('queries source history once for shared review dates and refreshes it on the next validation', t => {
+    mkdirSync(join(dir, 'docs-canonical'));
+    for (let i = 0; i < 4; i++) writeFileSync(join(dir, `docs-canonical/doc${i}.md`),
+      '<!-- docguard:last-reviewed 2020-01-01 -->');
+    const original = childProcess.execFileSync;
+    let queries = 0;
+    let stagedQueries = 0;
+    t.mock.method(childProcess, 'execFileSync', (binary, args, options) => {
+      // Match `git log … --name-only` specifically: the staged-path lookup also
+      // passes --name-only, and it is a different query with its own budget.
+      if (binary === 'git' && args[0] === 'log' && args.includes('--name-only')) queries++;
+      if (binary === 'git' && args[0] === 'diff' && args.includes('--cached')) stagedQueries++;
+      return original(binary, args, options);
+    });
+    syncBuiltinESMExports();
+    try {
+      assert.ok(validateFreshness(dir, {}).every(result => result.status === 'pass'));
+      assert.equal(queries, 1);
+      // The staged lookup is also once per validation, not once per document.
+      assert.equal(stagedQueries, 1);
+      writeFileSync(join(dir, 'new.go'), 'package main');
+      runGit('add new.go', dir);
+      runGit('commit -m source', dir);
+      assert.ok(validateFreshness(dir, {}).every(result => result.status === 'warn'));
+      assert.equal(queries, 2);
+      assert.equal(stagedQueries, 2);
+    } finally {
+      t.mock.restoreAll();
+      syncBuiltinESMExports();
+    }
   });
 });

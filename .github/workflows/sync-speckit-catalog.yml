@@ -20,17 +20,22 @@ on:
         required: false
         type: string
 
+# Read by default; the job asks for issues: write (specs/068-release-least-privilege).
 permissions:
   contents: read
-  issues: write # reminder issue in THIS repo only — never github/spec-kit
 
 jobs:
   prepare-catalog-submission:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # reminder issue in THIS repo only — never github/spec-kit
 
     steps:
       - name: Checkout docguard repo
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Get version and metadata
         id: meta
@@ -58,7 +63,6 @@ jobs:
         run: |
           VERSION="${{ steps.meta.outputs.version }}"
           SUBMIT_URL=$(cat /tmp/submit-url.txt)
-          TITLE="📦 Submit DocGuard v${VERSION} to the spec-kit community catalog"
 
           {
             echo "Update the spec-kit community catalog for **v${VERSION}**"
@@ -82,20 +86,7 @@ jobs:
             echo "</details>"
           } > /tmp/reminder.md
 
-          EXISTING=$(gh issue list \
-            --repo "$GITHUB_REPOSITORY" \
-            --state open \
-            --search "in:title \"DocGuard v${VERSION}\" spec-kit catalog" \
-            --json number,title \
-            --jq "[.[] | select(.title | contains(\"v${VERSION}\"))][0].number" 2>/dev/null || echo "")
-
-          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
-            gh issue edit "$EXISTING" --repo "$GITHUB_REPOSITORY" --body-file /tmp/reminder.md
-            echo "✅ Refreshed reminder issue #${EXISTING}"
-          else
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file /tmp/reminder.md
-            echo "✅ Opened catalog-submission reminder issue"
-          fi
+          bash .github/scripts/upsert-catalog-reminder.sh "$VERSION" /tmp/reminder.md
 
       - name: Write run summary
         run: |

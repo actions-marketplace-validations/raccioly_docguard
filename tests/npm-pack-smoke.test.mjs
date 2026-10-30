@@ -14,17 +14,24 @@
  * a missing `schemas/` directory until we added it to the files array.
  *
  * @req SC-PACK-001 — npm pack succeeds without errors
+ * @req specs/009-language-repository-coverage/spec.md#SC-005
  * @req SC-PACK-002 — packed tarball includes cli/, schemas/, templates/, commands/
  * @req SC-PACK-003 — extracted package can run `docguard --version`
  * @req SC-PACK-004 — extracted package can run a full guard against a fixture
  * @req SC-PACK-005 — schemas/docguard-config.schema.json is in the package
+ * @req docguard.evidence-scoped-verification#SC-005
+ * @req docguard.language-repository-coverage#FR-008
+ * @req docguard.task-specific-agent-context#FR-010
+ * @req docguard.adoption-workflow-integrity#FR-010
+ * @req docs-canonical/REQUIREMENTS.md#NFR-004
  */
 import { describe, it, afterEach } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { fixtureGit } from './helpers/git.mjs';
 
 // Skip if NPM_PACK_SMOKE=0 — opt-out only. By default this runs in regular
 // CI because catching publish-time gaps is core hygiene.
@@ -67,13 +74,36 @@ describe('npm pack smoke', { skip: SKIP }, () => {
     assert.ok(existsSync(join(pkgDir, 'schemas')), 'schemas/ should be in the tarball (v0.15-P4)');
     assert.ok(existsSync(join(pkgDir, 'schemas/docguard-config.schema.json')),
       'schemas/docguard-config.schema.json should ship');
+    assert.ok(existsSync(join(pkgDir, 'schemas/docguard-specs.schema.json')),
+      'schemas/docguard-specs.schema.json should ship');
+    assert.ok(existsSync(join(pkgDir, 'schemas/docguard-evidence.schema.json')),
+      'schemas/docguard-evidence.schema.json should ship');
+    assert.ok(existsSync(join(pkgDir, 'schemas/docguard-task-context.schema.json')),
+      'schemas/docguard-task-context.schema.json should ship');
+    assert.ok(existsSync(join(pkgDir, 'cli/evidence/evaluate.mjs')),
+      'evidence evaluator should ship');
+    assert.ok(existsSync(join(pkgDir, 'templates/evidence-manifest.json')),
+      'evidence manifest example should ship');
     assert.ok(existsSync(join(pkgDir, 'templates')), 'templates/ should be in the tarball');
     assert.ok(existsSync(join(pkgDir, 'commands')), 'commands/ should be in the tarball');
     assert.ok(existsSync(join(pkgDir, 'extensions')), 'extensions/ should be in the tarball');
     assert.ok(existsSync(join(pkgDir, 'package.json')), 'package.json should be in the tarball');
+    assert.ok(existsSync(join(pkgDir, 'CHANGELOG.md')),
+      'README links CHANGELOG.md, so the package must ship that linked document');
+
+    // npm renders the packaged README. Every relative link in that README must
+    // resolve inside the tarball; repository-only material must use an absolute
+    // GitHub URL. This catches attractive but broken post-install documentation.
+    const readme = readFileSync(join(pkgDir, 'README.md'), 'utf8');
+    const targets = [...readme.matchAll(/!?\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g)]
+      .map(match => match[1].replace(/^<|>$/g, ''))
+      .filter(target => !target.startsWith('#') && !/^[a-z][a-z0-9+.-]*:/i.test(target))
+      .map(target => decodeURI(target.split('#')[0]).replace(/^\.\//, ''));
+    const missing = [...new Set(targets)].filter(target => !existsSync(join(pkgDir, target)));
+    assert.deepEqual(missing, [], `relative README links missing from npm package: ${missing.join(', ')}`);
   });
 
-  it('extracted package runs --version (CLI loads end-to-end)', () => {
+  it('extracted package reports its exact packed version (CLI loads end-to-end)', () => {
     packDir = tmp('pack');
     extractDir = tmp('extract');
     spawnSync('npm', ['pack', '--pack-destination', packDir], { cwd: process.cwd() });
@@ -86,8 +116,9 @@ describe('npm pack smoke', { skip: SKIP }, () => {
     const cli = join(extractDir, 'package/cli/docguard.mjs');
     const r = spawnSync('node', [cli, '--version'], { encoding: 'utf-8' });
     assert.equal(r.status, 0, `--version should exit 0; got ${r.status}\nstderr: ${r.stderr}`);
-    assert.match(r.stdout, /docguard v\d+\.\d+\.\d+/,
-      `--version should print docguard vX.Y.Z; got: ${r.stdout}`);
+    const packed = JSON.parse(readFileSync(join(extractDir, 'package/package.json'), 'utf8'));
+    assert.equal(r.stdout.trim(), `docguard v${packed.version}`,
+      `--version must equal packed package.json ${packed.version}; got: ${r.stdout.trim()}`);
   });
 
   it('extracted package can run guard against a minimal fixture', () => {
@@ -107,10 +138,10 @@ describe('npm pack smoke', { skip: SKIP }, () => {
     writeFileSync(join(fixtureDir, 'CHANGELOG.md'), '# Changelog\n## [Unreleased]\n');
     writeFileSync(join(fixtureDir, 'DRIFT-LOG.md'), '# Drift\n');
     writeFileSync(join(fixtureDir, '.docguard.json'),
-      JSON.stringify({ projectName: 'smoke', profile: 'starter', version: '0.5' }));
-    spawnSync('git', ['init', '-q'], { cwd: fixtureDir });
-    spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'add', '-A'], { cwd: fixtureDir });
-    spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { cwd: fixtureDir });
+      JSON.stringify({ projectName: 'smoke', profile: 'starter', version: '0.6' }));
+    fixtureGit(fixtureDir, ['init', '-q']);
+    fixtureGit(fixtureDir, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'add', '-A']);
+    fixtureGit(fixtureDir, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init']);
 
     const cli = join(extractDir, 'package/cli/docguard.mjs');
     const r = spawnSync('node', [cli, 'guard', '--quiet', '--format', 'json'], {
@@ -125,6 +156,50 @@ describe('npm pack smoke', { skip: SKIP }, () => {
     assert.ok(data.project === 'smoke', `expected project in JSON output; got: ${r.stdout.slice(0, 200)}`);
     assert.ok(Array.isArray(data.validators), 'validators array should be present');
 
+    rmSync(fixtureDir, { recursive: true, force: true });
+  });
+
+  it('extracted package discloses AST-only Worker forms when Babel is absent', () => {
+    packDir = tmp('pack');
+    extractDir = tmp('extract');
+    spawnSync('npm', ['pack', '--pack-destination', packDir], { cwd: process.cwd() });
+    const tarball = readdirSync(packDir).find(f => f.endsWith('.tgz'));
+    spawnSync('tar', ['xzf', join(packDir, tarball), '-C', extractDir]);
+    const modulePath = join(extractDir, 'package/cli/shared-source.mjs');
+    const script = [
+      `import { extractWorkerEnvBindings } from ${JSON.stringify('file://' + modulePath)};`,
+      'const source = \'import { env } from "cloudflare:workers"; consume(env.API_TOKEN);\';',
+      'const result = extractWorkerEnvBindings(source, "worker.ts");',
+      'console.log(JSON.stringify({ names: [...result], limitations: result.limitations }));',
+    ].join('\n');
+    const r = spawnSync('node', ['--input-type=module', '-e', script], { encoding: 'utf-8' });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout), {
+      names: [],
+      limitations: ['worker-imported-env-needs-ast'],
+    });
+  });
+
+  it('extracted package emits task context without the optional parser installed', () => {
+    packDir = tmp('pack');
+    extractDir = tmp('extract');
+    const fixtureDir = tmp('task-context');
+    spawnSync('npm', ['pack', '--pack-destination', packDir], { cwd: process.cwd() });
+    const tarball = readdirSync(packDir).find(f => f.endsWith('.tgz'));
+    spawnSync('tar', ['xzf', join(packDir, tarball), '-C', extractDir]);
+    mkdirSync(join(fixtureDir, 'docs-canonical'));
+    mkdirSync(join(fixtureDir, 'src'));
+    writeFileSync(join(fixtureDir, 'package.json'), JSON.stringify({ name: 'task-smoke', version: '1.0.0', type: 'module' }));
+    writeFileSync(join(fixtureDir, '.docguard.json'), JSON.stringify({ projectName: 'task-smoke', profile: 'starter', version: '0.6', requiredFiles: { canonical: ['docs-canonical/REQUIREMENTS.md'] } }));
+    writeFileSync(join(fixtureDir, 'docs-canonical/REQUIREMENTS.md'), '# Requirements\n\nUpdate `normalizeThing` in `src/tool.mjs` without changing its public return type.\n');
+    writeFileSync(join(fixtureDir, 'src/tool.mjs'), 'export const normalizeThing = value => value;\n');
+    const cli = join(extractDir, 'package/cli/docguard.mjs');
+    const result = spawnSync('node', [cli, 'agent', '--task', 'Update normalizeThing in src/tool.mjs', '--format', 'json', '--dir', fixtureDir], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    const packet = JSON.parse(result.stdout);
+    assert.equal(packet.kind, 'docguard.task-context');
+    assert.equal(packet.selection.status, 'targeted');
+    assert.ok(packet.pointers.some(pointer => pointer.path === 'src/tool.mjs'));
     rmSync(fixtureDir, { recursive: true, force: true });
   });
 });

@@ -40,8 +40,9 @@
 
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { resolve, extname, relative, basename } from 'node:path';
-import { isGitRepo, lastCommitHash, symbolExistsAtRev } from '../shared-git.mjs';
+import { lastCommitHash, symbolExistsAtRev, gitMetadataStatus, unreadableGitApplicability } from '../shared-git.mjs';
 import { walkFiles, isNonProductPath, listCanonicalDocs } from '../shared-ignore.mjs';
+import { findConstitution } from '../scanners/speckit.mjs';
 import { readScannable } from '../shared-source.mjs';
 import { resolveDocDirs } from '../shared.mjs';
 import { mkFinding, resultFromFindings, lineSuppresses } from '../findings.mjs';
@@ -164,28 +165,40 @@ function extractRefs(content) {
 
 function indexDocs(projectDir) {
   const docs = [];
-  const push = (name, full) => {
+  const push = (name, full, rel = name) => {
     try {
       const content = readFileSync(full, 'utf-8');
-      docs.push({ name, path: full, refs: extractRefs(content) });
+      docs.push({ name, rel, path: full, refs: extractRefs(content) });
     } catch { /* skip */ }
   };
   // Recursive. `name` stays the bare basename — matches this validator's
   // pre-existing flat-tree message/location format exactly.
-  for (const doc of listCanonicalDocs(projectDir)) push(basename(doc.rel), doc.abs);
+  for (const doc of listCanonicalDocs(projectDir)) push(basename(doc.rel), doc.abs, doc.rel);
   for (const agent of ['AGENTS.md', 'CLAUDE.md', 'GEMINI.md']) {
     const p = resolve(projectDir, agent);
     if (existsSync(p)) push(agent, p);
   }
+  // docguard.spec-kit-artifact-coverage#FR-006: the Spec Kit constitution names
+  // the functions and modules its principles depend on; check them like any
+  // governing document. It lives in a dot directory the source walk skips.
+  const constitution = findConstitution(projectDir);
+  if (constitution) push(constitution.rel, constitution.abs);
   return docs;
 }
 
+/** @implements docguard.output-ux#FR-016 */
 export function validateReferenceExistence(projectDir, config = {}) {
   const cfg = config.referenceExistence || {};
   const maxRefsPerDoc = cfg.maxRefsPerDoc || 80;
   const adrEnabled = cfg.adrCitations !== false;
 
-  if (!isGitRepo(projectDir)) {
+  // docguard.unreadable-git-metadata#FR-002: unreadable metadata means this
+  // check could not run — say so, instead of looking like nothing matched.
+  const git = gitMetadataStatus(projectDir);
+  if (git.status === 'unreadable') {
+    return { ...resultFromFindings([], { passed: 0, total: 0 }), applicability: unreadableGitApplicability(git) };
+  }
+  if (git.status !== 'ok') {
     return resultFromFindings([], { passed: 0, total: 0, applicable: false });
   }
   const docs = indexDocs(projectDir);
@@ -250,9 +263,12 @@ export function validateReferenceExistence(projectDir, config = {}) {
         severity: 'warn',
         confidence: 'low',
         message: `${doc.name} references \`${sym}\`, which existed in the code when the doc was last updated but has ZERO matches at HEAD — likely renamed or removed.`,
-        location: { file: doc.name },
+        // docguard.output-ux#FR-016: the project-relative path; two nested
+        // docs can share a basename.
+        location: { file: doc.rel },
         suggestion: {
-          summary: `Update or remove the \`${sym}\` reference in ${doc.name} (or suppress if it is a still-relevant user-facing name).`,
+          kind: 'review',
+          text: `Update or remove the \`${sym}\` reference in ${doc.name} (or suppress if it is a still-relevant user-facing name).`,
         },
       }));
     }
@@ -287,7 +303,8 @@ export function validateReferenceExistence(projectDir, config = {}) {
         message,
         location: { file: first.file, line: first.line },
         suggestion: {
-          summary: known.size > 0
+          kind: 'review',
+          text: known.size > 0
             ? `Fix the number or write the missing ADR entry (or suppress with // docguard:ignore REF002 on the citation line).`
             : `Create an ADR doc (docguard init writes templates/ADR.md) or suppress with // docguard:ignore REF002.`,
         },

@@ -1,8 +1,8 @@
 # Test Specification
 
-<!-- docguard:version 0.8.0 -->
+<!-- docguard:version 1.4.6 -->
 <!-- docguard:status active -->
-<!-- docguard:last-reviewed 2026-07-03 -->
+<!-- docguard:last-reviewed 2026-10-13 -->
 
 > DocGuard has a single optional-load npm dependency (`@babel/parser`) and an optional `python3` AST tier. CLI integration tests cover the full stack with `node:test` (zero dev dependencies) and exercise both AST extractors (`js-ast`, `py-ast`) plus their regex fallbacks. The Python AST tests skip themselves automatically on a machine that lacks `python3`.
 
@@ -15,13 +15,21 @@
 
 ---
 
-DocGuard's tests verify command behavior through subprocess execution. Each test runs the full CLI binary via execSync, capturing stdout and checking output patterns. This approach tests the complete stack in a single pass: argument parsing, config loading, validator execution, and output formatting.
+DocGuard's tests verify command behavior through subprocess execution. Command tests run the full CLI binary as a subprocess, capturing stdout and checking output patterns. This approach tests the complete stack in a single pass: argument parsing, config loading, validator execution, and output formatting.
 
-Tests are designed to be config-aware. They verify that project-type settings like needsEnvExample and testFramework correctly influence scoring and validation behavior. Regression guards pin specific bug fixes with dedicated assertions, ensuring fixed issues cannot recur.
+Tests are designed to be config-aware. They verify that project-type settings like needsEnvExample and testFramework correctly influence scoring and validation behavior. Regression guards preserve known failures with dedicated assertions and neighboring valid cases.
 
-All tests use the built-in node:test framework with zero test dependencies. The test suite runs in under 30 seconds and is executed automatically by CI on every push.
+All tests use the built-in node:test framework with zero test dependencies. CI runs the suite on Node 18, 20, 22, and 24. Its runtime budget catches a test that runs away (spec 051 FR-007, revised 2026-10-13):
+- `tools/suite-runtime-budget.mjs` divides each top-level test's duration by the run's speed factor. That factor is the median ratio of the run's tests to `tools/suite-runtime-reference.json`.
+- It fails any test over `TEST_CEILING_MS` (100 seconds at reference speed, in `.github/workflows/ci.yml`).
+- The suite total is reported, not gated. Runner speed alone moved it between 188 and 369 seconds for identical code.
+- `tests/release-cut-green.test.mjs` keeps the ceiling above the slowest recorded normal test and below a 165-second runaway on the slowest recorded runner.
 
-Test names follow the pattern: "verb + expected behavior" (e.g., "runs and shows a score", "respects projectTypeConfig"). Each test is self-contained with no shared mutable state between tests.
+Local timing depends on runtime and filesystem. Record measured timing with its environment rather than asserting a universal duration.
+
+Test names follow the pattern: "verb + expected behavior" (e.g., "runs and shows a score", "respects projectTypeConfig"). Each test should isolate its mutable fixtures and clean up its resources.
+
+Fixture git is independent of the machine's git config (spec 066). A test that builds or inspects a throwaway repository passes `FIXTURE_GIT` from `tests/helpers/git.mjs` on every git call (hooks off through `core.hooksPath` set to the null device, commit and tag signing off), or calls `fixtureGit()`, which also throws with git's stderr when a setup step fails. The options travel with each invocation and stay out of the environment, so the product code under test still meets the ambient config; `cli/` uses them only for a scratch repository DocGuard creates itself (`docguard demo`). A fixture that depends on a branch name pins it with `git init -b`. `tests/test-git-hermeticity.test.mjs` reports any git spawn in `tests/` that bypasses the helper; an exemption carries a `fixture-git-exempt:` comment with its reason. The CI `hermeticity` job first proves its config is in effect, then runs the suite under it: every hook fails, signing is mandatory through a gpg that always fails, and the default branch is `trunk`.
 
 ## Test Categories
 
@@ -30,46 +38,149 @@ Test names follow the pattern: "verb + expected behavior" (e.g., "runs and shows
 | Unit | node:test | tests/ | `npm test` |
 | CLI Integration | node:test | tests/ | `npm test` |
 
-> **CLI integration tests cover the full stack** — this is a CLI tool with zero UI surface.
-> Commands are validated end-to-end via Node.js subprocess execution, making separate E2E tests redundant.
+> **CLI integration tests cover command routing; packed adoption tests cover the
+> release boundary.** Source-tree subprocess success does not prove that npm
+> contains every linked or imported file, that remediation is actionable, or
+> that an existing repository remains unchanged during inspection.
 
-All test files live in `tests/` and match the glob `tests/*.test.mjs` — individual files are not enumerated here (the suite grows every release); see the Source-to-Test Map below for the source→test traceability that matters.
+All test files live in `tests/` and match the glob `tests/*.test.mjs` — the test runner supplies the current inventory as the suite grows; see the Source-to-Test Map below for the source→test traceability that matters.
 
 ## Coverage Rules
 
 | Metric | Target | Current |
 |--------|:------:|:-------:|
-| Command Coverage | 100% | 100% (all commands) |
-| Validator Coverage | 80% | 100% (all validators) |
-| Flag Coverage | 80% | 100% |
-| Test Count | — | 600+ tests (`npm test`) |
+| Command Coverage | Every public command | Scenario coverage; inspect tests before claiming exhaustive behavior |
+| Validator Coverage | Every validator | Positive, negative, and regression cases |
+| Flag Coverage | Risk-based | Tested scenarios; no exhaustive coverage claim |
+| Test Count | — | Current count is emitted by `npm test` |
 
 ## Source-to-Test Map
 
 | Source File | Test File | Status |
 |------------|-----------|:------:|
 | `cli/docguard.mjs` | `tests/commands.test.mjs` | ✅ |
-| `cli/shared.mjs` | `tests/commands.test.mjs` | ✅ |
+| `cli/shared.mjs` | `tests/commands.test.mjs`, `tests/ignore-parser-parity.test.mjs` | ✅ |
 | `cli/commands/init.mjs` | `tests/commands.test.mjs` | ✅ |
 | `cli/commands/guard.mjs` | `tests/commands.test.mjs` | ✅ |
 | `cli/commands/score.mjs` | `tests/commands.test.mjs` | ✅ |
 | `cli/commands/diff.mjs` | `tests/commands.test.mjs` | ✅ |
 | `cli/commands/generate.mjs` | `tests/commands.test.mjs` | ✅ |
 | `cli/commands/agents.mjs` | `tests/commands.test.mjs` | ✅ |
-| `cli/commands/hooks.mjs` | `tests/commands.test.mjs` | ✅ |
+| `cli/commands/agent.mjs`, `cli/scanners/task-context.mjs` | `tests/agent.test.mjs`, `tests/task-context.test.mjs` | ✅ |
+| `cli/commands/hooks.mjs` | `tests/hooks.test.mjs`, `tests/hooks-contract.test.mjs` | ✅ |
+| `extensions/spec-kit-docguard/extension.yml`, `extensions/spec-kit-docguard/commands/*.md` | `tests/hooks-contract.test.mjs` | ✅ |
 | `cli/commands/diagnose.mjs` | `tests/commands.test.mjs` | ✅ |
 | `cli/commands/badge.mjs` | `tests/commands.test.mjs` | ✅ |
 | `cli/commands/ci.mjs` | `tests/commands.test.mjs` | ✅ |
+| `cli/commands/sync-tests.mjs` (`sync --tests`) | `tests/sync.test.mjs`, `tests/field-report-3-deferred.test.mjs` | ✅ |
 | `cli/commands/fix.mjs` | `tests/commands.test.mjs` | ✅ |
-| `cli/commands/watch.mjs` | `tests/commands.test.mjs` | ✅ pass |
+| `cli/commands/watch.mjs` | `tests/commands.test.mjs`, `tests/watch-reliability.test.mjs` | ✅ pass |
+| `cli/commands/demo.mjs` | `tests/demo-command.test.mjs`, `tests/test-git-hermeticity.test.mjs` | ✅ pass |
 | `cli/commands/publish.mjs` | `tests/commands.test.mjs` | ✅ |
 | `cli/commands/trace.mjs` | `tests/commands.test.mjs` | ✅ |
+| `cli/shared-requirements.mjs` | `tests/traceability.test.mjs`, `tests/archive.test.mjs` | ✅ |
+| `cli/scanners/requirement-evidence.mjs` | `tests/traceability.test.mjs`, `tests/spec-registry.test.mjs`, `tests/requirement-evidence-literals.test.mjs` | ✅ |
+| `cli/commands/retire.mjs` | `tests/archive.test.mjs` | ✅ |
+| `cli/writers/file-transaction.mjs` | `tests/file-transaction.test.mjs` | ✅ |
+| `cli/scanners/reconciliation.mjs`, `cli/commands/reconcile.mjs` | `tests/reconcile.test.mjs` | ✅ |
+| `cli/commands/specs.mjs` completion path | `tests/spec-completion.test.mjs` | ✅ |
+| Packed install adoption journey | `tests/adoption-workflow.test.mjs`, `tests/npm-pack-smoke.test.mjs` | ✅ |
+| `cli/shared-git.mjs`, reconciliation coverage | `tests/shared-git.test.mjs`, `tests/reconcile.test.mjs` | ✅ |
+| `cli/shared-ignore.mjs`, `cli/scanners/instruction-audit.mjs` | `tests/docguardignore.test.mjs`, `tests/instruction-audit.test.mjs`, `tests/quoted-comment-openers.test.mjs` (pointers after a quoted `<!--`) | ✅ |
+| `cli/shared-validator-surface.mjs`, `cli/validators/metrics-consistency.mjs`, `cli/validators/canonical-sync.mjs` | `tests/metrics-consistency.test.mjs`, `tests/canonical-sync.test.mjs`, `tests/mechanical.test.mjs` | ✅ |
+| `cli/validators/traceability.mjs`, lifecycle trust in `cli/scanners/spec-registry.mjs` | `tests/traceability-lifecycle.test.mjs` | ✅ |
+| Finding-code enforcement and machine writers | `tests/severity.test.mjs`, `tests/sarif.test.mjs`, `tests/junit.test.mjs` | ✅ |
+| Combined readiness assessment | `tests/assessment.test.mjs` | ✅ |
+| `benchmarks/lib/manifest.mjs`, `benchmarks/lib/metrics.mjs`, `benchmarks/lib/compare.mjs` | `tests/benchmark-manifest.test.mjs`, `tests/benchmark-metrics.test.mjs` | ✅ |
+| `benchmarks/lib/runner.mjs`, `benchmarks/run.mjs` | `tests/benchmark-runner.test.mjs` | ✅ |
+| `benchmarks/lib/baseline.mjs`, `schemas/docguard-benchmark-baseline.schema.json`, `benchmarks/baseline.json` | `tests/benchmark-baseline.test.mjs` | ✅ |
+| `benchmarks/lib/precision-evidence.mjs`, `benchmarks/generate-precision-evidence.mjs`, `cli/precision-evidence.mjs`, `cli/precision-evidence-data.mjs`, `schemas/docguard-precision-evidence.schema.json` | `tests/precision-evidence.test.mjs` | ✅ |
+| `benchmarks/agent-context/run.mjs`, task-context schemas and fixtures | `tests/agent-context-benchmark.test.mjs` | ✅ |
+| `cli/evidence/*.mjs`, `cli/validators/evidence.mjs` | `tests/evidence-manifest.test.mjs`, `tests/evidence-adapters.test.mjs`, `tests/evidence-integration.test.mjs` | ✅ |
+| `cli/feedback-fixture.mjs`, `cli/commands/feedback.mjs` | `tests/feedback-fixture.test.mjs`, `tests/feedback-contributions.test.mjs` | ✅ |
+| `cli/validators/document-lifecycle.mjs` | `tests/document-lifecycle.test.mjs` | ✅ |
+| `cli/commands/specs.mjs`, `cli/scanners/spec-registry.mjs`, `cli/validators/spec-registry.mjs` | `tests/spec-registry.test.mjs` | ✅ |
+| `cli/spec-kit-delegation.mjs`, `cli/ensure-skills.mjs` | `tests/spec-kit-delegation.test.mjs`, `tests/security-init-injection.test.mjs` | ✅ |
+| `cli/scanners/spec-first.mjs` (`specs require`) | `tests/spec-first.test.mjs` | ✅ |
+| `cli/scanners/agent-instructions.mjs` (STR004/STR005) | `tests/agent-instruction-budget.test.mjs` | ✅ |
+| `cli/scanners/as-built.mjs`, `cli/commands/generate-as-built.mjs` | `tests/as-built-specs.test.mjs` | ✅ |
+| `cli/shared-test-cases.mjs` | `tests/test-case-count.test.mjs` | ✅ |
+| `cli/scanners/speckit.mjs` (SPK010 directory claims) | `tests/spk010-directory-claims.test.mjs`, `tests/spec-kit-artifact-coverage.test.mjs` | ✅ |
+| `.github/scripts/release-changelog.mjs`, `.github/scripts/homebrew-formula.mjs` | `tests/release-readiness.test.mjs` | ✅ |
+| `cli/scanners/revision-anchor.mjs` (`specs reanchor`, SPR008) | `tests/completion-revision-anchoring.test.mjs` | ✅ |
+| `cli/scanners/reconciliation.mjs` (canonical requirement links) | `tests/canonical-requirement-links.test.mjs`, `tests/reconcile.test.mjs` | ✅ |
 | `cli/validators/structure.mjs` | `tests/commands.test.mjs` | ✅ |
-| `cli/validators/docs-diff.mjs` | `tests/commands.test.mjs` | ✅ |
+| `cli/validators/docs-diff.mjs` | `tests/commands.test.mjs`, `tests/docs-diff.test.mjs` | ✅ |
+| `cli/scanners/doc-deps.mjs`, `cli/validators/doc-dependency.mjs`, `cli/commands/review.mjs` (doc dependency lock, DLK001–DLK005) | `tests/doc-dependency-lock.test.mjs`, `tests/fingerprint-shared.test.mjs` | ✅ |
+| `cli/scanners/fingerprint.mjs`, `cli/scanners/py-anchors.mjs` (shared fingerprints, `doclock-v0` golden, batched `python3`) | `tests/fingerprint-shared.test.mjs` | ✅ |
+| `cli/scanners/pattern-lexer.mjs` (pattern tier: string-aware comments, symbol spans, floor fingerprints) | `tests/pattern-lexer.test.mjs` | ✅ |
+| `cli/scanners/anchor-tags.mjs`, `cli/scanners/anchors.mjs`, `cli/scanners/anchor-cache.mjs`, `cli/validators/requirement-anchors.mjs`, `cli/commands/anchors.mjs` (requirement anchors, ANC001–ANC011) | `tests/requirement-anchors.test.mjs`, `tests/requirement-anchors-golden.test.mjs`, `tests/requirement-anchors-lock.test.mjs` | ✅ |
+| `cli/scanners/anchor-lock.mjs` (anchor lock read/serialize, union-merge conflicts) | `tests/requirement-anchors-lock.test.mjs` | ✅ |
+| `tools/anchor-churn-replay.mjs`, anchor failure policy (`failOn`), SPC007 own-spec exemption | `tests/requirement-anchors-policy.test.mjs` | ✅ |
+| Anchor rename/move carry-over | `tests/requirement-anchors-rename.test.mjs` | ✅ |
+| Anchor ripple; `reverseImportAncestors` / `reverseImportIndex` shared with `impact` | `tests/requirement-anchors-ripple.test.mjs`, `tests/impact-walk-relocation.test.mjs`, `tests/impact.test.mjs` | ✅ |
+| Anchor test chain; TestGuard evidence adapter (every re-verified, needs-reverification and inconclusive cause, path and revision safety) | `tests/requirement-anchors-testchain.test.mjs` | ✅ |
+| Anchor orphans, dispositions and granularity in `score`/`trace` | `tests/requirement-anchors-orphans.test.mjs` | ✅ |
+| Trace-matrix export: CSV columns and order, RFC 4180 quoting, formula injection, ReqIF 1.2 structure and escaping, byte-identical runs, `--out` | `tests/trace-matrix.test.mjs` | ✅ |
+| StrictDoc and OpenFastTrace importers: opt-in, mapping, ANC007/ANC006, OFT outdated, cache identity, never written | `tests/requirement-anchors-import.test.mjs` | ✅ |
+| Golden fingerprints for 13 languages and python-ast 3.11–3.14; formatting stability; algorithm-version handling (FR-012) | `tests/requirement-anchors-golden.test.mjs`, `tests/requirement-anchors-lock.test.mjs` | ✅ |
+| Tree-sitter tier: never auto-detected, hash pinning, staged copy, no environment, fallback; with the vetted artifacts, golden spans and formatting stability (the anchor-oracle CI job) | `tests/requirement-anchors-treesitter.test.mjs` | ✅ |
+| Pattern tier against tree-sitter: per-language declaration agreement on `tools/anchor-oracle/corpus` and the anchor fixtures (SC-007) | `tools/anchor-oracle/run.mjs`, `tests/anchor-oracle.test.mjs` (CI job `anchor-oracle`) | ✅ |
+| `docguard:volatile` lines (spec 072): placeholder at the Babel, python-ast, pattern, tree-sitter and file tiers with a control per case, multi-line constructs kept, marker-in-string ignored, ANC011 listed but not in guard; the release version sync keeps the marker and the anchors | `tests/volatile-anchor-lines.test.mjs` (tree-sitter cases in the CI job `anchor-oracle`), `tests/release-version-sync.test.mjs` | ✅ |
+| Anchors documented (every config key, flag, finding) and adopted by this repository (lock, CODEOWNERS, union merge, replay, no ANC006/ANC007) | `tests/requirement-anchors-adoption.test.mjs` | ✅ |
+| `cli/shared-html-comments.mjs`: a `<!--` quoted in a code span opens nothing, for requirement IDs and instruction pointers (spec 074) | `tests/quoted-comment-openers.test.mjs` | ✅ |
+| Docs-Sync evidence: whole-word module names, `covers` entries, App Router handlers by URL path, unique path tails, `index` directories, drawn trees, names in comments ignored; nudge hook and Diff-Suspicion `path` whole-name matching (specs 077, 078) | `tests/whole-token-sibling-matchers.test.mjs`, `tests/docs-sync-specific-evidence.test.mjs`, `tests/docs-sync.test.mjs` | ✅ |
+| Document fidelity (spec 079): ENV001/ENV002 share STR003's heading matcher; brace lists in documented tests expand and a brace glob matches as a union (DDF002 and `diff`); DDF001 negation over lists, removal verbs and change-record sections; STR006 and unedited-scaffold scoring (docQuality, Legible, Machine markers) incl. the `generate --plan --write` allow-list; `constructor` no longer yields NaN readability; two review rounds' cases (list negation that stops at a predicate, removal verbs scoped to their object, fenced/commented/H1/indented change-record headings, role-mapped and N/A-owned scaffolds, main's plural heading matching with two whole-heading synonyms in validator and writer alike, self-anchored test extraction, `**/` matching no directory, `no-` compounds, infrastructure-only removal nouns, linear-time lists and braces, prototype-named CLI, MCP and DRF inputs) | `tests/doc-validator-fidelity.test.mjs`, `tests/generated-docs-e2e.test.mjs` | ✅ |
+| TODO tracking: keywords quoted in code spans or strings are not annotations; comments from the string-aware reader; no self-path skip (spec 073) | `tests/todo-tracking.test.mjs` | ✅ |
+| `cli/shared-requirements.mjs` (requirement `block`), `cli/scanners/requirement-docs.mjs` | `tests/shared-requirements-block.test.mjs`, `tests/traceability.test.mjs` | ✅ |
+| `tools/budget.mjs` (non-regression budgets) | `tests/budget.test.mjs` | ✅ |
+| `cli/commands/mcp.mjs` (MCP server over stdio and loopback HTTP; served-directory confinement) | `tests/mcp.test.mjs`, `tests/mcp-http.test.mjs`, `tests/mcp-doc-tools.test.mjs`, `tests/mcp-project-confinement.test.mjs` | ✅ |
+| `cli/release-age.mjs` (version-age note on guard text, MCP instructions and the context pack) | `tests/update-awareness.test.mjs` | ✅ |
+| `cli/shared-guard-json.mjs` (compact guard response) | `tests/compact-guard-response.test.mjs` | ✅ |
+| `cli/scanners/doc-references.mjs`, `cli/shared-headings.mjs` (MCP doc navigation) | `tests/mcp-doc-tools.test.mjs`, `tests/trace-reverse.test.mjs` | ✅ |
+| `cli/shared-sync-scope.mjs` (`sync --since` section scope) | `tests/sync-since.test.mjs` | ✅ |
+| `cli/scanners/instruction-scopes.mjs`, `cli/scanners/frontmatter.mjs`, `cli/validators/path-scoped-rules.mjs`, `cli/commands/rules.mjs` (PSR001–PSR004, `rules --for`) | `tests/path-scoped-rules.test.mjs` | ✅ |
+| `cli/scanners/doc-ownership.mjs`, `cli/validators/doc-ownership.mjs` (OWN001–OWN007, `trace --owners`) | `tests/doc-ownership.test.mjs` | ✅ |
+| `cli/scanners/import-graph.mjs`, `cli/scanners/module-diagram.mjs` (module and entity diagrams) | `tests/code-derived-diagrams.test.mjs`, `tests/architecture.test.mjs`, `tests/python-import-graph.test.mjs`, `tests/js-import-edges.test.mjs` | ✅ |
+| `cli/scanners/symbol-map.mjs`, `benchmarks/agent-context/run.mjs` (symbol map, agent-context protocol v2) | `tests/symbol-map.test.mjs`, `tests/agent-context-benchmark.test.mjs` | ✅ |
+| `cli/scanners/go-routes.mjs`, `cli/scanners/spring-routes.mjs`, `cli/scanners/rails-routes.mjs`, `cli/scanners/route-lexing.mjs` (Go, Spring and Rails routes) | `tests/go-spring-rails-routes.test.mjs`, `tests/routes-multilang.test.mjs` | ✅ |
+| `cli/scanners/php-routes.mjs`, `cli/scanners/dotnet-routes.mjs` (Laravel, Symfony and ASP.NET Core routes) | `tests/php-dotnet-routes.test.mjs` | ✅ |
+| `cli/shared-ignore.mjs` (`.docguardignore` reasons and expiries), `cli/scanners/suppressions.mjs`, `cli/validators/suppressions.mjs`, `cli/commands/ignore.mjs`, `cli/writers/claimspec-ignore.mjs`, `cli/claimspec-schema.mjs` (IGN001–IGN003, `docguard ignore`, claimspec export) | `tests/ignore-reasons.test.mjs`, `tests/docguardignore.test.mjs` | ✅ |
+| `cli/writers/baseline.mjs` (adoption baseline, stable fingerprints and legacy match) | `tests/baseline.test.mjs`, `tests/baseline-stable-fingerprint.test.mjs` | ✅ |
+| `cli/scanners/reconciliation.mjs`, `cli/validators/spec-registry.mjs` (reviewed `assetPaths`, SPR009) | `tests/asset-path-attribution.test.mjs` | ✅ |
+| `cli/shared-source.mjs`, `cli/shared-ignore.mjs` (`fallback-language` tier, product-code package segments) | `tests/fallback-language-coverage.test.mjs`, `tests/parser-tier.test.mjs` | ✅ |
+| `cli/commands/specs.mjs` (first-spec preflight, `specs approve`) | `tests/first-spec-preflight.test.mjs` | ✅ |
+| `cli/writers/state-dir.mjs`, `cli/docguard.mjs` dispatch (read-only commands, self-ignoring `.docguard/`) | `tests/read-only-commands.test.mjs` | ✅ |
+| `cli/scanners/py-outline.mjs`, `cli/scanners/python-routes.mjs`, `cli/scanners/python-models.mjs`, `cli/scanners/py-env.mjs` (both Python tiers) | `tests/python-extraction.test.mjs`, `tests/py-ast.test.mjs` | ✅ |
+| `cli/scanners/js-ast.mjs`, `cli/scanners/ts-paths.mjs`, `cli/scanners/schemas.mjs` (Express and Next.js extraction) | `tests/js-ts-extraction.test.mjs` | ✅ |
+| `cli/scanners/schemas.mjs`, `cli/scanners/js-ast.mjs`, `cli/validators/schema-sync.mjs` (decorated entity classes and model-definition calls, both parser tiers) | `tests/typeorm-models.test.mjs` | ✅ |
+| `cli/writers/doc-generators.mjs`, `cli/writers/generate-io.mjs`, `cli/commands/generate.mjs` (generated docs pass DocGuard's own checks) | `tests/generated-docs-consistency.test.mjs`, `tests/generated-docs-e2e.test.mjs` | ✅ |
+| Command output across guard, fix, sync, trace, upgrade and init (spec 049) | `tests/output-ux.test.mjs` | ✅ |
+| `cli/agent-surface.mjs`, `cli/spec-kit-delegation.mjs` (hooks that resolve, extension refresh) | `tests/spec-kit-integration-honesty.test.mjs` | ✅ |
+| `cli/config.mjs`, `cli/shared-doc-roles.mjs`, `cli/validators/metrics-consistency.mjs` (dogfood fixes) | `tests/dogfood-findings.test.mjs` | ✅ |
+| `.github/scripts/sync-release-version.mjs`, `cli/release-pr-policy.mjs`, the CI runtime budget | `tests/release-cut-green.test.mjs`, `tests/release-version-sync.test.mjs` | ✅ |
+| `tools/suite-runtime-budget.mjs` (CI runtime budget: TAP reading, speed factor, per-test ceiling, reference build) and the CI step that runs it | `tests/suite-runtime-budget.test.mjs`, `tests/ci-reproducibility.test.mjs`, `tests/release-cut-green.test.mjs` | ✅ |
+| `tools/generate-docs-reference.mjs`, `docs/` site navigation and links | `tests/user-docs.test.mjs` | ✅ |
+| `.github/scripts/jules-policy.mjs`, `.github/scripts/jules-triage.mjs`, `.jules/preflight.mjs`, `.jules/setup.sh`, the Jules branch of `auto-merge.yml` | `tests/jules-policy.test.mjs` | ✅ |
+| `.github/workflows/*.yml` permissions, checkout credentials and the release job layout | `tests/workflow-permissions.test.mjs` | ✅ |
+
+Completion tests cover initial `implemented → verified` delivery, evidence and
+dirty-tree blockers, living-spec `verified → verified` maintenance, and refusal
+of empty repeats driven only by generated lifecycle artifacts.
 
 > **Note**: `watch.mjs` is an interactive file-watcher (uses `fs.watch` + process signals). It is
-> verified via manual execution rather than automated tests, which is appropriate for
-> interactive/daemon-style commands per ISO/IEC/IEEE 29119-3 §7.2 (manual test procedures).
+> covered by automated lifecycle tests, including filesystem watcher error handling.
+> `tests/watch-reliability.test.mjs` drives the 500 ms debounce with an injected fake clock
+> (`runtime.setTimeout` / `runtime.clearTimeout`) and captures console output, so its coalescing and
+> queued-check assertions are driven by a fake clock and hold under any machine load (spec 055). The spawn
+> tests in `tests/commands.test.mjs` cover real `fs.watch` events and real timers end to end.
+> Manual checks supplement platform-specific event behavior.
+
+> **Note**: `tools/budget.mjs` compares guard wall time between two trees. `tests/budget.test.mjs`
+> decides every guard-time verdict on a scripted timing source (the `sample` option of `guardPair`):
+> seeded load bursts, a 30% slowdown, the interleaving order and a steady drift, so no assertion
+> depends on machine load (spec 062). One test spawns real stub trees and asserts only that each
+> median is at least the stub's busy-wait. The CI `budget` job exercises the real path on every PR.
 
 ## Critical CLI Flows
 
@@ -93,8 +204,142 @@ All test files live in `tests/` and match the glob `tests/*.test.mjs` — indivi
 
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
+| 1.4.6 | 2026-10-13 | DocGuard Team | The CI runtime budget is a per-test ceiling at reference-runner speed (`tools/suite-runtime-budget.mjs`, spec 051 FR-007 revision) |
+| 1.4.5 | 2026-10-11 | DocGuard Team | Map `sync-tests.mjs` to its tests; `runCI`, `runSpecs` and `runSyncTests` have behaviour tests (#556) |
+| 1.4.4 | 2026-10-11 | DocGuard Team | Map the workflow permission rules to `tests/workflow-permissions.test.mjs` (spec 068) |
+| 1.4.3 | 2026-10-11 | DocGuard Team | Fixture git goes through `tests/helpers/git.mjs`; the CI `hermeticity` job; map `demo.mjs` to its tests (spec 066) |
+| 1.4.2 | 2026-10-10 | DocGuard Team | Record the scripted timing source behind the budget tests (spec 062) |
+| 1.4.1 | 2026-10-10 | DocGuard Team | Map `watch.mjs` to its deterministic reliability tests (spec 055) |
+| 1.4.0 | 2026-10-10 | DocGuard Team | Freshness review for specs 038–053: map the modules those specs added or changed to their tests; record the 360-second CI runtime budget (spec 051) |
+| 1.3.0 | 2026-09-30 | DocGuard Team | Freshness review: map the MCP server and the compact guard response to their tests; describe the frozen v2 agent-context protocol beside v1 |
+| 1.2.0 | 2026-09-29 | DocGuard Team | Freshness review: map the modules specs 014–026 added to their tests, and correct the benchmark case count |
+| 1.1.0 | 2026-09-15 | DocGuard Team | Add field-replay controls for shipped validator counts, ignored checkout pointer copies, and non-clean planned lifecycle advice |
+| 1.0.0 | 2026-09-15 | DocGuard Team | Add executable hook-composition, direct evidence exit-code, and field-level registry-difference regressions |
 | 0.7.0 | 2026-03-13 | @raccioly | Added trace, publish; watch.mjs coverage justified (ISO 29119); 15 commands |
 | 0.5.0 | 2026-03-13 | @raccioly | Added diagnose, guard JSON, profile, tax tests (24→30) |
 | 0.3.0 | 2026-03-12 | @raccioly | Real tests, project-type-aware spec |
 | 0.1.0 | 2026-03-12 | DocGuard Generate | Auto-generated (corrected) |
-| `cli/scanners/schemas.mjs` | `tests/schemas.test.mjs` | ✅ |
+
+## Trust regression scenarios
+
+`tests/score-assurance.test.mjs` checks that structural grades never claim factual verification and that CI, diagnose, and reports retain this boundary. `tests/feedback-contributions.test.mjs` checks confident-finding selection, preview behavior, and outbound metadata privacy. Cache tests must change source contents without changing a manifest or Git HEAD, including repeated edits and fresh-process reads. Hook tests execute generated scripts against controlled runtimes rather than merely matching shell text. Traceability tests pair synthetic fixture IDs with genuine requirement annotations.
+
+A detector fix should include a clean near-miss and a real defect. Held-out neighboring cases are required to evaluate generalization. `benchmarks/baseline.json` is the reviewed reference: 26 measured cases across 13 repository groups plus one explicit unsupported case. Its observed perfect point estimates retain Wilson confidence limits and do not establish exhaustive correctness. The envelope's `review.measures` is `benchmark-precision` and its `review.caveat` must accompany any quoted number; tests assert the committed metrics and caveat are recomputable from the committed cases, and that a hand-edited ratio, stale caveat, or pre-provenance envelope is rejected.
+
+The finding shape is itself a contract, because findings are copied verbatim into shareable feedback records. `tests/precision-evidence.test.mjs` pins the exact key set a guard run emits, so a field added without a specification fails the suite; it also asserts that `location` is a string or null and that `disposition` and `evidence.status` hold values from their declared vocabularies. `tests/findings-channels.test.mjs` pins the derivation rules for the three channels: `disposition` from `suggestion.kind` with `escalate` as the fail-closed default, `evidence` projected per code and always standing alone, and `reportable` true for an unmeasured code even at high confidence. A malformed `suggestion.kind` must omit the suggestion, so a typo stays visible as a missing suggestion instead of reclassifying a fix as a review.
+
+Retirement tests use disposable Git repositories and verify both sides of the boundary: completed planning material is reported for review, while active neighboring material stays clean. Write-path tests must prove retained-ref recovery metadata and refusal of source code, dirty, untracked, required, symlinked, private, protected, submodule, and out-of-root paths. Read-only plan and check modes must not modify repository state.
+
+## Enterprise precision regressions
+
+Regression cases are synthetic and name no consumer repositories. Keep a valid near-neighbor beside every detected defect: formatting versus declaration deletion; negated versus current technology use; explained versus unexplained skips; mock expectations versus credentials; implemented versus omitted contract endpoints; Worker bindings versus local variables; historical versus active documents. Check coverage tests distinguish unsupported and missing inputs from executed checks. Document-role tests exercise mapped findings, raw/loaded configuration parity, unsafe paths, read-only planning, successful section-bounded generation/sync/repair, backup creation, multi-target preflight atomicity, and force-resistant malformed/shared ownership.
+
+Worker fixtures reproduce Cloudflare's module-handler argument, exported Pages
+context, imported global `env`, and entrypoint-class property forms. Every form
+has a lookalike source, class, function, shadow, or computed-key control. The
+packed-package test runs without installed Babel and requires AST-only forms to
+remain disclosed as limitations.
+
+JS/TS import-edge fixtures read every import form at the syntax-tree tier
+and at the pattern fallback, both in an unparsable file and in a copy of
+`cli/` that cannot resolve `@babel/parser`. Controls put each form in a
+comment, a string and a template literal, and follow a side-effect import with
+a quoted statement the fallback must leave intact. A repository test requires
+an edge for every multi-line import and re-export in `cli/`.
+
+Python import-graph fixtures cover regular flat and `src/` packages, absolute
+and explicit-relative imports, cycles, and configured layer violations. Paired
+controls keep standard-library and third-party imports out of the local graph;
+dynamic imports, `sys.path` mutation, parse failures, interpreter absence, and
+ambiguous workspace modules must remain partial or unsupported applicability.
+Tests never import or execute fixture modules.
+
+Repository-root fixtures pair ancestor DocGuard, npm workspace, and pnpm
+include evidence with explicit-dir, local-config, exclusion, Git-only, and
+nested-repository controls. Command tests require the selected package result to
+remain unchanged, human guidance to contain an exact rerun, and machine stdout
+to remain parseable while stderr carries the typed diagnostic.
+
+Independent review must challenge suppression paths, not only the original false-positive example. Cross-project runs use disposable snapshots and verify consumer content remains unchanged. Finding counts alone cannot establish precision or recall.
+
+Task-context tests require exact path and qualified-requirement priority,
+determinism, fixed excerpt/read budgets, stale and retired lifecycle exclusion,
+private/symlink rejection, honest abstention, aligned human/JSON output, and
+unchanged task-graph behavior. The frozen agent benchmark keeps hidden
+evaluators outside copied repositories, proves original fail-to-pass and
+pass-to-pass states plus reviewed references, records all 27 observations, and
+applies its committed non-inferiority and efficiency gate without an LLM judge.
+Protocol v2 (spec 036) is frozen beside v1 rather than replacing it: six tasks
+(three on the 29-module `ledger-service` fixture), three context conditions
+(task only, context pack, context pack with symbol map) and three repetitions,
+so 54 trials.
+The runner refuses to start when a task's fixture or evaluator digest, or the
+manifest digest, differs from the committed value. v2 was frozen with a CLI
+version and model that ChatGPT-account Codex no longer serves, so protocol v3
+changes only that executable pin, and the runner rejects a v3 manifest that
+differs from v2 anywhere else. The v3 trials are recorded in
+`results/observed-v3.json`, and a test recomputes their decision (`opt-in`)
+from the recorded trials.
+
+Run `node benchmarks/run.mjs --baseline benchmarks/baseline.json` for the network-free synthetic corpus (CI does this on every push; pinned public baseline cases are reported as `outOfSelection`, not as removed). Run `node benchmarks/run.mjs --external --baseline benchmarks/baseline.json` explicitly for pinned public sources. The comparator gates new case-level false positives, false negatives, removals within the selection, and supported-case abstentions. Persisted cold/warm timings are observational because matching Node and platform metadata cannot exclude host contention. Runtime regression claims require at least five controlled samples from the same paired comparison session and a greater-than-20-percent real-workload change.
+
+Evidence adapter tests use paired valid and invalid fixtures. They cover RFC
+6901 escaping and array indices, strict typed values, duplicate-free sets,
+bounded collections, saved clean and non-clean oasdiff/Buf reports, malformed
+reports, unknown adapter versions, input-digest staleness, missing and ambiguous
+Markdown targets, unsafe paths, and stable identity behavior. Integration tests
+confirm that guard, JSON, SARIF, JUnit, score assurance, agent context, and direct
+CLI exit codes retain the five-state boundary. Contradicted and invalid direct
+verification exits 1; stale, inconclusive, and unsupported evidence exits 2;
+verified evidence exits 0. No test invokes third-party project code or an
+external compatibility binary.
+
+Python literal evidence adds paired list, tuple, set, dictionary, annotated,
+multiline, string/comment, dynamic, duplicate-assignment, malicious, symlink,
+and explicit-budget fixtures. Tests assert that project Python is never
+executed. The packed adopter workflow starts with a foreign hook and a
+specification missing immutable metadata, runs the installed CLI, validates
+every rendered suggestion, follows the proposed remediation, and requires the
+post-action registry check to pass.
+Managed-hook tests reinstall into a hook with commands on both sides, require
+exactly one marker pair, repair nested markers emitted by affected releases,
+execute every successful postlude, and retain fail-closed exits. Spec-registry
+tests require stale JSON and text output to identify bounded field paths,
+including order-only canonicalization.
+
+Express route fixtures pair real registrations with chained HTTP-client calls,
+same-path test requests, conventional test-helper trees, single-level mounts,
+and nested imported mounts. They also cover static path constants, pathless
+mounts, aliased router exports, trailing middleware, and multiple router symbols
+in one module. Non-product evidence is rejected before route-key deduplication
+so a discarded test call cannot hide a later product route.
+
+Go, Spring and Rails route fixtures are eight reference projects (gin, echo,
+chi, net/http, gorilla/mux with fiber, Spring in Java and in Kotlin, Rails).
+Each ground truth was written from the framework's routing rules before the
+scanner was changed, and the scanner must report exactly that set. Neighbouring
+cases cover router names reused in two functions, same-named methods told apart
+by package and receiver type, cyclic calls, HTTP-client calls, comments,
+`_test.go` files and Feign clients. Prefixes that cannot be read must yield no
+route at all.
+
+Sinatra, Starlette, Warp, Tide and `net/http`-only Go route fixtures are five
+reference projects run end to end from framework detection, each with a ground
+truth written from the framework's routing rules before its reader existed
+(all five reported no route before). Neighbouring cases cover Sinatra apps
+resolved through project superclasses, `use` and `Rack::URLMap`, Rack::Test
+calls, heredocs and `=begin` blocks; Starlette at both Python tiers and a
+`Router` from another library; Warp alternatives that cannot match; Tide
+bindings reused in two functions; and non-literal paths, which must be omitted
+and counted in the API-surface reason.
+
+API omission tests preserve documented endpoints across generated and human
+documents, mapped roles, and forced writes whenever the only runtime-absence
+evidence is a bounded scan. Field-replay controls pair historical and current
+metrics, package capability and enabled-project validator counts, multiline and
+disconnected skip reasons, repeated and unrepeated test credentials,
+package-local and ignored environment templates, ignored and nested-checkout
+pointer copies, committed and non-clean planned lifecycle registries,
+authoritative and stale OpenAPI copies, parameter-equivalent and different
+routes, frontend utilities and real services, and known versus unknown validator
+schema keys.

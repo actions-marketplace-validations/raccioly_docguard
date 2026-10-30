@@ -7,21 +7,29 @@
  *   confusing "validator missing" or "field unknown" warnings. A one-shot
  *   `docguard upgrade` lets them see the gap and fix it in seconds.
  *
- * Three modes:
- *   docguard upgrade                — report current vs latest, exit 0
- *   docguard upgrade --check-only   — same report, exit 1 if behind (for CI)
- *   docguard upgrade --apply        — actually run `npm i -g docguard-cli@latest`
- *                                     and migrate .docguard.json if needed
+ * Modes:
+ *   docguard upgrade                       — report current vs latest, exit 0
+ *   docguard upgrade --check-only          — same report, exit 1 if behind (for CI)
+ *   docguard upgrade --apply               — run `npm i -g docguard-cli@latest` when
+ *                                            npm has a newer release, and migrate
+ *                                            .docguard.json if needed
+ *   docguard upgrade --apply --schema-only — migrate .docguard.json only; no
+ *                                            network, no install
+ *
+ * @implements docguard.output-ux#FR-006
  *
  * Network access (npm registry fetch) is OPTIONAL — if offline, we fall back
  * to "could not check remote version" without erroring.
  */
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 import { c, CURRENT_SCHEMA_VERSION, compareVersions } from '../shared.mjs';
+import { installAgentAssets, staleAgentAssets } from '../ensure-skills.mjs';
+import { readAgentSurface } from '../agent-surface.mjs';
+import { packagedExtensionVersion, readRegistryEntry, refreshSpecKitExtension } from '../spec-kit-delegation.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG = JSON.parse(readFileSync(resolve(__dirname, '..', '..', 'package.json'), 'utf-8'));
@@ -129,6 +137,9 @@ export function migrateSchema(cfg, fromVersion) {
     // additive: existing projects get an empty severity map and default
     // (medium) behavior. No behavioral change unless they explicitly opt in.
     '0.5': (c) => ({ ...c, severity: c.severity || {}, version: '0.5' }),
+    // v0.6 — exact finding-code enforcement overrides. Empty by default, so
+    // existing validator-level behavior remains unchanged after migration.
+    '0.6': (c) => ({ ...c, findingSeverity: c.findingSeverity || {}, version: '0.6' }),
   };
   let current = { ...cfg };
   let changed = false;
@@ -179,39 +190,48 @@ function openUpgradePR(projectDir, migratedConfig, fromVersion, toVersion) {
   }
 
   const branch = `docguard/upgrade-schema-${toVersion}-${Date.now().toString(36)}`;
+  const git = args => spawnSync('git', args, { cwd: projectDir, encoding: 'utf-8' });
+  const cfgPath = resolve(projectDir, '.docguard.json');
+  const priorConfig = existsSync(cfgPath) ? readFileSync(cfgPath, 'utf-8') : null;
+  // Where to come back to: the branch name, or the commit when HEAD is detached.
+  const head = git(['symbolic-ref', '-q', '--short', 'HEAD']);
+  const start = head.status === 0 ? head.stdout.trim() : git(['rev-parse', 'HEAD']).stdout.trim();
+
   // Branch off current HEAD
-  let r = spawnSync('git', ['checkout', '-b', branch], { cwd: projectDir, encoding: 'utf-8' });
-  if (r.status !== 0) return { ok: false, error: `git checkout failed: ${r.stderr || r.stdout}` };
+  let r = git(['checkout', '-b', branch]);
+  if (r.status !== 0) {
+    // checkout -b can fail after switching (a failing post-checkout hook).
+    const switched = git(['rev-parse', '--abbrev-ref', 'HEAD']).stdout.trim() === branch;
+    const fail = `git checkout failed: ${r.stderr || r.stdout}`;
+    return switched ? rollbackUpgradePR(projectDir, { start, branch, priorConfig, pushed: false }, fail) : { ok: false, error: fail };
+  }
+  const failed = (error, pushed = false) => rollbackUpgradePR(projectDir, { start, branch, priorConfig, pushed }, error);
 
   // Write the migrated config
   try {
-    writeFileSync(
-      resolve(projectDir, '.docguard.json'),
-      JSON.stringify(migratedConfig, null, 2) + '\n',
-      'utf-8'
-    );
+    writeFileSync(cfgPath, JSON.stringify(migratedConfig, null, 2) + '\n', 'utf-8');
   } catch (e) {
-    return { ok: false, error: `write .docguard.json failed: ${e.message}` };
+    return failed(`write .docguard.json failed: ${e.message}`);
   }
 
   // Commit
-  r = spawnSync('git', ['add', '.docguard.json'], { cwd: projectDir, encoding: 'utf-8' });
-  if (r.status !== 0) return { ok: false, error: `git add failed: ${r.stderr}` };
+  r = git(['add', '.docguard.json']);
+  if (r.status !== 0) return failed(`git add failed: ${r.stderr}`);
 
   const commitMsg = `chore(docguard): migrate .docguard.json schema ${fromVersion} → ${toVersion}\n\nAutomated migration via \`docguard upgrade --apply --pr\`.`;
-  r = spawnSync('git', ['commit', '-m', commitMsg], { cwd: projectDir, encoding: 'utf-8' });
-  if (r.status !== 0) return { ok: false, error: `git commit failed: ${r.stderr || r.stdout}` };
+  r = git(['commit', '-m', commitMsg]);
+  if (r.status !== 0) return failed(`git commit failed: ${r.stderr || r.stdout}`);
 
   // Push
-  r = spawnSync('git', ['push', '-u', 'origin', branch], { cwd: projectDir, encoding: 'utf-8' });
-  if (r.status !== 0) return { ok: false, error: `git push failed: ${r.stderr || r.stdout}` };
+  r = git(['push', '-u', 'origin', branch]);
+  if (r.status !== 0) return failed(`git push failed: ${r.stderr || r.stdout}`);
 
   // Open PR
   const prBody =
     `Automated schema migration from \`${fromVersion}\` → \`${toVersion}\`.\n\n` +
     `This PR was opened by \`docguard upgrade --apply --pr\`. It updates the\n` +
     `\`.docguard.json\` schema version and any additive fields the new schema\n` +
-    `introduces (e.g. \`severity: {}\` for v0.5).\n\n` +
+    `introduces (for example \`findingSeverity: {}\` for v0.6).\n\n` +
     `Review and merge to keep your team's DocGuard config in sync.\n\n` +
     `> 🤖 Generated by [DocGuard](https://github.com/raccioly/docguard)`;
   r = spawnSync('gh', [
@@ -219,21 +239,73 @@ function openUpgradePR(projectDir, migratedConfig, fromVersion, toVersion) {
     '--title', `chore(docguard): migrate schema ${fromVersion} → ${toVersion}`,
     '--body', prBody,
   ], { cwd: projectDir, encoding: 'utf-8' });
-  if (r.status !== 0) return { ok: false, error: `gh pr create failed: ${r.stderr || r.stdout}` };
+  if (r.status !== 0) return failed(`gh pr create failed: ${r.stderr || r.stdout}`, true);
 
   const prUrl = (r.stdout || '').trim().split('\n').pop();
   return { ok: true, prUrl };
+}
+
+/**
+ * Undo `openUpgradePR` after a failed step: back to the starting branch (or
+ * commit), `.docguard.json` as it was, and the new branch deleted unless it
+ * was pushed. A step that cannot be undone is reported with the manual fix.
+ *
+ * @implements docguard.hooks-repo-scope#FR-005
+ */
+function rollbackUpgradePR(projectDir, { start, branch, priorConfig, pushed }, error) {
+  const git = args => spawnSync('git', args, { cwd: projectDir, encoding: 'utf-8' });
+  const cfgPath = resolve(projectDir, '.docguard.json');
+  const manual = [];
+
+  // Drop the migration from the index and the working tree (it may be
+  // committed on the new branch), so the switch back cannot be refused.
+  git(['reset', '-q', '--', '.docguard.json']);
+  git(['checkout', '-q', 'HEAD', '--', '.docguard.json']);
+
+  const back = git(['checkout', '-q', start]);
+  const onStart = git(['rev-parse', '--abbrev-ref', 'HEAD']).stdout.trim() !== branch;
+  if (!onStart) {
+    manual.push(`git checkout ${start}`);
+  } else {
+    if (back.status !== 0) {
+      // Switched, but a checkout hook complained: say so, the switch stands.
+      manual.push(`check the post-checkout hook output: ${(back.stderr || back.stdout).trim()}`);
+    }
+    // The exact text the user had, including uncommitted edits.
+    try {
+      if (priorConfig === null) { if (existsSync(cfgPath)) unlinkSync(cfgPath); }
+      else if (!existsSync(cfgPath) || readFileSync(cfgPath, 'utf-8') !== priorConfig) writeFileSync(cfgPath, priorConfig, 'utf-8');
+    } catch (e) {
+      manual.push(`restore .docguard.json (${e.message})`);
+    }
+  }
+
+  if (!pushed && onStart) {
+    const del = git(['branch', '-D', branch]);
+    if (del.status !== 0) manual.push(`git branch -D ${branch}`);
+  }
+
+  const kept = !pushed && manual.includes(`git branch -D ${branch}`);
+  let message = onStart
+    ? `${error}\n  Rolled back: back on ${start}, .docguard.json restored`
+    : `${error}\n  Could not return to ${start}; you are still on ${branch}`;
+  if (pushed) message += `. The branch ${branch} was pushed; open the pull request yourself with: gh pr create --head ${branch}`;
+  else if (onStart) message += `, branch ${branch} ${kept ? 'not deleted' : 'deleted'}.`;
+  if (manual.length) message += `\n  Finish by hand: ${manual.join('; ')}`;
+  return { ok: false, error: message };
 }
 
 export async function runUpgrade(projectDir, _config, flags) {
   const checkOnly = flags.checkOnly || flags['check-only'];
   const apply = flags.apply;
 
-  console.log(`${c.bold}🔧 DocGuard Upgrade${c.reset}`);
-  console.log(`${c.dim}   Checking CLI and schema versions...${c.reset}\n`);
+  const schemaOnly = !!flags.schemaOnly;
 
-  // CLI version check
-  const latest = await fetchLatestNpmVersion();
+  console.log(`${c.bold}🔧 DocGuard Upgrade${c.reset}`);
+  console.log(`${c.dim}   ${schemaOnly ? 'Checking the .docguard.json schema (--schema-only: npm is not contacted)...' : 'Checking the CLI release on npm and the .docguard.json schema...'}${c.reset}\n`);
+
+  // CLI version check — skipped entirely under --schema-only (offline).
+  const latest = schemaOnly ? null : await fetchLatestNpmVersion();
   const cliCmp = latest ? compareVersions(INSTALLED_VERSION, latest) : 0;
   const cliBehind = cliCmp < 0;
 
@@ -244,7 +316,9 @@ export async function runUpgrade(projectDir, _config, flags) {
 
   // ── Report ──────────────────────────────────────────────────────────────
   console.log(`  ${c.cyan}CLI${c.reset}    installed: ${c.bold}v${INSTALLED_VERSION}${c.reset}`);
-  if (latest) {
+  if (schemaOnly) {
+    console.log(`         ${c.dim}npm not checked (--schema-only)${c.reset}`);
+  } else if (latest) {
     if (cliBehind) {
       console.log(`         latest:    ${c.yellow}v${latest}${c.reset} ${c.yellow}(behind)${c.reset}`);
     } else if (cliCmp > 0) {
@@ -279,10 +353,20 @@ export async function runUpgrade(projectDir, _config, flags) {
     console.log(`         current:   v${CURRENT_SCHEMA_VERSION} ${c.dim}— run ${c.cyan}docguard init${c.dim} to create one${c.reset}`);
   }
 
+  const agentFiles = agentFilesStatus(projectDir);
+  const extensionNote = agentFiles.extensionStale
+    ? `; Spec Kit extension v${agentFiles.registered}, this CLI ships v${agentFiles.packaged}`
+    : '';
+  if (agentFiles.behind) {
+    console.log(`  ${c.cyan}Agent${c.reset}  files:     ${c.yellow}${agentFiles.stale.length} out of date${extensionNote}${c.reset}`);
+  } else {
+    console.log(`  ${c.cyan}Agent${c.reset}  files:     ${c.green}current${c.reset}`);
+  }
+
   console.log();
 
   // ── Decide what to do ───────────────────────────────────────────────────
-  const anythingBehind = cliBehind || schemaBehind;
+  const anythingBehind = cliBehind || schemaBehind || agentFiles.behind;
   if (!anythingBehind) {
     console.log(`  ${c.green}✅ Everything is up to date.${c.reset}`);
     return;
@@ -294,7 +378,10 @@ export async function runUpgrade(projectDir, _config, flags) {
     console.log(`    ${c.yellow}•${c.reset} Upgrade CLI:    ${c.cyan}npm install -g docguard-cli@latest${c.reset}`);
   }
   if (schemaBehind) {
-    console.log(`    ${c.yellow}•${c.reset} Migrate schema: ${c.cyan}docguard upgrade --apply${c.reset} ${c.dim}(or hand-edit .docguard.json)${c.reset}`);
+    console.log(`    ${c.yellow}•${c.reset} Migrate schema: ${c.cyan}docguard upgrade --apply --schema-only${c.reset} ${c.dim}(or hand-edit .docguard.json)${c.reset}`);
+  }
+  if (agentFiles.behind) {
+    console.log(`    ${c.yellow}•${c.reset} Refresh agent files: ${c.cyan}docguard upgrade --apply${c.reset} ${c.dim}(or docguard init)${c.reset}`);
   }
   console.log();
 
@@ -307,27 +394,33 @@ export async function runUpgrade(projectDir, _config, flags) {
   // ── --apply: actually run the migration ─────────────────────────────────
   if (apply) {
     console.log(`${c.bold}  Applying upgrades...${c.reset}\n`);
+    let cliUpgradeFailed = false;
 
     if (cliBehind) {
       console.log(`  ${c.dim}Running:${c.reset} npm install -g docguard-cli@latest`);
       const r = applyCliUpgrade();
       if (r.status !== 0) {
+        // Do NOT exit here. The schema migration below is local, offline, and
+        // independent of which CLI is installed -- gating it behind a global npm
+        // install left every npx / pnpm / devDependency / Docker user with a
+        // "Schema vX is behind vY" nudge that no command could ever clear.
         console.error(`  ${c.red}✗ CLI upgrade failed.${c.reset} Try with sudo, or check npm permissions.`);
-        process.exit(1);
+        cliUpgradeFailed = true;
+      } else {
+        console.log(`  ${c.green}✓ CLI upgraded.${c.reset}`);
+        // Validator-count drift: a CLI upgrade often adds or removes validators,
+        // which changes the "N validators" / "N checks" totals that Metrics-
+        // Consistency scans for in markdown. Without a clear nudge here, a
+        // previously-green project goes red on the very next `docguard guard`
+        // for a reason the user did not cause. The fix is mechanical (replace
+        // hardcoded counts via fix --write) but the user has to know to run it.
+        // We don't auto-run fix --write from this process — the just-installed
+        // binary has the new validator list, but THIS process is still the OLD
+        // binary, so running fix here would use stale counts.
+        console.log(`  ${c.yellow}ℹ  Validator/check totals may have shifted with this upgrade.${c.reset}`);
+        console.log(`     Run ${c.cyan}docguard fix --write${c.reset} ${c.dim}to refresh hardcoded counts in your docs${c.reset}`);
+        console.log(`     ${c.dim}(picks up the new totals from the just-installed CLI).${c.reset}`);
       }
-      console.log(`  ${c.green}✓ CLI upgraded.${c.reset}`);
-      // Validator-count drift: a CLI upgrade often adds or removes validators,
-      // which changes the "N validators" / "N checks" totals that Metrics-
-      // Consistency scans for in markdown. Without a clear nudge here, a
-      // previously-green project goes red on the very next `docguard guard`
-      // for a reason the user did not cause. The fix is mechanical (replace
-      // hardcoded counts via fix --write) but the user has to know to run it.
-      // We don't auto-run fix --write from this process — the just-installed
-      // binary has the new validator list, but THIS process is still the OLD
-      // binary, so running fix here would use stale counts.
-      console.log(`  ${c.yellow}ℹ  Validator/check totals may have shifted with this upgrade.${c.reset}`);
-      console.log(`     Run ${c.cyan}docguard fix --write${c.reset} ${c.dim}to refresh hardcoded counts in your docs${c.reset}`);
-      console.log(`     ${c.dim}(picks up the new totals from the just-installed CLI).${c.reset}`);
     }
 
     if (schemaBehind && projectSchema) {
@@ -363,8 +456,71 @@ export async function runUpgrade(projectDir, _config, flags) {
       }
     }
 
+    // Agent files come from THIS process's package. After a successful global
+    // CLI upgrade those are the old version's files, so refreshing now would
+    // install stale copies under a "refreshed" message.
+    let agentRefreshFailed = false;
+    if (agentFiles.behind) {
+      if (cliBehind && !cliUpgradeFailed) {
+        console.log(`  ${c.yellow}ℹ  Agent files were not refreshed: this process still carries v${INSTALLED_VERSION}'s copies.${c.reset}`);
+        console.log(`     Run ${c.cyan}docguard upgrade --apply${c.reset} again (or ${c.cyan}docguard init${c.reset}) with the new CLI.`);
+      } else {
+        agentRefreshFailed = !refreshAgentFiles(projectDir);
+      }
+    }
+
+    // The schema migration still ran and still counts; the exit code reports the
+    // CLI install that did not, so CI cannot read a partial upgrade as a full one.
+    if (agentRefreshFailed && !cliUpgradeFailed) {
+      console.error(`\n  ${c.yellow}⚠ The other upgrades completed; the Spec Kit extension refresh did not.${c.reset}`);
+      process.exit(1);
+    }
+    if (cliUpgradeFailed) {
+      console.error(`\n  ${c.yellow}⚠ Schema work above completed; the CLI upgrade did not.${c.reset}`);
+      process.exit(1);
+    }
     console.log(`\n  ${c.green}✅ Upgrade complete.${c.reset} Run ${c.cyan}docguard guard${c.reset} to verify.`);
   }
+}
+
+/**
+ * Read-only: DocGuard files installed for the project's agent that differ from
+ * this CLI's, and a registered Spec Kit extension at another version. Spec 042
+ * made `init` the only installer, so nothing else refreshes these after a CLI
+ * upgrade.
+ *
+ * @implements docguard.spec-kit-integration-honesty#FR-004
+ */
+export function agentFilesStatus(projectDir) {
+  const stale = staleAgentAssets(projectDir, readAgentSurface(projectDir));
+  const entry = readRegistryEntry(projectDir);
+  const packaged = packagedExtensionVersion();
+  const registered = typeof entry?.version === 'string' ? entry.version : null;
+  const extensionStale = Boolean(registered && packaged && registered !== packaged && entry.enabled !== false);
+  return { stale, registered, packaged, extensionStale, behind: stale.length > 0 || extensionStale };
+}
+
+/** `upgrade --apply`: the installer and extension refresh `init` uses. */
+function refreshAgentFiles(projectDir) {
+  const assets = installAgentAssets(projectDir, readAgentSurface(projectDir));
+  console.log(`  ${c.green}✓ Agent files refreshed:${c.reset} ${assets.written.length} file(s) updated${assets.written.length ? ` ${c.dim}(${[assets.skillsDir, assets.commandsDir].filter(Boolean).join(', ')})${c.reset}` : ''}.`);
+  if (!readRegistryEntry(projectDir)) return true;
+  const { extension, hooks } = refreshSpecKitExtension(projectDir);
+  if (extension.status === 'refreshed') {
+    console.log(`  ${c.green}✓ DocGuard extension updated in Spec Kit${c.reset} ${c.dim}(${extension.from} → ${extension.to})${c.reset}`);
+  } else if (extension.status === 'failed' || extension.status === 'unsupported-version') {
+    console.error(`  ${c.red}✗ DocGuard extension not updated:${c.reset} ${extension.reason}`);
+    if (extension.manualCommand) console.log(`     ${c.dim}To retry by hand:${c.reset} ${c.cyan}${extension.manualCommand}${c.reset}`);
+    return false;
+  } else if (extension.status === 'not-attempted') {
+    console.log(`  ${c.yellow}⚠ DocGuard extension not updated: the specify CLI is not on PATH.${c.reset}`);
+    return false;
+  }
+  if (hooks && hooks.status !== 'active') {
+    const why = hooks.unresolved.length ? hooks.unresolved.map(h => `${h.command} (expected ${h.path})`).join(', ') : hooks.reason;
+    console.log(`  ${c.yellow}⚠ Workflow hooks are not active: ${why}${c.reset}`);
+  }
+  return true;
 }
 
 /**
@@ -378,7 +534,7 @@ export function checkUpgradeStatus(projectDir) {
     // '0.0' is the internal sentinel for pre-0.4 schemas (no `version` field).
     // Surface that as a friendlier label so users don't see "Schema 0.0".
     const label = schema === '0.0' ? 'pre-0.4 (no version field)' : `v${schema}`;
-    return `Schema ${label} is behind current v${CURRENT_SCHEMA_VERSION}. Run \`docguard upgrade --apply\` to migrate.`;
+    return `Schema ${label} is behind current v${CURRENT_SCHEMA_VERSION}. Run \`docguard upgrade --apply --schema-only\` to migrate it (no npm check, no install).`;
   }
   return null;
 }

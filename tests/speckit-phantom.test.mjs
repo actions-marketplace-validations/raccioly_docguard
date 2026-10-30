@@ -12,10 +12,12 @@ import { execSync } from 'node:child_process';
 const CBX = '- [x' + '] ';
 const CBU = '- [ ' + '] ';
 
-import { validateSpecKitIntegration } from '../cli/scanners/speckit.mjs';
+import { validateSpecKitIntegration, parseCheckedTasks } from '../cli/scanners/speckit.mjs';
+import { FIXTURE_GIT_SHELL } from './helpers/git.mjs';
+// @implements docguard.test-git-hermeticity#FR-001: this file's fixture git goes through the helper.
 
 let hasGit = true;
-try { execSync('git --version', { stdio: 'ignore' }); } catch { hasGit = false; }
+try { execSync(`git ${FIXTURE_GIT_SHELL} --version`, { stdio: 'ignore' }); } catch { hasGit = false; }
 
 describe('Spec-Kit — phantom-completion detection (SPK008/SPK009)', () => {
   let tmp;
@@ -196,9 +198,9 @@ describe('Spec-Kit — phantom-completion detection (SPK008/SPK009)', () => {
         CBX + 'T005 Create audit log in src/api/audit.ts',
       ]),
     });
-    execSync('git init -q', { cwd: tmp });
+    execSync(`git ${FIXTURE_GIT_SHELL} init -q`, { cwd: tmp });
     execSync(
-      'git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit --allow-empty -qm "feat: implement T004 users API"',
+      `git ${FIXTURE_GIT_SHELL} -c user.name=t -c user.email=t@t commit --allow-empty -qm "feat: implement T004 users API"`,
       { cwd: tmp }
     );
 
@@ -214,9 +216,9 @@ describe('Spec-Kit — phantom-completion detection (SPK008/SPK009)', () => {
     writeFeature('001-feat', {
       'tasks.md': tasksMd([CBX + 'T001 Create src/missing/core.mjs']),
     });
-    execSync('git init -q', { cwd: tmp });
+    execSync(`git ${FIXTURE_GIT_SHELL} init -q`, { cwd: tmp });
     execSync(
-      'git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit --allow-empty -qm "feat: implement T0010 other thing"',
+      `git ${FIXTURE_GIT_SHELL} -c user.name=t -c user.email=t@t commit --allow-empty -qm "feat: implement T0010 other thing"`,
       { cwd: tmp }
     );
 
@@ -234,5 +236,16 @@ describe('Spec-Kit — phantom-completion detection (SPK008/SPK009)', () => {
     assert.equal(clean.errors.length, 0);
     assert.deepEqual(phantoms(clean), []);
     assert.ok(clean.total > 0 && clean.passed <= clean.total);
+  });
+});
+
+describe('parseCheckedTasks', () => {
+  it('extracts checked tasks correctly', () => {
+    const content = 'Some text\n- [x] T123 Task 1\n- [X] T124 Task 2\n- [ ] T125 Task 3';
+    const tasks = parseCheckedTasks(content);
+    assert.equal(tasks.length, 2);
+    assert.equal(tasks[0].id, 'T123');
+    assert.equal(tasks[0].text, 'Task 1');
+    assert.equal(tasks[0].line, 2);
   });
 });

@@ -14,6 +14,15 @@
  * path (line numbers stripped) | message with digit-runs normalized to #`.
  * Line numbers churn on every edit and messages embed volatile counts
  * ("21 commits since…") — both would rot the baseline in a week.
+ *
+ * Advisory tails are excluded too (docguard.baseline-stable-fingerprint):
+ * text a validator appends as a hint, which changes when unrelated files
+ * change. Each tail is declared per finding code in ADVISORY_TAILS.
+ *
+ * @implements docguard.baseline-stable-fingerprint#FR-001
+ * @implements docguard.baseline-stable-fingerprint#FR-002
+ * @implements docguard.baseline-stable-fingerprint#FR-004
+ * @implements docguard.baseline-stable-fingerprint#FR-003
  */
 
 import { createHash } from 'node:crypto';
@@ -22,12 +31,41 @@ import { resolve } from 'node:path';
 
 export const BASELINE_FILE = '.docguard.baseline.json';
 
-/** Stable fingerprint for one finding. */
-export function fingerprintFinding(f) {
+/**
+ * Advisory text a validator appends to a finding's message, by finding code.
+ * TRC004's IR soft-match hint names whichever test file is currently the best
+ * text match, so adding an unrelated test changes it (raccioly/docguard#478).
+ */
+export const ADVISORY_TAILS = Object.freeze({
+  TRC004: / — IR soft-match: .*$/s,
+});
+
+function hash(code, path, message) {
+  const msg = String(message || '').replace(/\d+/g, '#').replace(/\s+/g, ' ').trim();
+  return createHash('sha256').update(`${code}|${path}|${msg}`).digest('hex').slice(0, 16);
+}
+
+function parts(f) {
   const code = f.code || 'UNCODED';
   const path = typeof f.location === 'string' ? f.location.replace(/:\d+$/, '') : '';
-  const msg = String(f.message || '').replace(/\d+/g, '#').replace(/\s+/g, ' ').trim();
-  return createHash('sha256').update(`${code}|${path}|${msg}`).digest('hex').slice(0, 16);
+  return { code, path, message: String(f.message || '') };
+}
+
+/** Stable fingerprint for one finding: its message without a declared advisory tail. */
+export function fingerprintFinding(f) {
+  const { code, path, message } = parts(f);
+  const tail = ADVISORY_TAILS[code];
+  return hash(code, path, tail ? message.replace(tail, '') : message);
+}
+
+/**
+ * The fingerprint releases before the advisory-tail change wrote: the full
+ * message. Guard accepts it so an existing baseline keeps suppressing what it
+ * froze; `--update-baseline` rewrites it in the stable form.
+ */
+export function legacyFingerprint(f) {
+  const { code, path, message } = parts(f);
+  return hash(code, path, message);
 }
 
 /**
@@ -52,7 +90,17 @@ export function loadBaseline(projectDir) {
       const count = Number.isInteger(n) && n > 0 ? n : 0;
       if (count > 0) map.set(fp, count);
     }
-    return map.size > 0 ? map : null;
+    if (map.size === 0) return null;
+    // `generatedAt` is written by saveBaseline and was previously dropped on
+    // read, so a baseline had no age: 233 frozen findings looked the same on
+    // day 1 and day 400, and silent permanent amnesty is the failure mode a
+    // suppression list is most prone to. Carried as a non-enumerable property
+    // so every existing `Map` consumer (iteration, spread, size) is untouched.
+    Object.defineProperty(map, 'generatedAt', {
+      value: typeof data.generatedAt === 'string' ? data.generatedAt : null,
+      enumerable: false,
+    });
+    return map;
   } catch {
     // A malformed baseline must not silently un-gate CI: treat as absent so
     // every finding surfaces (fail-open on visibility, fail-closed on hiding).
@@ -65,6 +113,18 @@ export function loadBaseline(projectDir) {
  * count, keys sorted so the committed file diffs cleanly. Returns the number
  * of distinct fingerprints.
  */
+/**
+ * Whole days since an ISO timestamp, or null when it is absent or unparseable.
+ * Age is reported, never enforced: an old baseline is a prompt to re-triage,
+ * not a gate.
+ */
+export function baselineAgeDays(generatedAt, now = Date.now()) {
+  if (typeof generatedAt !== 'string') return null;
+  const at = Date.parse(generatedAt);
+  if (!Number.isFinite(at)) return null;
+  return Math.max(0, Math.floor((now - at) / 86400000));
+}
+
 export function saveBaseline(projectDir, findings) {
   const counts = {};
   for (const f of findings) {

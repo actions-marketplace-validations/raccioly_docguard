@@ -1,6 +1,6 @@
 {
   "projectName": "docguard",
-  "version": "0.5",
+  "version": "0.6",
   "profile": "enterprise",
   "projectType": "cli",
   "requiredFiles": {
@@ -38,9 +38,29 @@
     "testSpec": true,
     "security": true,
     "environment": true,
-    "freshness": true
+    "freshness": true,
+    "documentLifecycle": true,
+    "specRegistry": true
+  },
+  "ownership": {
+    "roots": ["cli", "extensions", "tools", "benchmarks", "tests"],
+    "entries": [
+      { "doc": "docs-canonical/ARCHITECTURE.md", "section": "component-map", "purpose": "What each CLI layer (entry, commands, validators, scanners, writers, evidence, shared modules) is responsible for, and where it sits in the layer graph.", "paths": ["cli/**"] },
+      { "doc": "docs-canonical/DATA-MODEL.md", "section": "finding-channels", "purpose": "The finding contract every validator emits: code, severity, confidence, disposition, evidence and parser tier.", "paths": ["cli/findings.mjs"] },
+      { "doc": "extensions/spec-kit-docguard/README.md", "purpose": "The Spec Kit extension: its commands, hooks and the scripts they call.", "paths": ["extensions/**"] },
+      { "doc": "docs-canonical/ENVIRONMENT.md", "section": "development", "purpose": "Development tools: the llms bundle generator, the non-regression budget runner and the test reporter.", "paths": ["tools/**"] },
+      { "doc": "docs-canonical/CI-RECIPES.md", "section": "recipe-4d--detector-precision-regression", "purpose": "The precision benchmark, its corpus and fixtures, and the agent-context benchmark.", "paths": ["benchmarks/**"] },
+      { "doc": "docs-canonical/TEST-SPEC.md", "section": "source-to-test-map", "purpose": "Which test files defend which source files, and the fixtures they use.", "paths": ["tests/**"] }
+    ]
+  },
+  "diagrams": {
+    "moduleGraph": { "include": ["cli"] }
+  },
+  "specFirst": {
+    "paths": ["cli/**"]
   },
   "severity": {},
+  "findingSeverity": {},
   "surfaceSync": {
     "surfaces": [
       {
@@ -49,7 +69,7 @@
         "extract": "basename-no-ext",
         "ignore": [
           "agents", "hooks", "ci", "badge", "llms", "publish",
-          "setup", "impact", "sync-tests"
+          "setup", "impact", "sync-tests", "generate-as-built"
         ],
         "docs": ["README.md"],
         "section": "Usage"
@@ -69,7 +89,7 @@
       },
       {
         "name": "slash-commands",
-        "glob": "templates/commands/*.md",
+        "glob": "commands/docguard.*.md",
         "extract": "basename-no-ext",
         "docs": ["README.md"],
         "section": "Slash Commands"

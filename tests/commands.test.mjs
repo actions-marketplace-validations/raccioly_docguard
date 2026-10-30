@@ -5,11 +5,14 @@
 
 import { describe, it } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { execSync, spawn } from 'node:child_process';
+import { execSync, execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync, readFileSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { runCI } from '../cli/commands/ci.mjs';
+import { runSpecs } from '../cli/commands/specs.mjs';
+import { loadConfig } from '../cli/config.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CLI = join(__dirname, '..', 'cli', 'docguard.mjs');
@@ -78,8 +81,19 @@ describe('docguard audit', () => {
 
 
 describe('docguard badge', () => {
-  it('runs and shows badges', () => {
-    const output = run('badge');
+  // The deprecated alias initializes skills: keep its writes out of the source tree.
+  function runBadge(t, args = []) {
+    const project = mkdtempSync(join(tmpdir(), 'dg-badge-command-'));
+    t.after(() => rmSync(project, { recursive: true, force: true }));
+    return execFileSync(process.execPath, [CLI, 'badge', ...args], {
+      cwd: project, encoding: 'utf8', timeout: 15000,
+      // No host Spec Kit installation may run during this fixture.
+      env: { ...process.env, NO_COLOR: '1', PATH: '' },
+    });
+  }
+
+  it('runs and shows badges', t => {
+    const output = runBadge(t);
     assert.match(output, /DocGuard Badge/);
     assert.match(output, /Score Badge:/);
     assert.match(output, /Type Badge:/);
@@ -87,8 +101,8 @@ describe('docguard badge', () => {
     assert.match(output, /img\.shields\.io/);
   });
 
-  it('outputs JSON with --format json', () => {
-    const output = run('badge --format json');
+  it('outputs JSON with --format json', t => {
+    const output = runBadge(t, ['--format', 'json']);
     const jsonStart = output.indexOf('{');
     const jsonStr = output.substring(jsonStart);
     const parsed = JSON.parse(jsonStr);
@@ -294,12 +308,12 @@ describe('field report fixes — init --fix headless + generate --plan no side-e
 });
 
 describe('read-only commands are side-effect-free (v0.26 field report Bug #3)', () => {
-  // A bare `docguard guard`/`score`/`diff` used to run ensureSkills →
+  // A bare `docguard guard`/`score`/`diff`/`fix` used to run ensureSkills →
   // auto-init Spec Kit and write .agent/.specify into the tree before printing
   // results. A validate/report command must never mutate the working tree —
   // this holds even when the `specify` CLI is absent, because ensureSkills
   // writes .agent/skills unconditionally regardless of the spawn.
-  for (const cmd of ['guard', 'score', 'diff']) {
+  for (const cmd of ['guard', 'score', 'diff', 'fix']) {
     it(`docguard ${cmd} does not scaffold .agent/ or .specify/`, () => {
       const tmpDir = mkdtempSync(join(tmpdir(), `sg-readonly-${cmd}-`));
       try {
@@ -392,11 +406,41 @@ describe('field report F1/F3 — kind-aware generate + cli/library profiles', ()
 });
 
 describe('docguard hooks', () => {
-  it('lists available hooks', () => {
-    const output = run('hooks --list');
+  it('lists available hooks without scaffolding the inspected repository', t => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'sg-hooks-list-'));
+    t.after(() => rmSync(tmpDir, { recursive: true, force: true }));
+    execSync(`git ${FIXTURE_GIT_SHELL} init -q`, { cwd: tmpDir });
+    writeFileSync(join(tmpDir, 'package.json'), '{"name":"hooks-list","version":"1.0.0"}');
+
+    const output = run(`hooks --list --dir ${tmpDir}`);
     assert.match(output, /pre-commit/);
     assert.match(output, /pre-push/);
     assert.match(output, /commit-msg/);
+    assert.equal(existsSync(join(tmpDir, '.agent')), false, 'listing hooks must not install agent skills');
+  });
+
+  it('distinguishes an existing foreign hook from a DocGuard installation', t => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'sg-hooks-foreign-'));
+    t.after(() => rmSync(tmpDir, { recursive: true, force: true }));
+    execSync(`git ${FIXTURE_GIT_SHELL} init -q`, { cwd: tmpDir });
+    writeFileSync(join(tmpDir, 'package.json'), '{"name":"hooks-foreign","version":"1.0.0"}');
+    writeFileSync(join(tmpDir, '.git/hooks/pre-commit'), '#!/bin/sh\nnpm test\n');
+
+    const output = run(`hooks --list --dir ${tmpDir}`);
+    assert.match(output, /pre-commit.*existing non-DocGuard hook/);
+    assert.doesNotMatch(output, /pre-commit.*DocGuard installed/);
+  });
+
+  it('routes init --with hooks --list directly to read-only inventory', t => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'sg-init-hooks-list-'));
+    t.after(() => rmSync(tmpDir, { recursive: true, force: true }));
+    execSync(`git ${FIXTURE_GIT_SHELL} init -q`, { cwd: tmpDir });
+    writeFileSync(join(tmpDir, 'package.json'), '{"name":"hooks-nested-list","version":"1.0.0"}');
+
+    const output = run(`init --with hooks --list --dir ${tmpDir}`);
+    assert.match(output, /Available hooks/);
+    assert.equal(existsSync(join(tmpDir, 'docs-canonical')), false);
+    assert.equal(existsSync(join(tmpDir, '.agent')), false);
   });
 });
 
@@ -845,6 +889,8 @@ describe('docguard trace error handling', () => {
 });
 
 import { getTestFilesFromPatterns } from '../cli/validators/docs-diff.mjs';
+import { FIXTURE_GIT_SHELL } from './helpers/git.mjs';
+// @implements docguard.test-git-hermeticity#FR-001: this file's fixture git goes through the helper.
 describe('getTestFilesFromPatterns', () => {
   it('should return empty array if directory does not exist', () => {
     const results = getTestFilesFromPatterns('/path/that/does/not/exist/for/sure/12345', ['**/*.test.js']);
@@ -890,6 +936,8 @@ describe('getTestFilesFromPatterns', () => {
   });
 });
 
+// @req docguard.watch-deterministic#FR-004
+// @req docguard.watch-deterministic#SC-003
 describe('docguard watch', () => {
   // v0.29 flake fix: these two spawn tests polled with a FIXED 2s cap
   // (20×100ms) — a hair-trigger race against CLI startup (init + spawn +
@@ -930,19 +978,38 @@ describe('docguard watch', () => {
         output += data.toString();
       });
 
-      // Wait until initial output signals it's ready
-      await waitFor(() => output.includes('Watching 5 directories') || output.includes('Watching for changes'));
+      // Wait for the REAL readiness marker: "Watching N directories", which is
+      // printed only after the initial guard run finishes and the watchers are
+      // actually registered. Order of output is:
+      //
+      //     👁️  DocGuard Watch — <dir>
+      //        Watching for changes... (Ctrl+C to stop)   ← NOT ready yet
+      //        [HH:MM:SS] Running guard...                ← takes seconds
+      //        Watching N directories                     ← ready
+      //
+      // This used to wait on `'Watching 5 directories' || 'Watching for
+      // changes'`. The count is actually 4, so the first branch never matched
+      // and it always fell through to the second — which fires BEFORE the
+      // initial guard run. The file write below then landed while the watchers
+      // were still unregistered and was missed entirely. On a fast runner the
+      // guard run finished inside the 500ms buffer and it passed; on a loaded
+      // one it didn't. That flake failed 2 of 3 release runs (on Node 24 and
+      // then Node 22) and blocked the pipeline. Match the count, don't hardcode.
+      await waitFor(() => /Watching \d+ directories/.test(output));
 
       assert.match(output, /DocGuard Watch/);
       assert.match(output, /Watching for changes/);
+      assert.match(output, /Watching \d+ directories/);
 
-      // Wait an extra moment to ensure the watcher is fully registered
+      // Small extra buffer: fs.watch registration can lag the log line slightly.
       await new Promise(r => setTimeout(r, 500));
 
       // Test file change
       writeFileSync(join(tmpDir, 'src', 'index.js'), 'console.log("world");');
 
-      await waitFor(() => output.includes('Changed:') && output.includes('index.js'));
+      // Wait on the pattern asserted below: two separate substrings could both
+      // be present before they are on one line (docguard.watch-deterministic#FR-004).
+      await waitFor(() => /Changed: .*index\.js/.test(output));
 
       // Ensure it detected our modification
       assert.match(output, /Changed: .*index\.js/);
@@ -971,7 +1038,9 @@ describe('docguard watch', () => {
         output += data.toString();
       });
 
-      await waitFor(() => output.includes('Auto-fix prompts'));
+      // The prompts arrive in a later stdout chunk than their header: wait for the
+      // last line asserted, or the assertions race the stream.
+      await waitFor(() => output.includes('docguard fix --doc'));
 
       assert.match(output, /Mode: auto-fix/);
       assert.match(output, /Auto-fix prompts:/);
@@ -979,6 +1048,101 @@ describe('docguard watch', () => {
     } finally {
       if (child) child.kill('SIGINT');
       rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// runCI and runSpecs called in-process, as the MCP server and the GitHub
+// Action do. Both report through process.exitCode instead of exiting, so each
+// case resets it; a leftover non-zero code would fail the test runner.
+describe('runCI and runSpecs report through their return value and process.exitCode', () => {
+  const captured = fn => {
+    const out = [];
+    const write = process.stdout.write;
+    const log = console.log;
+    const error = console.error;
+    process.stdout.write = chunk => { out.push(String(chunk)); return true; };
+    console.log = (...args) => { out.push(args.join(' ')); };
+    console.error = () => {};
+    process.exitCode = 0;
+    try { return { value: fn(), out: out.join('') }; } finally {
+      process.stdout.write = write;
+      console.log = log;
+      console.error = error;
+    }
+  };
+  const fixture = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'docguard-inproc-'));
+    writeFileSync(join(dir, '.docguard.json'), JSON.stringify({ projectName: 'inproc', profile: 'starter' }));
+    writeFileSync(join(dir, 'README.md'), '# inproc\n');
+    return dir;
+  };
+
+  it('runCI: the exit code follows the JSON status, and an unreachable threshold fails', () => {
+    const dir = fixture();
+    try {
+      const { out } = captured(() => runCI(dir, loadConfig(dir), { format: 'json', threshold: '101', noHistory: true }));
+      const code = process.exitCode;
+      process.exitCode = 0;
+      const result = JSON.parse(out);
+      assert.equal(result.threshold, 101);
+      assert.equal(result.thresholdMet, false, 'no project scores above 100');
+      assert.equal(result.status, 'FAIL');
+      assert.equal(code, 1, 'FAIL exits 1');
+      assert.equal(existsSync(join(dir, '.docguard', 'history.jsonl')), false, '--no-history writes nothing');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('runCI: records one history line carrying the reported score', () => {
+    const dir = fixture();
+    try {
+      const { out } = captured(() => runCI(dir, loadConfig(dir), { format: 'json' }));
+      const code = process.exitCode;
+      process.exitCode = 0;
+      const result = JSON.parse(out);
+      assert.equal(code, { FAIL: 1, WARN: 2, PASS: 0 }[result.status], `exit ${code} for ${result.status}`);
+      const lines = readFileSync(join(dir, '.docguard', 'history.jsonl'), 'utf-8').trim().split('\n');
+      assert.equal(lines.length, 1);
+      const entry = JSON.parse(lines[0]);
+      assert.equal(entry.score, result.score);
+      assert.equal(entry.status, result.status);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('runSpecs: --check reports a missing registry, --write creates it, then --check is CURRENT', () => {
+    const dir = fixture();
+    mkdirSync(join(dir, '.specify', 'memory'), { recursive: true });
+    writeFileSync(join(dir, '.specify', 'memory', 'constitution.md'), '# Constitution\n');
+    mkdirSync(join(dir, 'specs', '001-alpha'), { recursive: true });
+    writeFileSync(join(dir, 'specs', '001-alpha', 'spec.md'), '# Feature Specification: Alpha\n\n**Spec ID**: `inproc.alpha`\n\n## Requirements\n\n- **FR-001**: Alpha works.\n');
+    const config = loadConfig(dir);
+    try {
+      const missing = captured(() => runSpecs(dir, config, { check: true })).value;
+      assert.equal(missing.status, 'MISSING');
+      assert.equal(process.exitCode, 2, '--check fails on a missing registry');
+
+      const written = captured(() => runSpecs(dir, config, { write: true })).value;
+      assert.equal(written.status, 'WRITTEN');
+      assert.equal(written.specs, 1);
+      assert.ok(existsSync(join(dir, '.docguard-specs.json')));
+
+      const current = captured(() => runSpecs(dir, config, { check: true })).value;
+      assert.equal(current.status, 'CURRENT');
+      assert.equal(process.exitCode, 0);
+    } finally {
+      process.exitCode = 0;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('runSpecs: an unknown action is an error, not a silent success', () => {
+    const dir = fixture();
+    try {
+      captured(() => runSpecs(dir, loadConfig(dir), { args: ['bogus'] }));
+      assert.equal(process.exitCode, 1);
+    } finally {
+      process.exitCode = 0;
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

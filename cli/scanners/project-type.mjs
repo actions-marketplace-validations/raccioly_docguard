@@ -16,6 +16,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { resolve, join, relative, dirname, basename } from 'node:path';
 import { shouldIgnore, relPosix, isNonProductDir } from '../shared-ignore.mjs';
+import { hasWorkerConfig, isPagesProject } from '../shared-source.mjs';
 
 const IGNORE_DIRS = new Set([
   'node_modules', '.git', '.next', 'dist', 'build', 'coverage', 'target',
@@ -26,6 +27,9 @@ const IGNORE_DIRS = new Set([
 // Manifest filename → ecosystem language.
 const MANIFESTS = [
   { file: 'package.json', lang: 'JavaScript' },
+  { file: 'wrangler.toml', lang: 'JavaScript' },
+  { file: 'wrangler.json', lang: 'JavaScript' },
+  { file: 'wrangler.jsonc', lang: 'JavaScript' },
   { file: 'pyproject.toml', lang: 'Python' },
   { file: 'requirements.txt', lang: 'Python' },
   { file: 'setup.py', lang: 'Python' },
@@ -57,7 +61,8 @@ function findManifests(projectDir, maxDepth = 4, config = {}) {
         // DEFAULT. A fixture `package.json` declaring express or a `py_app`
         // requirements.txt with flask must never set the PROJECT's stack/kind.
         // This is the first-run fix — it needs no `.docguardignore`.
-        if (isNonProductDir(e.name, config)) continue;
+        // The parent path lets a package segment (`com/example`) through.
+        if (isNonProductDir(e.name, config, relPosix(root, dir))) continue;
         // Also honor explicit config.ignore / .docguardignore patterns.
         if (shouldIgnore(relPosix(root, join(dir, e.name)), config)) continue;
         walk(join(dir, e.name), depth + 1);
@@ -91,13 +96,46 @@ function tomlSectionDeps(content, sections) {
   return deps;
 }
 
+/**
+ * The strings of a TOML array starting at `open` (the index of its `[`).
+ * Quote- and comment-aware, so `"uvicorn[standard]"` does not end the array.
+ * @implements docguard.python-extraction#FR-017
+ */
+function tomlArrayStrings(content, open) {
+  const out = [];
+  let depth = 0;
+  for (let i = open; i < content.length; i++) {
+    const ch = content[i];
+    if (ch === '#') { while (i < content.length && content[i] !== '\n') i++; continue; }
+    if (ch === '"' || ch === "'") {
+      const triple = content.startsWith(ch.repeat(3), i);
+      const delim = triple ? ch.repeat(3) : ch;
+      let j = i + delim.length;
+      let value = '';
+      while (j < content.length && !content.startsWith(delim, j)) {
+        if (ch === '"' && content[j] === '\\') { value += content[j + 1] || ''; j += 2; continue; }
+        value += content[j++];
+      }
+      if (depth === 1) out.push(value);
+      i = j + delim.length - 1;
+      continue;
+    }
+    if (ch === '[') depth++;
+    else if (ch === ']' && --depth === 0) break;
+  }
+  return out;
+}
+
 /** pyproject [project] dependencies = ["pkg>=1", ...] and poetry table form. */
 function pyprojectDeps(content) {
   const deps = {};
   // PEP 621 array form
-  const arr = content.match(/dependencies\s*=\s*\[([\s\S]*?)\]/);
+  const arr = /(?:^|\n)\s*dependencies\s*=\s*\[/.exec(content);
   if (arr) {
-    for (const m of arr[1].matchAll(/["']([A-Za-z0-9_.\-]+)\s*[><=~!\[]?/g)) deps[m[1]] = '*';
+    for (const spec of tomlArrayStrings(content, arr.index + arr[0].length - 1)) {
+      const m = spec.match(/^\s*([A-Za-z0-9_.\-]+)/);
+      if (m) deps[m[1]] = '*';
+    }
   }
   // Poetry table form
   Object.assign(deps, tomlSectionDeps(content, ['tool.poetry.dependencies']));
@@ -157,21 +195,76 @@ function csprojDeps(content) {
   return deps;
 }
 
+/**
+ * Whether a project file builds an ASP.NET Core app: the web SDK (as the
+ * `Sdk` attribute or an `<Sdk>` element), the `Microsoft.AspNetCore.App`
+ * framework reference, or a `Microsoft.AspNetCore.*` package. A
+ * `dotnet new webapi` project has only the first.
+ * @implements docguard.php-dotnet-routes#FR-008
+ */
+function isAspNetCoreProject(content) {
+  return /\bSdk\s*=\s*"Microsoft\.NET\.Sdk\.Web(?:\/[^"]*)?"/.test(content)
+    || /<Sdk\s+Name\s*=\s*"Microsoft\.NET\.Sdk\.Web"/.test(content)
+    || /<FrameworkReference\s+Include\s*=\s*"Microsoft\.AspNetCore\.App"/.test(content)
+    || /<PackageReference\s+Include\s*=\s*"Microsoft\.AspNetCore(?:\.[^"]*)?"/.test(content);
+}
+
 // ── Framework + kind classification per ecosystem ────────────────────────────
 
+const NET_HTTP_IMPORT = /"net\/http"/;
+const NET_HTTP_SERVER = /\.\s*(?:HandleFunc|Handle)\s*\(|\bhttp\s*\.\s*(?:ListenAndServe(?:TLS)?|NewServeMux)\s*\(|\bhttp\s*\.\s*Server\s*\{/;
+
+/**
+ * Whether a Go module with no router dependency serves HTTP with the standard
+ * library: one of its `.go` files imports `net/http` and registers a handler,
+ * makes a `ServeMux`, or starts a server. An HTTP client alone does not count.
+ * The walk is bounded (depth 6, 2,000 files) and skips `vendor`, `testdata`,
+ * dot directories and `_test.go` files.
+ *
+ * @implements docguard.more-route-frameworks#FR-006
+ */
+function servesNetHttp(dir) {
+  let seen = 0;
+  const walk = (d, depth) => {
+    if (depth > 6 || seen >= 2000) return false;
+    let entries;
+    try { entries = readdirSync(d, { withFileTypes: true }); } catch { return false; }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        if (IGNORE_DIRS.has(e.name) || e.name.startsWith('.') || e.name === 'testdata' || isNonProductDir(e.name)) continue;
+        if (walk(join(d, e.name), depth + 1)) return true;
+      } else if (e.isFile() && e.name.endsWith('.go') && !e.name.endsWith('_test.go')) {
+        if (++seen > 2000) return false;
+        const text = readSafe(join(d, e.name));
+        if (NET_HTTP_IMPORT.test(text) && NET_HTTP_SERVER.test(text)) return true;
+      }
+    }
+    return false;
+  };
+  return walk(dir, 0);
+}
+
 function has(deps, ...names) {
-  const keys = Object.keys(deps).map(k => k.toLowerCase());
+  // A Go module's major version is a path suffix (`github.com/labstack/echo/v4`);
+  // match on the module without it (docguard.go-spring-rails-routes#FR-007).
+  const keys = Object.keys(deps).map(k => k.toLowerCase().replace(/\/v\d+$/, ''));
   return names.some(n => keys.some(k => k === n.toLowerCase() || k.endsWith('/' + n.toLowerCase()) || k.endsWith(':' + n.toLowerCase())));
 }
 
-function classify(lang, dir, deps) {
+function classify(lang, dir, deps, { webSdk = false } = {}) {
   let framework = null;
   let kind = 'library';
 
   if (lang === 'JavaScript' || lang === 'TypeScript') {
-    if (has(deps, 'next')) { framework = 'Next.js'; kind = 'webapp'; }
+    // A Pages project may carry a Wrangler file too; its Functions are not a
+    // Worker's fetch entry (docguard.js-route-shapes#FR-002).
+    if (isPagesProject(dir)) { framework = 'Cloudflare Pages'; kind = 'service'; }
+    else if (hasWorkerConfig(dir)) { framework = 'Cloudflare Workers'; kind = 'service'; }
+    else if (has(deps, 'next')) { framework = 'Next.js'; kind = 'webapp'; }
     else if (has(deps, 'react', 'vue', '@angular/core', 'svelte', '@sveltejs/kit', 'nuxt')) { framework = has(deps,'react')?'React':has(deps,'vue')?'Vue':'Frontend'; kind = 'webapp'; }
-    else if (has(deps, 'express', 'fastify', 'hono', 'koa', '@nestjs/core')) { framework = has(deps,'express')?'Express':has(deps,'fastify')?'Fastify':has(deps,'@nestjs/core')?'NestJS':'Hono'; kind = 'api'; }
+    // NestJS first: a Nest app on the Express platform often lists `express`
+    // too (docguard.js-framework-routes#FR-007).
+    else if (has(deps, 'express', 'fastify', 'hono', 'koa', '@nestjs/core')) { framework = has(deps,'@nestjs/core')?'NestJS':has(deps,'express')?'Express':has(deps,'fastify')?'Fastify':has(deps,'hono')?'Hono':'Koa'; kind = 'api'; } // docguard.docs-verification-findings#FR-001
   } else if (lang === 'Python') {
     if (has(deps, 'django') || existsSync(join(dir, 'manage.py'))) { framework = 'Django'; kind = 'webapp'; }
     else if (has(deps, 'fastapi')) { framework = 'FastAPI'; kind = 'api'; }
@@ -191,6 +284,8 @@ function classify(lang, dir, deps) {
     else if (has(deps, 'echo', 'labstack/echo')) { framework = 'Echo'; kind = 'service'; }
     else if (has(deps, 'chi', 'go-chi/chi')) { framework = 'Chi'; kind = 'service'; }
     else if (has(deps, 'fiber', 'gofiber/fiber')) { framework = 'Fiber'; kind = 'service'; }
+    else if (has(deps, 'gorilla/mux')) { framework = 'Gorilla Mux'; kind = 'service'; }
+    else if (servesNetHttp(dir)) { framework = 'net/http'; kind = 'service'; } // docguard.more-route-frameworks#FR-006
     else if (existsSync(join(dir, 'main.go')) || existsSync(join(dir, 'cmd'))) kind = 'service';
   } else if (lang === 'Java' || lang === 'Kotlin') {
     if (has(deps, 'spring-boot-starter-web', 'spring-boot-starter', 'org.springframework.boot:spring-boot-starter-web')) { framework = 'Spring Boot'; kind = 'api'; }
@@ -201,10 +296,43 @@ function classify(lang, dir, deps) {
     if (has(deps, 'laravel/framework')) { framework = 'Laravel'; kind = 'webapp'; }
     else if (has(deps, 'symfony/framework-bundle')) { framework = 'Symfony'; kind = 'webapp'; }
   } else if (lang === 'C#') {
-    if (has(deps, 'Microsoft.AspNetCore.App') || /Sdk="Microsoft\.NET\.Sdk\.Web"/.test('')) { framework = 'ASP.NET Core'; kind = 'api'; }
+    // The regex used to be tested against '' and never matched (docguard.php-dotnet-routes#FR-008).
+    if (webSdk || has(deps, 'Microsoft.AspNetCore.App')) { framework = 'ASP.NET Core'; kind = 'api'; }
   }
 
   return { framework, kind };
+}
+
+// ORM, UI and auth libraries worth naming next to the framework
+// (docguard.js-ts-extraction#FR-008): a Next.js app's React, its Drizzle or
+// Prisma, its NextAuth. Order is the output order after sorting by name.
+const JS_LIBRARIES = [
+  ['Prisma', ['prisma', '@prisma/client']],
+  ['Drizzle', ['drizzle-orm']],
+  ['Mongoose', ['mongoose']],
+  ['TypeORM', ['typeorm']],
+  ['Sequelize', ['sequelize']],
+  ['Knex', ['knex']],
+  ['React', ['react']],
+  ['Vue', ['vue']],
+  ['Svelte', ['svelte']],
+  ['NextAuth.js', ['next-auth', '@auth/core']],
+  ['Passport.js', ['passport']],
+  ['Clerk', ['@clerk/nextjs', '@clerk/clerk-sdk-node', '@clerk/express']],
+  ['Lucia', ['lucia']],
+];
+
+/**
+ * Libraries a JS/TS ecosystem declares, other than its framework.
+ * @implements docguard.js-ts-extraction#FR-008
+ */
+function jsLibraries(lang, deps, framework) {
+  if (lang !== 'JavaScript' && lang !== 'TypeScript') return [];
+  const names = Object.keys(deps || {});
+  return JS_LIBRARIES
+    .filter(([label, packages]) => label !== framework && packages.some(p => names.includes(p)))
+    .map(([label]) => label)
+    .sort((a, b) => a.localeCompare(b));
 }
 
 // ── Per-manifest ecosystem builder ───────────────────────────────────────────
@@ -248,12 +376,13 @@ function buildEcosystem(projectDir, m) {
     deps = csprojDeps(content);
   }
 
-  const cls = classify(lang, m.absDir, deps);
+  const cls = classify(lang, m.absDir, deps, { webSdk: m.file.endsWith('.csproj') && isAspNetCoreProject(content) });
   return {
     language: lang,
     manifest: relative(resolve(projectDir), path) || m.file,
     dir: relative(resolve(projectDir), m.absDir) || '.',
     framework: cls.framework,
+    libraries: jsLibraries(lang, deps, cls.framework),
     kind: kind || cls.kind || 'library',
     deps,
     entryPoints,
@@ -263,7 +392,7 @@ function buildEcosystem(projectDir, m) {
 /**
  * Detect every ecosystem present in the repo (polyglot-aware).
  * Multiple manifests in the same dir+language merge into one ecosystem.
- * @returns {Array<{ language, manifest, dir, framework, kind, deps, entryPoints }>}
+ * @returns {Array<{ language, manifest, dir, framework, libraries, kind, deps, entryPoints }>}
  */
 export function detectEcosystems(projectDir, config = {}) {
   const manifests = findManifests(projectDir, 4, config);
@@ -285,6 +414,7 @@ export function detectEcosystems(projectDir, config = {}) {
       // Re-classify with merged deps.
       const cls = classify(cur.language, join(resolve(projectDir), cur.dir === '.' ? '' : cur.dir), cur.deps);
       if (!cur.framework) cur.framework = cls.framework;
+      cur.libraries = jsLibraries(cur.language, cur.deps, cur.framework);
     } else {
       byKey.set(key, eco);
     }

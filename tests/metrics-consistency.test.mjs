@@ -1,10 +1,15 @@
+// @req docguard.adoption-workflow-integrity#FR-015
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { validateMetricsConsistency } from '../cli/validators/metrics-consistency.mjs';
+
+// The shipped validator count is derived, never hardcoded: a new validator
+// must not break tests about a different behaviour.
+const SHIPPED = readdirSync(new URL('../cli/validators/', import.meta.url)).filter(f => f.endsWith('.mjs')).length;
 
 describe('Metrics-Consistency Validator', () => {
   let tmpDir;
@@ -20,7 +25,7 @@ describe('Metrics-Consistency Validator', () => {
   it('passes when metrics correctly match actual actuals', () => {
     // DocGuard-bound (Bug #2): the line references DocGuard, so the numbers are
     // DocGuard's to govern.
-    writeFileSync(join(tmpDir, 'README.md'), 'DocGuard runs 15 checks across 12 validators.');
+    writeFileSync(join(tmpDir, 'README.md'), `DocGuard runs 15 checks across ${SHIPPED} validators.`);
 
     const guardResults = [];
     for(let i=0; i<11; i++) {
@@ -36,7 +41,7 @@ describe('Metrics-Consistency Validator', () => {
   });
 
   it('returns warnings when numbers mismatch actuals', () => {
-    writeFileSync(join(tmpDir, 'README.md'), 'DocGuard runs 20 checks across 12 validators.');
+    writeFileSync(join(tmpDir, 'README.md'), `DocGuard runs 20 checks across ${SHIPPED} validators.`);
 
     const guardResults = [];
     for(let i=0; i<11; i++) {
@@ -89,12 +94,14 @@ describe('Metrics-Consistency Validator', () => {
     assert.strictEqual(result.total, 0);
   });
 
-  it('checks for test count if test files exist', () => {
+  it('asserts nothing about tests when test files declare no recognisable cases', () => {
     mkdirSync(join(tmpDir, 'tests'), { recursive: true });
     writeFileSync(join(tmpDir, 'tests', 'a.test.mjs'), '...');
     writeFileSync(join(tmpDir, 'tests', 'b.test.mjs'), '...');
+    writeFileSync(join(tmpDir, 'README.md'), 'npm test    # 33 tests\n');
 
-    // we don't have pattern for tests in the current implementation, but it shouldn't crash
+    // Two files, zero declared cases: a "0" floor proves nothing, so no claim
+    // is made (fail-safe, same rule as an unresolved collection glob).
     const result = validateMetricsConsistency(tmpDir, {});
 
     assert.deepEqual(result.errors, []);
@@ -103,7 +110,7 @@ describe('Metrics-Consistency Validator', () => {
     assert.strictEqual(result.total, 0);
   });
 
-  // Field test (wu-whatsappinbox): the recursive root walk swept in OpenWolf
+  // Field test (downstream-project): the recursive root walk swept in OpenWolf
   // session archives and vendored toolkit READMEs deep under security/, then
   // reported their unrelated "N validators / N checks" prose as the user's
   // drift (~39 false warnings). Markdown buried in arbitrary subdirectories is
@@ -168,6 +175,169 @@ describe('Metrics-Consistency Validator', () => {
     const fix = (result.fixes || []).find(f => f.type === 'replace-count');
     assert.ok(fix, 'a bound mismatch should still produce a fix');
     assert.equal(fix.actualSource, 'docguard.guard.checks', 'fix must carry provenance for the applier');
+  });
+
+  it('uses the shipped validator surface when a project disables validators (adoption regression)', () => {
+    // A consumer can intentionally disable validators, but that does not change
+    // the truthful sentence "DocGuard ships N validators." The old code
+    // derived N-1 from this reduced run (N-2 enabled + Metrics-Consistency).
+    const enabledResults = Array.from({ length: SHIPPED - 2 }, () => ({ status: 'passed', total: 1 }));
+    writeFileSync(join(tmpDir, 'README.md'), `DocGuard ships ${SHIPPED} validators.`);
+    const clean = validateMetricsConsistency(tmpDir, {}, enabledResults);
+    assert.deepEqual(clean.warnings, [], clean.warnings.join(' | '));
+
+    writeFileSync(join(tmpDir, 'README.md'), `DocGuard ships ${SHIPPED - 1} validators.`);
+    const stale = validateMetricsConsistency(tmpDir, {}, enabledResults);
+    const fix = stale.fixes.find(item => item.type === 'replace-count');
+    assert.equal(stale.warnings.length, 1, stale.warnings.join(' | '));
+    assert.ok(stale.warnings[0].includes(`DocGuard's shipped validators count is ${SHIPPED}`));
+    assert.deepEqual(
+      { found: fix?.found, actual: fix?.actual, actualSource: fix?.actualSource },
+      { found: SHIPPED - 1, actual: SHIPPED, actualSource: 'docguard.package.validators' },
+    );
+  });
+
+  it('does not rewrite a historical metric transition', () => {
+    writeFileSync(join(tmpDir, 'AGENTS.md'),
+      "DocGuard's defaults changed across releases (182 → 203 checks on one upgrade).\n");
+    const result = validateMetricsConsistency(tmpDir, {}, [{ status: 'passed', total: 211 }]);
+
+    assert.deepEqual(result.warnings, []);
+    assert.deepEqual(result.fixes, []);
+  });
+
+  it('does not treat counts under a release-history heading as current assertions', () => {
+    writeFileSync(join(tmpDir, 'README.md'),
+      '# Project\n\n## Release history\n\nDocGuard shipped 182 checks in v0.39.\n');
+    const result = validateMetricsConsistency(tmpDir, {}, [{ status: 'passed', total: 211 }]);
+
+    assert.deepEqual(result.warnings, []);
+    assert.deepEqual(result.fixes, []);
+  });
+
+  it('retains a current metric mismatch and its mechanical fix', () => {
+    writeFileSync(join(tmpDir, 'README.md'), 'DocGuard currently runs 182 checks.\n');
+    const result = validateMetricsConsistency(tmpDir, {}, [{ status: 'passed', total: 211 }]);
+
+    assert.equal(result.findings?.[0]?.confidence, 'high');
+    assert.equal(result.findings?.[0]?.suggestion?.kind, 'fix');
+    assert.equal(result.fixes.length, 1);
+  });
+
+  it('makes a repeated current count review-only when it also occurs historically', () => {
+    writeFileSync(join(tmpDir, 'README.md'), [
+      'DocGuard currently runs 182 checks.',
+      'Previously, DocGuard ran 182 checks.',
+    ].join('\n'));
+    const result = validateMetricsConsistency(tmpDir, {}, [{ status: 'passed', total: 211 }]);
+
+    assert.equal(result.warnings.length, 1);
+    assert.equal(result.findings?.[0]?.confidence, 'low');
+    assert.equal(result.findings?.[0]?.suggestion?.kind, 'review');
+    assert.deepEqual(result.fixes, []);
+  });
+});
+
+// ── "N tests" (MET003) ────────────────────────────────────────────────────────
+// The README said "33 tests across 18 describe blocks" from 2026-03-15 for 92
+// releases while the suite grew past 2,000 cases. The validator's header
+// promised an "N tests" check, `actuals.tests` was computed from v0.8.2 on,
+// and no pattern ever read it — a dead path a green self-guard could not see.
+// These cases pin the finished check: the exact README sentence is the CONTROL.
+describe('Metrics-Consistency — "N tests" is a lower-bound check (MET003)', () => {
+  let tmpDir;
+  beforeEach(() => { tmpDir = mkdtempSync(join(tmpdir(), 'docguard-test-metrics-tests-')); });
+  afterEach(() => { rmSync(tmpDir, { recursive: true, force: true }); });
+
+  const CASE = (name) => `  it('${name}', () => { assert.ok(true); });\n`;
+  function suite(file, n, extra = '') {
+    mkdirSync(join(tmpDir, 'tests'), { recursive: true });
+    let src = "import { describe, it } from 'node:test';\nimport assert from 'node:assert';\n" + extra + "describe('s', () => {\n";
+    for (let i = 0; i < n; i++) src += CASE(`case ${i}`);
+    writeFileSync(join(tmpDir, 'tests', file), src + '});\n');
+  }
+
+  it('flags the exact README sentence that slipped through (33 tests vs 40 declared)', () => {
+    suite('a.test.mjs', 40);
+    writeFileSync(join(tmpDir, 'README.md'), [
+      '## 🧪 Testing', '', '```bash', 'npm test    # 33 tests across 18 describe blocks', '```', '',
+    ].join('\n'));
+    const result = validateMetricsConsistency(tmpDir, {}, []);
+    const f = result.findings.find(x => x.code === 'MET003');
+    assert.ok(f, `expected MET003; got: ${result.warnings.join(' | ')}`);
+    assert.match(f.message, /"33 tests"/);
+    assert.match(f.message, /at least 40 test cases/);
+    assert.match(f.message, /1 test files/);
+    assert.equal(f.confidence, 'high');
+    assert.equal(f.disposition, 'escalate', 'the true number is unknowable statically — never auto-written');
+    assert.equal(f.suggestion.kind, 'review');
+    assert.equal(f.parserTier, 'js-ast');
+    assert.deepEqual(result.fixes, [], 'MET003 must never emit a replace-count fix');
+  });
+
+  it('passes a documented count AT OR ABOVE the declared floor (loop-generated cases run more than once)', () => {
+    suite('a.test.mjs', 40);
+    writeFileSync(join(tmpDir, 'README.md'), 'npm test    # 40 tests\n\nThe suite has 2,085 tests passing on CI.\n');
+    const result = validateMetricsConsistency(tmpDir, {}, []);
+    assert.deepEqual(result.warnings, [], `counts >= floor cannot be disproven; got: ${result.warnings.join(' | ')}`);
+    assert.equal(result.passed, 2, 'one pass per distinct documented value');
+  });
+
+  it('parses a thousands separator as one number, never as its last group', () => {
+    suite('a.test.mjs', 40);
+    // "1,733 tests" must read as 1733 (>= 40 → pass), not as "733 tests" nor "33 tests"
+    writeFileSync(join(tmpDir, 'README.md'), 'Verification passed 1,733 tests on every Node release.\n');
+    const result = validateMetricsConsistency(tmpDir, {}, []);
+    assert.deepEqual(result.warnings, [], `got: ${result.warnings.join(' | ')}`);
+    assert.equal(result.passed, 1);
+  });
+
+  it('does NOT bind a number about somebody else\'s tests (subject binding)', () => {
+    suite('a.test.mjs', 40);
+    writeFileSync(join(tmpDir, 'README.md'), [
+      'The 2026 study ran 12 tests per repository.',           // research, not our suite
+      '✅ TEST-SPEC.md (12 tests, 8/10 services mapped)',      // sample tool output
+      'Each PR gets 12 tests of patience from the reviewer.',  // prose
+    ].join('\n'));
+    const result = validateMetricsConsistency(tmpDir, {}, []);
+    assert.deepEqual(result.warnings, [], `unbound "12 tests" must be ignored; got: ${result.warnings.join(' | ')}`);
+    assert.equal(result.total, 0);
+  });
+
+  it('binds on runner invocations, "suite", and pass verbs', () => {
+    suite('a.test.mjs', 40);
+    for (const line of [
+      'pytest    # 12 tests',
+      'go test ./...   # 12 tests',
+      'The test suite (12 tests) runs in CI.',
+      '12 tests passing',
+      'node --test runs 12 tests',
+    ]) {
+      writeFileSync(join(tmpDir, 'README.md'), line + '\n');
+      const result = validateMetricsConsistency(tmpDir, {}, []);
+      assert.ok(result.findings.some(f => f.code === 'MET003'), `expected MET003 for: ${line}`);
+    }
+  });
+
+  it('treats a count under a version-pinned heading as history, not a current assertion', () => {
+    suite('a.test.mjs', 40);
+    writeFileSync(join(tmpDir, 'VALIDATION.md'), [
+      '# Validation', '',
+      '## Results — v0.31.0 (research-backed batch)', '',
+      'The candidate passed 12 tests on each supported Node release.', '',
+      '### R5 — Evidence-scoped verification (released in v0.40.0)', '',
+      'Verification passed 12 tests on Node 18, 20, 22, and 24.', '',
+    ].join('\n'));
+    const result = validateMetricsConsistency(tmpDir, { requiredFiles: { canonical: ['VALIDATION.md'] } }, []);
+    assert.deepEqual(result.warnings, [], `version-pinned sections describe that version; got: ${result.warnings.join(' | ')}`);
+  });
+
+  it('is unaffected by a `tests` collection override (reserved noun)', () => {
+    suite('a.test.mjs', 40);
+    writeFileSync(join(tmpDir, 'README.md'), 'npm test    # 33 tests\n');
+    const result = validateMetricsConsistency(tmpDir, { collections: { tests: 'does/not/exist/*.py' } }, []);
+    assert.ok(result.findings.some(f => f.code === 'MET003' && /at least 40/.test(f.message)),
+      `reserved noun keeps the built-in declared-case floor; got: ${result.warnings.join(' | ')}`);
   });
 });
 
@@ -234,8 +404,8 @@ describe('Metrics-Consistency — project collections (field report #6)', () => 
       { collections: { validators: 'src/extractors/*.py' } }, // 19 files — must be ignored for the reserved noun
       [{ status: 'passed', total: 5 }],
     );
-    // The built-in validators count is 2 (1 guard validator + the +1 self-count),
-    // not 19; "12 validators" is bound to docguard so it's compared to the built-in.
+    // The built-in validator count comes from the shipped package modules, not
+    // the collection override; "12 validators" remains DocGuard-bound.
     assert.ok(!result.warnings.some(w => w.includes('the code has 19')),
       `reserved noun must not use the collection glob: ${result.warnings.join(' | ')}`);
   });

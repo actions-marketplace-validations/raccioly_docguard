@@ -96,6 +96,69 @@ export function walk(node, visit) {
   }
 }
 
+/**
+ * Split source text at top-level `sep` (outside brackets, strings and
+ * comments). Pure text, so both parser tiers read object bodies the same way.
+ * @returns {string[]}
+ */
+export function splitTopLevel(text, sep = ',') {
+  const parts = [];
+  let depth = 0, start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '"' || ch === "'" || ch === '`') {
+      for (i++; i < text.length && text[i] !== ch; i++) if (text[i] === '\\') i++;
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '/') { while (i < text.length && text[i] !== '\n') i++; continue; }
+    if (ch === '/' && text[i + 1] === '*') { const end = text.indexOf('*/', i + 2); i = end < 0 ? text.length : end + 1; continue; }
+    if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') depth--;
+    else if (ch === sep && depth === 0) { parts.push(text.slice(start, i)); start = i + 1; }
+  }
+  parts.push(text.slice(start));
+  return parts;
+}
+
+/** Strip `//` and block comments outside strings. */
+export function stripComments(text) {
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '"' || ch === "'" || ch === '`') {
+      const start = i;
+      for (i++; i < text.length && text[i] !== ch; i++) if (text[i] === '\\') i++;
+      out += text.slice(start, i + 1);
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '/') { while (i < text.length && text[i] !== '\n') i++; out += '\n'; continue; }
+    if (ch === '/' && text[i + 1] === '*') { const end = text.indexOf('*/', i + 2); i = end < 0 ? text.length : end + 1; out += ' '; continue; }
+    out += ch;
+  }
+  return out;
+}
+
+/** Index of the bracket that closes the one at `open` (strings and comments skipped); -1 if none. */
+export function matchingBracket(text, open) {
+  const close = { '(': ')', '[': ']', '{': '}' };
+  const stack = [];
+  for (let i = open; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '"' || ch === "'" || ch === '`') {
+      for (i++; i < text.length && text[i] !== ch; i++) if (text[i] === '\\') i++;
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '/') { while (i < text.length && text[i] !== '\n') i++; continue; }
+    if (ch === '/' && text[i + 1] === '*') { const end = text.indexOf('*/', i + 2); if (end < 0) return -1; i = end + 1; continue; }
+    if (close[ch]) stack.push(close[ch]);
+    else if (ch === ')' || ch === ']' || ch === '}') {
+      if (stack.pop() !== ch) return -1;
+      if (stack.length === 0) return i;
+    }
+  }
+  return -1;
+}
+
 /** Inner source text of an ObjectExpression node, i.e. between its `{` and `}`. */
 function objectInner(content, objNode) {
   if (!objNode || objNode.type !== 'ObjectExpression') return '';
@@ -181,20 +244,364 @@ export function extractJsSchemaBodies(content, filename = 'file.ts') {
   return out;
 }
 
+// ── Decorated classes (TypeORM) and Sequelize calls ────────────────────────
+//
+// Both extractors return SOURCE TEXT (decorator arguments, object bodies,
+// type annotations), never interpreted values: the pattern tier in
+// schemas.mjs produces the same text by bracket matching, and one interpreter
+// reads both, so the tiers cannot disagree on what `{ nullable: true }` means.
+
+/** Source text of a node. */
+function textOf(content, node) {
+  return String(content).slice(node.start, node.end);
+}
+
+/** A decorator as `{ name, args }`: the callee's last name, each argument's text. */
+function decoratorInfo(content, dec) {
+  let expr = dec.expression;
+  let args = [];
+  if (expr && expr.type === 'CallExpression') {
+    args = expr.arguments.map(a => textOf(content, a));
+    expr = expr.callee;
+  }
+  const name = expr && expr.type === 'Identifier' ? expr.name
+    : expr && expr.type === 'MemberExpression' && !expr.computed && expr.property && expr.property.type === 'Identifier' ? expr.property.name : '';
+  return { name, args };
+}
+
+/**
+ * Class declarations with their decorators, for decorator-based ORMs.
+ *
+ * Returns `[{ name, base, line, decorators, members }]`: `base` is the
+ * `extends` name (last segment), `line` the line of the class name, each
+ * decorator `{ name, args }` with every argument as source text, and each
+ * member an instance property `{ name, optional, type, decorators }`, with
+ * `type` the annotation's source text or null. Methods, accessors, static
+ * and private members are not members. `null` when the file does not parse.
+ * @implements docguard.typeorm-models#FR-002
+ * @implements docguard.typeorm-models#FR-005
+ */
+export function extractDecoratedClasses(content, filename = 'file.ts') {
+  const { ast, ok } = parseJsTs(content, filename);
+  if (!ok || !ast) return null;
+  const out = [];
+  walk(ast, (node) => {
+    if (node.type !== 'ClassDeclaration' || !node.id) return;
+    const sup = node.superClass;
+    const base = sup && sup.type === 'Identifier' ? sup.name
+      : sup && sup.type === 'MemberExpression' && sup.property && sup.property.type === 'Identifier' ? sup.property.name : null;
+    const members = [];
+    for (const m of (node.body && node.body.body) || []) {
+      if (m.type !== 'ClassProperty' || m.computed || m.static) continue;
+      const name = m.key && m.key.type === 'Identifier' ? m.key.name : m.key && m.key.type === 'StringLiteral' ? m.key.value : null;
+      if (!name) continue;
+      const annotation = m.typeAnnotation && m.typeAnnotation.typeAnnotation;
+      members.push({
+        name,
+        optional: Boolean(m.optional),
+        type: annotation ? textOf(content, annotation) : null,
+        decorators: (m.decorators || []).map(d => decoratorInfo(content, d)),
+      });
+    }
+    out.push({
+      name: node.id.name,
+      base,
+      line: node.id.loc ? node.id.loc.start.line : null,
+      decorators: (node.decorators || []).map(d => decoratorInfo(content, d)),
+      members,
+    });
+  });
+  return out;
+}
+
+const SEQUELIZE_ASSOCIATIONS = new Set(['belongsTo', 'hasMany', 'hasOne', 'belongsToMany']);
+
+/**
+ * Sequelize model declarations and associations, as source text.
+ *
+ * - `x.define('Name', { … }, { … }?)` → `{ call: 'define', name, binding }`,
+ *   `binding` being the variable it is assigned to;
+ * - `Model.init({ … }, { … })` → `{ call: 'init', receiver: 'Model' }`;
+ * - `A.belongsTo(B, { … }?)` (and `hasMany`, `hasOne`, `belongsToMany`) →
+ *   `{ receiver: 'A', method, target: 'B', options }`; `this.belongsTo(B)`
+ *   inside `class A` has receiver `A`.
+ *
+ * Models carry `attributes` and `options` (object inner text) and `line`.
+ * `null` when the file does not parse.
+ * @implements docguard.typeorm-models#FR-006
+ */
+export function extractSequelizeCalls(content, filename = 'file.js') {
+  const { ast, ok } = parseJsTs(content, filename);
+  if (!ok || !ast) return null;
+  const models = [];
+  const associations = [];
+  const bindings = new Map(); // call start offset → the variable it is assigned to
+  const classes = [];
+  walk(ast, (node) => {
+    if (node.type === 'ClassDeclaration' && node.id) classes.push({ name: node.id.name, start: node.start, end: node.end });
+  });
+  const enclosingClass = (at) => classes.filter(c => c.start <= at && at < c.end).sort((a, b) => b.start - a.start)[0]?.name ?? null;
+  walk(ast, (node) => {
+    if (node.type === 'VariableDeclarator' && node.id && node.id.type === 'Identifier' && node.init) {
+      const init = node.init.type === 'AwaitExpression' ? node.init.argument : node.init;
+      if (init && init.type === 'CallExpression') bindings.set(init.start, node.id.name);
+      return;
+    }
+    if (node.type !== 'CallExpression' || !node.callee || node.callee.type !== 'MemberExpression' || node.callee.computed) return;
+    const method = node.callee.property && node.callee.property.type === 'Identifier' ? node.callee.property.name : '';
+    const object = node.callee.object;
+    const receiver = object && object.type === 'Identifier' ? object.name
+      : object && object.type === 'ThisExpression' && SEQUELIZE_ASSOCIATIONS.has(method) ? enclosingClass(node.start) : null;
+    const [a0, a1, a2] = node.arguments;
+    const line = node.loc ? node.loc.start.line : null;
+    if (method === 'define' && a0 && a0.type === 'StringLiteral' && a1 && a1.type === 'ObjectExpression') {
+      models.push({
+        call: 'define', name: a0.value, receiver: null, binding: bindings.get(node.start) ?? null,
+        attributes: objectInner(content, a1), options: a2 && a2.type === 'ObjectExpression' ? objectInner(content, a2) : '', line,
+      });
+    } else if (method === 'init' && receiver && a0 && a0.type === 'ObjectExpression' && a1 && a1.type === 'ObjectExpression') {
+      models.push({
+        call: 'init', name: null, receiver, binding: null,
+        attributes: objectInner(content, a0), options: objectInner(content, a1), line,
+      });
+    } else if (SEQUELIZE_ASSOCIATIONS.has(method) && receiver && a0) {
+      associations.push({
+        receiver, method, target: textOf(content, a0),
+        options: a1 && a1.type === 'ObjectExpression' ? objectInner(content, a1) : '', line,
+      });
+    }
+  });
+  return { models, associations };
+}
+
 // HTTP route-registration methods (`app.get`, `router.post`, …). `use`/`all`
 // are middleware-ish; `all` is included (it IS a route), `use` is not.
 const HTTP_METHOD_NAMES = new Set(['get', 'post', 'put', 'delete', 'patch', 'head', 'options', 'all']);
 
-/** Extract a string path from a call's first arg: StringLiteral or TemplateLiteral. */
-function pathArgValue(node) {
+export function topLevelStaticStrings(ast) {
+  const declarations = new Map();
+  const body = ast?.program?.body || [];
+  for (const statement of body) {
+    const declaration = statement.type === 'ExportNamedDeclaration' ? statement.declaration : statement;
+    if (declaration?.type !== 'VariableDeclaration' || declaration.kind !== 'const') continue;
+    for (const item of declaration.declarations || []) {
+      if (item.id?.type !== 'Identifier' || !item.init) continue;
+      if (declarations.has(item.id.name)) declarations.set(item.id.name, null);
+      else declarations.set(item.id.name, item.init);
+    }
+  }
+  const resolved = new Map();
+  const resolveNode = (node, visiting = new Set()) => {
+    if (!node) return null;
+    if (node.type === 'StringLiteral') return node.value;
+    if (node.type === 'Identifier') {
+      if (resolved.has(node.name)) return resolved.get(node.name);
+      const init = declarations.get(node.name);
+      if (!init || visiting.has(node.name)) return null;
+      const value = resolveNode(init, new Set(visiting).add(node.name));
+      if (value !== null) resolved.set(node.name, value);
+      return value;
+    }
+    if (node.type === 'TemplateLiteral') {
+      let value = '';
+      for (let i = 0; i < node.quasis.length; i++) {
+        value += node.quasis[i]?.value?.cooked ?? '';
+        if (i < node.expressions.length) {
+          const expression = resolveNode(node.expressions[i], visiting);
+          if (expression === null) return null;
+          value += expression;
+        }
+      }
+      return value;
+    }
+    if (node.type === 'BinaryExpression' && node.operator === '+') {
+      const left = resolveNode(node.left, visiting);
+      const right = resolveNode(node.right, visiting);
+      return left === null || right === null ? null : left + right;
+    }
+    return null;
+  };
+  for (const name of declarations.keys()) resolveNode({ type: 'Identifier', name });
+  return resolved;
+}
+
+function expressRouteBindings(ast) {
+  const bindings = new Set(['app', 'router', 'server', 'fastify', 'hono']);
+  const factories = new Set(['express', 'express.Router', 'Router', 'createRouter', 'Fastify', 'Hono']);
+  walk(ast, node => {
+    if (node.type !== 'ImportDeclaration' || node.source?.value !== 'express') return;
+    for (const spec of node.specifiers || []) {
+      if (spec.type === 'ImportDefaultSpecifier') factories.add(spec.local.name);
+      if (spec.type === 'ImportSpecifier' && (spec.imported?.name || spec.imported?.value) === 'Router') {
+        factories.add(spec.local.name);
+      }
+    }
+  });
+  walk(ast, node => {
+    if (node.type !== 'VariableDeclarator' || node.id?.type !== 'Identifier' || node.init?.type !== 'CallExpression') return;
+    const factory = calleeName(node.init.callee);
+    if (factories.has(factory)) bindings.add(node.id.name);
+  });
+  return bindings;
+}
+
+function looksLikeRouteReceiver(name, bindings) {
+  return bindings.has(name) || /(?:app|server|router|routes)$/i.test(name);
+}
+
+// ── Auth evidence (docguard.js-ts-extraction#FR-002) ────────────────────────
+//
+// Auth is a property of ONE route. It is read from that route's own middleware
+// arguments, its own handler body, an earlier `use(auth)` on its receiver, or a
+// mount above it — never from text elsewhere in the file, which marked public
+// `login`/`register` routes as protected whenever a sibling read `req.user`.
+
+const AUTH_WORDS = new Set([
+  'auth', 'authn', 'authz', 'authenticate', 'authenticated', 'authentication',
+  'authorize', 'authorized', 'authorization', 'authed', 'jwt', 'protect',
+  'protected', 'passport', 'guard', 'clerk',
+]);
+const AUTH_VERBS = new Set(['require', 'requires', 'ensure', 'verify', 'check', 'is', 'has', 'restrict', 'must']);
+const AUTH_OBJECTS = new Set([
+  'user', 'login', 'logged', 'session', 'role', 'roles', 'admin', 'scope', 'scopes',
+  'permission', 'permissions', 'token', 'signed', 'member', 'owner',
+]);
+const NOT_MIDDLEWARE_TAIL = new Set(['router', 'routes', 'route', 'controller', 'controllers', 'handler', 'handlers', 'service', 'services']);
+
+/**
+ * True when an identifier names auth middleware: `requireAuth`, `authenticate`,
+ * `verifyToken`, `ensureLoggedIn`, `checkJwt`, `requireRole`, `authGuard`, ...
+ * Words are split on camelCase and `_`, so `authorsList` or `oauthCallback`
+ * are not auth, and `authRouter` (a router) is not middleware.
+ * @implements docguard.js-ts-extraction#FR-002
+ */
+export function isAuthMiddlewareName(name) {
+  if (!name || typeof name !== 'string') return false;
+  const words = name.replace(/([a-z0-9])([A-Z])/g, '$1 $2').split(/[\s_\-.$]+/).filter(Boolean).map(w => w.toLowerCase());
+  if (words.length === 0 || NOT_MIDDLEWARE_TAIL.has(words[words.length - 1])) return false;
+  if (words.some(w => AUTH_WORDS.has(w))) return true;
+  if (AUTH_VERBS.has(words[0]) && words.slice(1).some(w => AUTH_OBJECTS.has(w))) return true;
+  return /^(?:adminOnly|loggedIn|restrictTo|expressjwt)$/i.test(name);
+}
+
+/** An auth check inside a handler body (a guard, not a bare `req.user` read). */
+export const AUTH_CHECK_RE = new RegExp([
+  String.raw`\b(?:getServerSession|getSession|getToken|currentUser|verifyIdToken|getAuth|validateRequest)\s*\(`,
+  String.raw`\bauth\s*\(\s*\)`,
+  String.raw`\bjwt\s*\.\s*verify\s*\(`,
+  String.raw`\bverify(?:Token|Jwt|JWT|Session|Auth)\s*\(`,
+  String.raw`\b(?:requireAuth|requireUser|requireSession|ensureAuthenticated|isAuthenticated)\s*\(`,
+  String.raw`\bif\s*\(\s*!\s*(?:(?:req|request|ctx|c)\s*\.\s*)?(?:user|session|auth|token|userId)\b`,
+  String.raw`\bstatus\s*\(\s*40[13]\s*\)`,
+  String.raw`\bstatus\s*:\s*40[13]\b`,
+  String.raw`\bUnauthori[sz]ed(?:Error|Exception)\b`,
+].join('|'));
+
+/** Is this call argument auth middleware (`requireAuth`, `passport.authenticate(...)`, `[auth, admin]`)? */
+export function isAuthMiddlewareNode(node) {
+  if (!node) return false;
+  if (node.type === 'Identifier') return isAuthMiddlewareName(node.name);
+  if (node.type === 'MemberExpression' && !node.computed) {
+    return isAuthMiddlewareName(node.property?.name) || (node.object?.type === 'Identifier' && isAuthMiddlewareName(node.object.name));
+  }
+  if (node.type === 'CallExpression') {
+    const callee = node.callee;
+    if (callee?.type === 'Identifier') return isAuthMiddlewareName(callee.name);
+    if (callee?.type === 'MemberExpression' && !callee.computed) {
+      return isAuthMiddlewareName(callee.property?.name) || (callee.object?.type === 'Identifier' && isAuthMiddlewareName(callee.object.name));
+    }
+    return false;
+  }
+  if (node.type === 'ArrayExpression') return (node.elements || []).some(isAuthMiddlewareNode);
+  // Fastify route options: `{ preHandler: [fastify.authenticate] }`, `onRequest`, ...
+  if (node.type === 'ObjectExpression') {
+    return (node.properties || []).some(p => HOOK_KEYS.has(propKeyName(p)) && isAuthMiddlewareNode(p.value));
+  }
+  return false;
+}
+
+const HOOK_KEYS = new Set(['preHandler', 'onRequest', 'preValidation', 'preParsing', 'beforeHandler', 'middleware', 'middlewares']);
+
+const FUNCTION_TYPES = new Set(['FunctionExpression', 'ArrowFunctionExpression', 'FunctionDeclaration']);
+
+/** Same-file function bodies by name: `function x(){}` and `const x = () => {}`. */
+export function functionBodies(ast) {
+  const bodies = new Map();
+  walk(ast, node => {
+    if (node.type === 'FunctionDeclaration' && node.id?.name) bodies.set(node.id.name, node);
+    if (node.type === 'VariableDeclarator' && node.id?.type === 'Identifier' && FUNCTION_TYPES.has(node.init?.type)) bodies.set(node.id.name, node.init);
+  });
+  return bodies;
+}
+
+/**
+ * The route's own auth evidence: middleware among `middleware`, or an auth
+ * check in the handler (an inline function, or a same-file named function).
+ */
+function ownAuth(content, middleware, handler, bodies) {
+  if (middleware.some(isAuthMiddlewareNode)) return true;
+  let fn = null;
+  if (handler && FUNCTION_TYPES.has(handler.type)) fn = handler;
+  else if (handler?.type === 'Identifier') fn = bodies.get(handler.name) || null;
+  else if (handler?.type === 'CallExpression' && isAuthMiddlewareNode(handler)) return true; // withAuth(handler)
+  if (!fn) return false;
+  return AUTH_CHECK_RE.test(String(content).slice(fn.start, fn.end));
+}
+
+/** `<receiver>.use([path,] …auth…)` calls: auth applied to later routes. */
+function authUses(ast, constants) {
+  const uses = [];
+  walk(ast, node => {
+    if (node.type !== 'CallExpression' || node.callee?.type !== 'MemberExpression' || node.callee.computed) return;
+    if (node.callee.property?.name !== 'use' || node.callee.object?.type !== 'Identifier') return;
+    const args = node.arguments || [];
+    const prefix = pathArgValue(args[0], constants, false);
+    const hasPrefix = typeof prefix === 'string' && (prefix.startsWith('/') || prefix === '*');
+    const rest = hasPrefix ? args.slice(1) : args;
+    if (rest.some(isAuthMiddlewareNode)) {
+      uses.push({ receiver: node.callee.object.name, prefix: hasPrefix && prefix !== '*' ? prefix : '', start: node.start ?? 0 });
+    }
+  });
+  return uses;
+}
+
+function prefixCovers(prefix, path) {
+  if (!prefix || prefix === '/') return true;
+  const p = prefix.replace(/\/+$/, '');
+  return path === p || path.startsWith(`${p}/`);
+}
+
+/** Extract a statically knowable string path from a call argument. */
+export function pathArgValue(node, constants = new Map(), dynamicPlaceholder = true) {
   if (!node) return null;
   if (node.type === 'StringLiteral') return node.value;
+  if (node.type === 'Identifier') return constants.get(node.name) ?? null;
+  // `cfg.PREFIX` / `paths.USERS`: a constant a caller resolved through an
+  // import, keyed `object.property` (docguard.js-route-shapes#FR-011).
+  if (memberKey(node)) return constants.get(memberKey(node)) ?? null;
   if (node.type === 'TemplateLiteral') {
     if (node.expressions.length === 0) return node.quasis[0]?.value?.cooked ?? null;
-    // `/users/${id}` → `/users/:param` so a dynamic segment still looks like a path.
-    return node.quasis
-      .map((q, i) => (q.value.cooked ?? '') + (i < node.expressions.length ? ':param' : ''))
-      .join('');
+    let value = '';
+    for (let i = 0; i < node.quasis.length; i++) {
+      value += node.quasis[i]?.value?.cooked ?? '';
+      if (i < node.expressions.length) {
+        const expression = node.expressions[i];
+        const staticValue = expression.type === 'Identifier' ? constants.get(expression.name)
+          : memberKey(expression) ? constants.get(memberKey(expression)) : null;
+        if (staticValue === undefined || staticValue === null) {
+          if (!dynamicPlaceholder) return null;
+          value += ':param';
+        } else {
+          value += staticValue;
+        }
+      }
+    }
+    return value;
+  }
+  if (node.type === 'BinaryExpression' && node.operator === '+') {
+    const left = pathArgValue(node.left, constants, false);
+    const right = pathArgValue(node.right, constants, false);
+    return left === null || right === null ? null : left + right;
   }
   return null;
 }
@@ -204,18 +611,45 @@ function pathArgValue(node) {
  * via AST. More accurate than regex: it matches ANY receiver identifier (so
  * `userRouter.get`, `v1.post`, `r.delete` are all caught — not just app/router/
  * server), survives multi-line calls and arbitrary whitespace, and reads
- * template-literal paths. The `/`-or-`*` path requirement keeps non-route
- * `.get()` calls (e.g. `map.get('key')`, `headers.get('x')`) out.
+ * template-literal paths whose substitutions are same-file constants. The
+ * `/`-or-`*` path requirement keeps non-route `.get()` calls (e.g.
+ * `map.get('key')`, `headers.get('x')`) out.
+ *
+ * A registration whose path is not literal (a template with a runtime value,
+ * an imported constant, a regular expression) is not reported at a guessed
+ * path such as `/items/:param`: it is listed in the result's non-enumerable
+ * `unresolved` (`{ line, target }`) so the caller can record it
+ * (docguard.js-route-shapes#FR-007). A one-argument `app.get('title')` is an
+ * Express settings read, not a registration, and is not listed.
  *
  * Returns `null` when the file can't be parsed (caller falls back to regex);
- * otherwise an array of `{ method, path, start }` (start = call node offset, for
- * the caller's comment/handler/auth context lookups).
+ * otherwise an array of `{ method, path, start, receiver, line, auth }` (start =
+ * call node offset, for the caller's comment/handler lookups; `auth` = the
+ * route's own evidence).
+ * @implements docguard.js-ts-extraction#FR-001
+ * @implements docguard.js-ts-extraction#FR-002
+ * @implements docguard.js-route-shapes#FR-007
  */
-export function extractJsRouteCalls(content, filename = 'file.ts') {
+export function extractJsRouteCalls(content, filename = 'file.ts', importedConstants = null) {
   const { ast, ok } = parseJsTs(content, filename);
   if (!ok || !ast) return null;
 
   const out = [];
+  const unresolved = [];
+  const unresolvedAt = new Set();
+  const markUnresolved = (node, at) => {
+    if (unresolvedAt.has(at.start)) return;
+    unresolvedAt.add(at.start);
+    unresolved.push({ line: at.loc?.start.line ?? null, target: node && typeof node.start === 'number' ? String(content).slice(node.start, node.end).replace(/\s+/g, ' ').slice(0, 80) : '' });
+  };
+  // Imported `const` strings the caller resolved (FR-011); a local binding wins.
+  const ownConstants = topLevelStaticStrings(ast);
+  const constants = importedConstants ? new Map([...importedConstants, ...ownConstants]) : ownConstants;
+  const routeBindings = expressRouteBindings(ast);
+  const bodies = functionBodies(ast);
+  const uses = authUses(ast, constants);
+  const usedAuth = (receiver, path, start) =>
+    uses.some(u => u.receiver === receiver && u.start < start && prefixCovers(u.prefix, path));
   walk(ast, (node) => {
     if (node.type !== 'CallExpression') return;
     const callee = node.callee;
@@ -224,15 +658,112 @@ export function extractJsRouteCalls(content, filename = 'file.ts') {
     if (!prop || prop.type !== 'Identifier') return;
     const method = prop.name.toLowerCase();
     if (!HTTP_METHOD_NAMES.has(method)) return;
-    const path = pathArgValue(node.arguments && node.arguments[0]);
-    if (!path || !(path.startsWith('/') || path === '*')) return;
+    const args = node.arguments || [];
+    // `<receiver>.route('/path').get(h).post(h)` (docguard.js-ts-extraction#FR-001):
+    // the method call's object is a chain that bottoms out in `.route(path)` on
+    // a route binding. Each method carries only handlers, no path.
+    const chain = routeChainBase(callee.object, routeBindings, constants);
+    if (chain?.unresolved) { markUnresolved(chain.pathNode, chain.node); return; }
+    if (chain) {
+      const handler = args[args.length - 1];
+      out.push({
+        method: method.toUpperCase(), path: chain.path, start: chain.start, receiver: chain.receiver,
+        line: prop.loc?.start.line ?? null,
+        handler: handlerName(handler),
+        auth: ownAuth(content, args.slice(0, -1), handler, bodies) || usedAuth(chain.receiver, chain.path, chain.start),
+      });
+      return;
+    }
+    // A route receiver must be a stable binding (`app.get`, `router.post`, …).
+    // Chained HTTP clients such as `request(app).get('/api/items')` also accept
+    // URL-shaped first arguments, but they issue requests rather than register
+    // routes. Treating their CallExpression receiver as a route used to let test
+    // calls contaminate the product API inventory.
+    if (!callee.object || callee.object.type !== 'Identifier') return;
+    if (!looksLikeRouteReceiver(callee.object.name, routeBindings)) return;
+    const path = pathArgValue(args[0], constants, false);
+    if (path === null) {
+      // A registration (path plus handler) whose path is not literal.
+      if (args.length >= 2 && args[0] && !FUNCTION_TYPES.has(args[0].type) && !(args[0].type === 'Identifier' && bodies.has(args[0].name))) markUnresolved(args[0], node);
+      return;
+    }
+    if (!(path.startsWith('/') || path === '*')) return;
     // `receiver` is the object the method was called on (`router` in
     // `router.get(...)`, `app` in `app.get(...)`). Mount-prefix resolution uses
     // it to apply a same-file `app.use('/api', router)` prefix ONLY to that
     // router's routes — never to sibling `app.get(...)` calls in the same file.
-    const receiver = callee.object && callee.object.type === 'Identifier' ? callee.object.name : null;
-    out.push({ method: method.toUpperCase(), path, start: node.start ?? 0, receiver });
+    const receiver = callee.object.name;
+    const start = node.start ?? 0;
+    const handler = args.length > 1 ? args[args.length - 1] : null;
+    out.push({
+      method: method.toUpperCase(), path, start, receiver,
+      line: node.loc?.start.line ?? null,
+      auth: ownAuth(content, args.slice(1, -1), handler, bodies) || usedAuth(receiver, path, start),
+    });
   });
+  Object.defineProperty(out, 'unresolved', { value: unresolved, enumerable: false });
+  return out;
+}
+
+/**
+ * `{ path, receiver, start }` when `node` is `<route binding>.route(path)[.method(...)]*`;
+ * `{ unresolved, node, pathNode }` when that path is not literal.
+ */
+function routeChainBase(node, routeBindings, constants) {
+  let cur = node;
+  while (cur?.type === 'CallExpression' && cur.callee?.type === 'MemberExpression' && !cur.callee.computed
+      && HTTP_METHOD_NAMES.has(String(cur.callee.property?.name).toLowerCase())) {
+    cur = cur.callee.object;
+  }
+  if (cur?.type !== 'CallExpression' || cur.callee?.type !== 'MemberExpression' || cur.callee.computed) return null;
+  if (cur.callee.property?.name !== 'route' || cur.callee.object?.type !== 'Identifier') return null;
+  const receiver = cur.callee.object.name;
+  if (!looksLikeRouteReceiver(receiver, routeBindings)) return null;
+  const path = pathArgValue(cur.arguments?.[0], constants, false);
+  if (path === null) return cur.arguments?.[0] ? { unresolved: true, node: cur, pathNode: cur.arguments[0] } : null;
+  if (!(path.startsWith('/') || path === '*')) return null;
+  return { path, receiver, start: cur.start ?? 0 };
+}
+
+function handlerName(node) {
+  if (!node) return '';
+  if (node.type === 'Identifier') return node.name;
+  if (FUNCTION_TYPES.has(node.type)) return node.id?.name || 'inline';
+  if (node.type === 'MemberExpression' && !node.computed) return node.property?.name || '';
+  return '';
+}
+
+/**
+ * Per-handler auth of a Next.js App Router `route.ts` (docguard.js-ts-extraction#FR-002):
+ * each exported HTTP method is judged by its own body, or by an auth wrapper
+ * (`export const GET = withAuth(async () => …)`). `null` on parse failure.
+ * @implements docguard.js-ts-extraction#FR-009
+ * @returns {Map<string, { line: number|null, auth: boolean }>|null}
+ */
+export function nextRouteHandlers(content, filename = 'route.ts') {
+  const { ast, ok } = parseJsTs(content, filename);
+  if (!ok || !ast) return null;
+  const bodies = functionBodies(ast);
+  const text = String(content);
+  const out = new Map();
+  const judge = (fn) => {
+    if (!fn) return false;
+    if (fn.type === 'CallExpression') return isAuthMiddlewareNode(fn) || (fn.arguments || []).some(a => FUNCTION_TYPES.has(a.type) && AUTH_CHECK_RE.test(text.slice(a.start, a.end)));
+    if (fn.type === 'Identifier') return judge(bodies.get(fn.name) || null);
+    return AUTH_CHECK_RE.test(text.slice(fn.start, fn.end));
+  };
+  for (const statement of ast.program?.body || []) {
+    if (statement.type !== 'ExportNamedDeclaration') continue;
+    const d = statement.declaration;
+    if (d?.type === 'FunctionDeclaration' && d.id?.name) out.set(d.id.name, { line: statement.loc?.start.line ?? null, auth: judge(d) });
+    for (const item of d?.declarations || []) {
+      if (item.id?.type === 'Identifier') out.set(item.id.name, { line: statement.loc?.start.line ?? null, auth: judge(item.init) });
+    }
+    for (const spec of statement.specifiers || []) {
+      const exported = spec.exported?.name ?? spec.exported?.value;
+      if (exported) out.set(exported, { line: statement.loc?.start.line ?? null, auth: judge(spec.local) });
+    }
+  }
   return out;
 }
 
@@ -340,6 +871,7 @@ export function extractJsRouteObjects(content, filename = 'file.ts') {
   if (!ok || !ast) return null;
 
   const out = [];
+  const unresolved = [];
   walk(ast, (node) => {
     if (node.type !== 'CallExpression') return;
     const callee = node.callee;
@@ -350,6 +882,7 @@ export function extractJsRouteObjects(content, filename = 'file.ts') {
 
     let methods = [];
     let path = null;
+    let pathNode = null;
     for (const prop of arg.properties || []) {
       if (prop.type !== 'ObjectProperty' && prop.type !== 'Property') continue;
       const key = propKeyName(prop);
@@ -360,15 +893,25 @@ export function extractJsRouteObjects(content, filename = 'file.ts') {
           methods = (v.elements || []).filter(e => e && e.type === 'StringLiteral').map(e => e.value);
         }
       } else if (key === 'url' || key === 'path') {
-        path = pathArgValue(prop.value);
+        path = pathArgValue(prop.value, new Map(), false);
+        pathNode = prop.value;
       }
+    }
+    // docguard.js-route-shapes#FR-007: a `url` that is not literal is listed, not guessed.
+    if (pathNode && path === null && methods.length) {
+      unresolved.push({ line: node.loc?.start.line ?? null, target: String(content).slice(pathNode.start, pathNode.end).slice(0, 80) });
+      return;
     }
     if (!path || !(path.startsWith('/') || path === '*') || !methods.length) return;
     const receiver = callee.object && callee.object.type === 'Identifier' ? callee.object.name : null;
+    const handlerProp = (arg.properties || []).find(p => propKeyName(p) === 'handler');
+    const auth = isAuthMiddlewareNode(arg) ||
+      Boolean(handlerProp && FUNCTION_TYPES.has(handlerProp.value?.type) && AUTH_CHECK_RE.test(String(content).slice(handlerProp.value.start, handlerProp.value.end)));
     for (const m of methods) {
-      out.push({ method: String(m).toUpperCase(), path, start: node.start ?? 0, receiver });
+      out.push({ method: String(m).toUpperCase(), path, start: node.start ?? 0, receiver, line: node.loc?.start.line ?? null, auth });
     }
   });
+  Object.defineProperty(out, 'unresolved', { value: unresolved, enumerable: false });
   return out;
 }
 
@@ -389,18 +932,45 @@ export function extractJsRouteObjects(content, filename = 'file.ts') {
  * Resolving `ident` (local router vs imported specifier) is the caller's job —
  * it needs filesystem context this pure-AST module deliberately avoids.
  */
-export function extractJsMountsAndImports(content, filename = 'file.ts') {
+export function extractJsMountsAndImports(content, filename = 'file.ts', importedConstants = null) {
   const { ast, ok } = parseJsTs(content, filename);
   if (!ok || !ast) return null;
 
   const imports = {};
+  const importSymbols = {};
+  const exports = {};
   const mounts = [];
+  const constantBindings = []; // { local, spec, imported, viaRequire } for imported `const` strings (FR-011)
+  const ownConstants = topLevelStaticStrings(ast);
+  // Imported `const` strings the caller resolved (docguard.js-route-shapes#FR-010); a local binding wins.
+  const constants = importedConstants ? new Map([...importedConstants, ...ownConstants]) : ownConstants;
+  const routeBindings = expressRouteBindings(ast);
+  const uses = authUses(ast, constants);
 
   walk(ast, (node) => {
     // import X from 'spec' | import { X } from 'spec' | import * as X from 'spec'
     if (node.type === 'ImportDeclaration' && node.source && node.source.type === 'StringLiteral') {
       for (const spec of node.specifiers || []) {
-        if (spec.local && spec.local.name) imports[spec.local.name] = node.source.value;
+        if (spec.local && spec.local.name) {
+          imports[spec.local.name] = node.source.value;
+          importSymbols[spec.local.name] = spec.type === 'ImportDefaultSpecifier'
+            ? 'default'
+            : spec.type === 'ImportNamespaceSpecifier'
+              ? '*'
+              : (spec.imported?.name || spec.imported?.value || spec.local.name);
+          constantBindings.push({ local: spec.local.name, spec: node.source.value, imported: importSymbols[spec.local.name], viaRequire: false });
+        }
+      }
+      return;
+    }
+    // const { A, B: c } = require('spec') — constants only; routers keep their rules.
+    if (node.type === 'VariableDeclarator' && node.id?.type === 'ObjectPattern'
+        && node.init?.type === 'CallExpression' && calleeName(node.init.callee) === 'require'
+        && node.init.arguments[0]?.type === 'StringLiteral') {
+      for (const p of node.id.properties || []) {
+        if (p.type === 'ObjectProperty' && p.value?.type === 'Identifier') {
+          constantBindings.push({ local: p.value.name, spec: node.init.arguments[0].value, imported: p.key?.name ?? p.key?.value, viaRequire: true });
+        }
       }
       return;
     }
@@ -410,23 +980,199 @@ export function extractJsMountsAndImports(content, filename = 'file.ts') {
         && calleeName(node.init.callee) === 'require'
         && node.init.arguments[0] && node.init.arguments[0].type === 'StringLiteral') {
       imports[node.id.name] = node.init.arguments[0].value;
+      importSymbols[node.id.name] = 'default';
+      constantBindings.push({ local: node.id.name, spec: node.init.arguments[0].value, imported: 'default', viaRequire: true });
       return;
     }
-    // <x>.use('/prefix', …, <routerIdent>) — the prefix is the first string-literal
-    // arg; the mounted router is the LAST identifier arg (skips middleware).
+    if (node.type === 'ExportDefaultDeclaration' && node.declaration?.type === 'Identifier') {
+      exports.default = node.declaration.name;
+      return;
+    }
+    if (node.type === 'ExportNamedDeclaration') {
+      if (node.declaration?.type === 'VariableDeclaration') {
+        for (const item of node.declaration.declarations || []) {
+          if (item.id?.type === 'Identifier') {
+            exports[item.id.name] = item.init?.type === 'Identifier' ? item.init.name : item.id.name;
+          }
+        }
+      }
+      for (const spec of node.specifiers || []) {
+        const exported = spec.exported?.name || spec.exported?.value;
+        const local = spec.local?.name || spec.local?.value;
+        if (exported && local) exports[exported] = local;
+      }
+      return;
+    }
+    // <x>.use('/prefix', middleware, router) and pathless <x>.use(router).
+    // Return every identifier candidate; the filesystem-aware caller keeps
+    // only candidates whose target contains router registrations or mounts.
     if (node.type === 'CallExpression' && node.callee && node.callee.type === 'MemberExpression'
         && !node.callee.computed && node.callee.property && node.callee.property.name === 'use') {
       const args = node.arguments || [];
       const first = args[0];
-      const prefix = first && first.type === 'StringLiteral' ? first.value : null;
-      if (!prefix || !prefix.startsWith('/')) return;
-      let ident = null;
-      for (let i = args.length - 1; i >= 1; i--) {
-        if (args[i] && args[i].type === 'Identifier') { ident = args[i].name; break; }
+      const receiver = node.callee.object?.type === 'Identifier'
+        ? node.callee.object.name
+        : null;
+      if (!receiver || !looksLikeRouteReceiver(receiver, routeBindings)) return;
+      const explicitPrefix = pathArgValue(first, constants, false);
+      const hasPrefix = typeof explicitPrefix === 'string' && explicitPrefix.startsWith('/');
+      // A prefix this file cannot read (docguard.js-route-shapes#FR-010): the
+      // mount is kept with `prefix: null` so the caller omits what it mounts
+      // and records the prefix, instead of serving the router at the root.
+      const unreadable = !hasPrefix && explicitPrefix === null && args.length >= 2 && isPrefixExpression(first);
+      if (!hasPrefix && !unreadable && (first?.type !== 'Identifier' || args.length !== 1)) return;
+      const prefix = hasPrefix ? explicitPrefix : unreadable ? null : '';
+      const start = hasPrefix || unreadable ? 1 : 0;
+      for (let i = start; i < args.length; i++) {
+        if (args[i]?.type === 'Identifier' && args[i].name !== receiver &&
+            (imports[args[i].name] || looksLikeRouteReceiver(args[i].name, routeBindings))) {
+          // Auth middleware passed before the router, or an earlier `use(auth)`
+          // on the same receiver, protects everything mounted here (FR-002).
+          const auth = args.slice(start, i).some(isAuthMiddlewareNode) ||
+            uses.some(u => u.receiver === receiver && u.start < (node.start ?? 0) && prefixCovers(u.prefix, prefix || '/'));
+          mounts.push({ prefix, ident: args[i].name, receiver, auth, line: node.loc?.start.line ?? null, ...(unreadable ? { target: String(content).slice(first.start, first.end).replace(/\s+/g, ' ').slice(0, 80) } : {}) });
+        }
       }
-      if (ident) mounts.push({ prefix, ident });
     }
   });
 
-  return { imports, mounts };
+  const routeReceivers = new Set(extractJsRouteCalls(content, filename, importedConstants)?.map(route => route.receiver) || []);
+  // Exported `const` strings, for importers' paths and prefixes.
+  const exportedConstants = exportedStaticStrings(ast);
+  return { imports, importSymbols, exports, mounts, routeReceivers: [...routeReceivers], exportedConstants, constantBindings };
+}
+
+/** `a.b` for a non-computed member of an identifier, else null. */
+function memberKey(node) {
+  return node?.type === 'MemberExpression' && !node.computed && node.object?.type === 'Identifier' && node.property?.type === 'Identifier'
+    ? `${node.object.name}.${node.property.name}` : null;
+}
+
+const isModuleExportsNode = n => n?.type === 'MemberExpression' && !n.computed && n.object?.type === 'Identifier'
+  && n.object.name === 'module' && n.property?.name === 'exports';
+
+/**
+ * The string constants a module exports: `export const X = '/x'`,
+ * `export { x as X }`, and CommonJS `module.exports = { X: '/x' }`,
+ * `exports.X = '/x'`, `module.exports.X = '/x'`. The result's non-enumerable
+ * `commonjs` says the module exports through `module.exports`, so a default
+ * import or `require()` of it is the object holding them.
+ * @implements docguard.js-route-shapes#FR-011
+ */
+export function exportedStaticStrings(ast) {
+  const own = topLevelStaticStrings(ast);
+  const out = {};
+  let commonjs = false;
+  const value = (n) => { const v = pathArgValue(n, own, false); return typeof v === 'string' ? v : null; };
+  for (const st of ast?.program?.body || []) {
+    if (st.type === 'ExportNamedDeclaration' && !st.source) {
+      for (const d of st.declaration?.declarations || []) if (d.id?.type === 'Identifier' && own.has(d.id.name)) out[d.id.name] = own.get(d.id.name);
+      for (const sp of st.specifiers || []) {
+        const local = sp.local?.name ?? sp.local?.value;
+        const exported = sp.exported?.name ?? sp.exported?.value;
+        if (local && exported && own.has(local)) out[exported] = own.get(local);
+      }
+    }
+    if (st.type !== 'ExpressionStatement' || st.expression?.type !== 'AssignmentExpression' || st.expression.operator !== '=') continue;
+    const { left, right } = st.expression;
+    if (isModuleExportsNode(left)) {
+      commonjs = true;
+      if (right?.type !== 'ObjectExpression') continue;
+      for (const p of right.properties || []) {
+        if (p.type !== 'ObjectProperty' || p.computed) continue;
+        const name = p.key?.name ?? p.key?.value;
+        const v = value(p.value);
+        if (name && v !== null) out[name] = v;
+      }
+    } else if (left?.type === 'MemberExpression' && !left.computed && (isModuleExportsNode(left.object) || (left.object?.type === 'Identifier' && left.object.name === 'exports'))) {
+      commonjs = true;
+      const v = value(right);
+      if (left.property?.name && v !== null) out[left.property.name] = v;
+    }
+  }
+  Object.defineProperty(out, 'commonjs', { value: commonjs, enumerable: false });
+  return out;
+}
+
+/**
+ * Constants an importer can use: `[{ local, imported, viaRequire, exported }]`
+ * (`exported` = the target's `exportedStaticStrings`) → a map with `X` for a
+ * named import and `ns.X` for a namespace import, a `require()` of the module,
+ * or a default import of a CommonJS module.
+ * @implements docguard.js-route-shapes#FR-011
+ */
+export function importedStaticStrings(bindings) {
+  const map = new Map();
+  for (const { local, imported, viaRequire, exported } of bindings) {
+    if (!exported || !local) continue;
+    const whole = imported === '*' || (imported === 'default' && (viaRequire || exported.commonjs));
+    if (whole) for (const [name, v] of Object.entries(exported)) map.set(`${local}.${name}`, v);
+    else if (imported !== 'default' && typeof exported[imported] === 'string') map.set(local, exported[imported]);
+  }
+  return map;
+}
+
+/**
+ * Does a first `use()` argument name a path rather than a middleware? A
+ * template or concatenation does; so does a name that says so (`API_PREFIX`,
+ * `basePath`, `config.apiPrefix`). `requireAuth` or `middlewares.cors` do not.
+ */
+const PREFIX_NAME = /^[A-Z][A-Z0-9_]*$|^(?:path|prefix|base|url|mount)$|(?:Path|Prefix|Base|Url|Mount)$/;
+function isPrefixExpression(node) {
+  if (!node) return false;
+  if (node.type === 'TemplateLiteral' || node.type === 'BinaryExpression') return true;
+  if (node.type === 'Identifier') return PREFIX_NAME.test(node.name);
+  if (node.type === 'MemberExpression' && !node.computed) return PREFIX_NAME.test(node.property?.name || '') || (node.object?.type === 'MemberExpression' && node.object.property?.name === 'env');
+  return false;
+}
+
+/**
+ * Names a JS/TS module exports (`default` for a default export), with the
+ * line of each export statement. Shared by as-built specs and the symbol map.
+ * @returns {{ name: string, line: number|undefined }[]}
+ */
+export function exportedNames(content, filename) {
+  const { ast, ok } = parseJsTs(content, filename);
+  if (!ok || !ast) return [];
+  const names = [];
+  walk(ast, node => {
+    if (node.type === 'ExportDefaultDeclaration') names.push({ name: 'default', line: node.loc?.start.line });
+    if (node.type !== 'ExportNamedDeclaration') return;
+    const d = node.declaration;
+    if (d?.id?.name) names.push({ name: d.id.name, line: node.loc?.start.line });
+    for (const decl of d?.declarations || []) if (decl.id?.name) names.push({ name: decl.id.name, line: node.loc?.start.line });
+    for (const s of node.specifiers || []) {
+      const n = s.exported?.name ?? s.exported?.value;
+      if (n) names.push({ name: n, line: node.loc?.start.line });
+    }
+  });
+  return names;
+}
+
+/**
+ * The names a module offers, for the symbol map (docguard.symbol-map#FR-001):
+ * its exports in source order, or, for a module that exports nothing (a
+ * script), its top-level function and class declarations.
+ * @returns {{ ok: boolean, names: string[] }} `ok: false` when it did not parse
+ */
+export function moduleSymbols(content, filename) {
+  const { ast, ok } = parseJsTs(content, filename);
+  if (!ok || !ast) return { ok: false, names: [] };
+  const exported = [];
+  const topLevel = [];
+  for (const stmt of ast.program?.body || []) {
+    if (stmt.type === 'ExportDefaultDeclaration') exported.push('default');
+    else if (stmt.type === 'ExportNamedDeclaration') {
+      const d = stmt.declaration;
+      if (d?.id?.name) exported.push(d.id.name);
+      for (const decl of d?.declarations || []) if (decl.id?.name) exported.push(decl.id.name);
+      for (const s of stmt.specifiers || []) {
+        const n = s.exported?.name ?? s.exported?.value;
+        if (n) exported.push(n);
+      }
+    } else if ((stmt.type === 'FunctionDeclaration' || stmt.type === 'ClassDeclaration') && stmt.id?.name) {
+      topLevel.push(stmt.id.name);
+    }
+  }
+  return { ok: true, names: [...new Set(exported.length ? exported : topLevel)] };
 }

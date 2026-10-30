@@ -10,23 +10,75 @@
  *   - pnpm-workspace.yaml          (packages:)
  *   - turbo.json                   (presence → trust package.json workspaces)
  *
- * Zero NPM dependencies — pure Node.js built-ins only.
+ * Source discovery uses Node.js built-ins; Worker binding analysis optionally
+ * loads the existing @babel/parser dependency, with a lexical fallback.
  */
 
+import { createRequire } from 'node:module';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { resolve, join, dirname, relative, extname } from 'node:path';
-import { shouldIgnore, isNonProductDir, isNonProductPath } from './shared-ignore.mjs';
+import { shouldIgnore, isNonProductDir, isNonProductPath, walkFiles, isIgnoredDirEntry } from './shared-ignore.mjs';
+import { pythonEnvNames } from './scanners/py-env.mjs';
 
 const IGNORE_DIRS = new Set([
   'node_modules', '.git', '.next', '.nuxt', 'dist', 'build', 'out',
   'coverage', '.cache', '__pycache__', '.venv', 'vendor', '.turbo',
-  'cdk.out',
+  // Maven/Gradle/Cargo build output: compiled or generated, never authored.
+  'cdk.out', 'target', '.gradle',
+  // .NET/C intermediate output and Mix/dune/Sphinx output; a .NET `bin/` is
+  // skipped by isIgnoredDirEntry (docguard.coverage-followups#FR-002).
+  'obj', '_build',
 ]);
 
-const CODE_EXTENSIONS = new Set([
+/** Extensions the env scan reads (docguard.fallback-language-coverage#FR-003). */
+export const CODE_EXTENSIONS = new Set([
   '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx',
   '.py', '.java', '.go', '.rs', '.rb', '.php',
+  '.kt', '.kts', '.cs',
 ]);
+
+/**
+ * Source languages DocGuard reads without a syntax tree, by extension. Used to
+ * NAME a coverage gap ("3 Go files"), so a reader learns which language was
+ * read by pattern, or not read at all. JS/TS and Python are absent: they have
+ * AST tiers. (docguard.fallback-language-coverage#FR-001/FR-004/FR-010)
+ */
+export const LANGUAGE_NAMES = Object.freeze({
+  '.go': 'Go', '.java': 'Java', '.kt': 'Kotlin', '.kts': 'Kotlin', '.rb': 'Ruby',
+  '.rs': 'Rust', '.php': 'PHP', '.cs': 'C#', '.swift': 'Swift', '.scala': 'Scala',
+  '.ex': 'Elixir', '.exs': 'Elixir', '.dart': 'Dart', '.c': 'C', '.h': 'C',
+  '.cc': 'C++', '.cpp': 'C++', '.cxx': 'C++', '.hpp': 'C++', '.m': 'Objective-C',
+  '.mm': 'Objective-C', '.lua': 'Lua', '.clj': 'Clojure', '.hs': 'Haskell',
+  '.erl': 'Erlang', '.ml': 'OCaml', '.fs': 'F#', '.vb': 'Visual Basic',
+  '.groovy': 'Groovy', '.pl': 'Perl', '.cr': 'Crystal', '.nim': 'Nim', '.zig': 'Zig',
+  '.jl': 'Julia',
+});
+
+const extOf = filePath => (String(filePath).match(/\.[^./\\]+$/) || [''])[0].toLowerCase();
+
+/** The display name of a source language that has no AST tier, or null. */
+export function languageOf(filePath) {
+  return LANGUAGE_NAMES[extOf(filePath)] || null;
+}
+
+const byLanguage = (a, b) => (a.language < b.language ? -1 : a.language > b.language ? 1 : 0);
+
+/** Files per language, `[{ language, files }]` sorted by language; unnamed files are skipped. */
+export function countLanguages(paths) {
+  const counts = new Map();
+  for (const p of paths) {
+    const language = languageOf(p);
+    if (language) counts.set(language, (counts.get(language) || 0) + 1);
+  }
+  return [...counts].map(([language, files]) => ({ language, files })).sort(byLanguage);
+}
+
+/** "3 Go files, 1 Java file", in language order so the text never changes between runs. */
+export function describeLanguageCounts(counts) {
+  return [...counts].sort(byLanguage)
+    .map(({ language, files }) => `${files} ${language} file${files === 1 ? '' : 's'}`)
+    .join(', ');
+}
 
 /** Normalize config.sourceRoot into an array of relative paths. */
 function sourceRootList(config) {
@@ -172,8 +224,15 @@ export function resolveSourceRoots(projectDir, config = {}) {
   for (const d of getWorkspaceDirs(projectDir)) add(d);
 
   // 3. conventional roots (only those that exist)
-  const conventional = ['src', 'app', 'lib', 'server', 'api', 'backend/src', 'backend', 'cli'];
+  const conventional = ['src', 'app', 'lib', 'server', 'api', 'functions', 'backend/src', 'backend', 'cli'];
   for (const cr of conventional) add(resolve(projectDir, cr));
+  // Next.js keeps pages and UI at the top level (`src/` forms are already under
+  // `src`). Added only for a Next.js project, so every other project's roots —
+  // and every scanner that reads them — stay unchanged.
+  // @implements docguard.js-ts-extraction#FR-004 {scope=statement}
+  if (isNextJsProject(projectDir)) {
+    for (const nr of NEXT_JS_ROOTS) add(resolve(projectDir, nr));
+  }
 
   // 4. Fall back to the project root ONLY when nothing else resolved. Adding it
   // unconditionally would pull in examples/, scripts/, and fixtures, producing
@@ -181,6 +240,22 @@ export function resolveSourceRoots(projectDir, config = {}) {
   if (out.size === 0) out.add(resolve(projectDir));
 
   return [...out];
+}
+
+const NEXT_JS_ROOTS = ['pages', 'components', 'hooks', 'utils'];
+const NEXT_CONFIG_FILES = ['next.config.js', 'next.config.mjs', 'next.config.cjs', 'next.config.ts'];
+/** Root files a Next.js app reads env in: edge middleware, instrumentation, config. */
+const NEXT_ROOT_FILES = [
+  'middleware.ts', 'middleware.js', 'middleware.mjs',
+  'instrumentation.ts', 'instrumentation.js',
+  ...NEXT_CONFIG_FILES,
+];
+
+/** A Next.js project: `next` in the root package.json, or a `next.config.*`. */
+export function isNextJsProject(projectDir) {
+  const pkg = safeReadJson(resolve(projectDir, 'package.json'));
+  if (pkg && ((pkg.dependencies && pkg.dependencies.next) || (pkg.devDependencies && pkg.devDependencies.next))) return true;
+  return NEXT_CONFIG_FILES.some(name => existsSync(resolve(projectDir, name)));
 }
 
 /**
@@ -207,6 +282,11 @@ export function collectPackageJsons(projectDir, config = {}) {
 
 /** Detect whether the project ships a Docker setup. */
 export function detectDocker(projectDir, config = {}) {
+  return findDockerManifest(projectDir, config) !== null;
+}
+
+/** The project-relative path of the Docker manifest `detectDocker` finds, or null. */
+export function findDockerManifest(projectDir, config = {}) {
   const candidates = ['Dockerfile', 'docker-compose.yml', 'docker-compose.yaml', '.dockerignore'];
   const root = resolve(projectDir);
   const dirs = new Set([root]);
@@ -226,14 +306,14 @@ export function detectDocker(projectDir, config = {}) {
 
   for (const dir of dirs) {
     for (const f of candidates) {
-      if (existsSync(join(dir, f))) return true;
+      if (existsSync(join(dir, f))) return relative(root, join(dir, f)).split('\\').join('/');
     }
   }
-  return false;
+  return null;
 }
 
 const HASH_COMMENT_EXTS = new Set(['.py', '.rb', '.php', '.sh']);
-const SLASH_COMMENT_EXTS = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.go', '.rs', '.java', '.php', '.kt', '.scala']);
+const SLASH_COMMENT_EXTS = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.go', '.rs', '.java', '.php', '.kt', '.kts', '.cs', '.scala']);
 
 /**
  * Classify every character of `content` as code (0), string-literal (1), or
@@ -316,10 +396,526 @@ export function isRunnerEnvVar(name) {
   return RUNNER_ENV_PREFIXES.some((p) => name.startsWith(p));
 }
 
-export function grepEnvUsage(projectDir, config = {}) {
+
+/** Wrangler is static evidence only: never load or execute project config. */
+/**
+ * Does the project ship an end-to-end suite? Project-type defaults are a guess;
+ * a Playwright/Cypress config or an e2e test directory is direct evidence, and
+ * an API that has one should not have its E2E checks silently disabled.
+ */
+export function hasE2ESuite(dir) {
+  const files = [
+    'playwright.config.ts', 'playwright.config.js', 'playwright.config.mjs',
+    'cypress.config.ts', 'cypress.config.js', 'cypress.config.mjs', 'cypress.json',
+  ];
+  for (const name of files) {
+    try { if (statSync(join(dir, name)).isFile()) return true; } catch { /* absent */ }
+  }
+  for (const name of ['e2e', join('tests', 'e2e'), join('test', 'e2e'), join('src', 'e2e')]) {
+    try { if (statSync(join(dir, name)).isDirectory()) return true; } catch { /* absent */ }
+  }
+  return false;
+}
+
+export function hasWorkerConfig(dir) {
+  return ['wrangler.toml', 'wrangler.json', 'wrangler.jsonc'].some(name => {
+    try { return statSync(join(dir, name)).isFile(); } catch { return false; }
+  });
+}
+
+const WRANGLER_FILES = ['wrangler.toml', 'wrangler.json', 'wrangler.jsonc'];
+/** A Wrangler key (TOML `key =`, JSON `"key":`) at the start of a line or after `{`/`,`. */
+const PAGES_OUTPUT_KEY = /(?:^|[{,])[ \t]*"?pages_build_output_dir"?[ \t]*[=:]/m;
+/** An exported Pages Function handler (`export const onRequestGet`, `export { x as onRequest }`). */
+const PAGES_HANDLER_EXPORT = /\bexport\s+(?:async\s+)?(?:function\s*\*?\s*|(?:const|let|var)\s+)onRequest(?:Get|Post|Put|Patch|Delete|Head|Options)?\b|\bexport\s*\{[^}]*\bonRequest(?:Get|Post|Put|Patch|Delete|Head|Options)?\s*[,}]/;
+
+/**
+ * The `pages_build_output_dir` a Wrangler file sets in `dir`, or null.
+ * @implements docguard.js-route-shapes#FR-008
+ */
+export function pagesOutputDir(dir) {
+  for (const name of WRANGLER_FILES) {
+    let text;
+    try { text = readFileSync(join(dir, name), 'utf8'); } catch { continue; }
+    const m = /(?:^|[{,])[ \t]*"?pages_build_output_dir"?[ \t]*[=:][ \t]*["']([^"'\n]+)["']/m.exec(text);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/**
+ * Is `dir` a Cloudflare Pages project? Its Wrangler file sets
+ * `pages_build_output_dir`, or it has no Wrangler file and its `functions/`
+ * directory exports a Pages Function handler. A Wrangler file without that key
+ * configures a Worker, and a Firebase `functions/` directory exports handlers
+ * under other names (`export const api = onRequest(app)`).
+ * @implements docguard.js-route-shapes#FR-002
+ */
+export function isPagesProject(dir) {
+  for (const name of WRANGLER_FILES) {
+    let text;
+    try { text = readFileSync(join(dir, name), 'utf8'); } catch { continue; }
+    if (PAGES_OUTPUT_KEY.test(text)) return true;
+  }
+  if (hasWorkerConfig(dir)) return false;
+  let seen = 0;
+  const walk = (d, depth) => {
+    if (depth > 8) return false;
+    let entries;
+    try { entries = readdirSync(d, { withFileTypes: true }); } catch { return false; }
+    for (const e of entries) {
+      if (e.name === 'node_modules' || e.name.startsWith('.')) continue;
+      const p = join(d, e.name);
+      if (e.isDirectory()) { if (walk(p, depth + 1)) return true; continue; }
+      if (!e.isFile() || !/\.(?:[cm]?[jt]s|[jt]sx)$/.test(e.name) || /\.d\.[cm]?ts$/.test(e.name)) continue;
+      if (++seen > 500) return false;
+      let text = '';
+      try { text = readFileSync(p, 'utf8'); } catch { /* unreadable */ }
+      if (PAGES_HANDLER_EXPORT.test(text)) return true;
+    }
+    return false;
+  };
+  return walk(join(dir, 'functions'), 0);
+}
+
+function workerConfigForFile(projectDir, file) {
+  const root = resolve(projectDir);
+  let dir = dirname(file);
+  while (dir === root || (!relative(root, dir).startsWith('..') && !relative(root, dir).startsWith('/'))) {
+    if (hasWorkerConfig(dir)) return true;
+    if (dir === root) break;
+    dir = dirname(dir);
+  }
+  return false;
+}
+
+// Optional-load the existing parser directly: shared helpers must not depend
+// on the scanner layer. No project modules or configuration are executed.
+let workerParse = null;
+try { workerParse = createRequire(import.meta.url)('@babel/parser').parse; } catch { /* lexical fallback */ }
+
+function workerType(param) {
+  const type = param?.typeAnnotation?.typeAnnotation;
+  return type?.type === 'TSTypeReference' && type.typeName?.type === 'Identifier' ? type.typeName.name : '';
+}
+
+const WORKER_ENTRYPOINTS = new Set(['WorkerEntrypoint', 'DurableObject', 'WorkflowEntrypoint']);
+const WORKER_HANDLER_KEYS = new Set(['fetch', 'scheduled', 'queue', 'email', 'tail', 'trace', 'alarm', 'test']);
+const PAGES_HANDLER_RE = /^onRequest(?:Get|Post|Put|Patch|Delete|Head|Options)?$/;
+
+/**
+ * Static lexical binding analysis; collect declarations before resolving reads.
+ * @implements docguard.language-repository-coverage#FR-006
+ * @implements docguard.language-repository-coverage#FR-007
+ */
+function workerAstBindings(ast, configured) {
+  const root = { parent: null, functionScope: true, bindings: new Map(), thisEnv: false };
+  const reads = [];
+  const exportedHandlers = new Set();
+  const bind = (pattern, scope, value = false, objectSource = null) => {
+    if (!pattern) return;
+    if (pattern.type === 'Identifier') scope.bindings.set(pattern.name, value);
+    else if (pattern.type === 'AssignmentPattern') bind(pattern.left, scope, value, objectSource);
+    else if (pattern.type === 'RestElement') bind(pattern.argument, scope, value, objectSource);
+    else if (pattern.type === 'ArrayPattern') for (const element of pattern.elements) bind(element, scope, false);
+    else if (pattern.type === 'ObjectPattern') {
+      for (const property of pattern.properties) {
+        if (property.type === 'RestElement') bind(property.argument, scope, false);
+        else {
+          const key = property.computed ? property.key?.value : (property.key?.name || property.key?.value);
+          bind(property.value, scope, objectSource === 'pages-context' && key === 'env' ? 'worker-env' : false);
+        }
+      }
+    }
+  };
+  const lookup = (name, scope) => {
+    while (scope) {
+      if (scope.bindings.has(name)) return scope.bindings.get(name);
+      scope = scope.parent;
+    }
+    return undefined;
+  };
+  const propertyName = node => node?.computed
+    ? (node.property?.type === 'StringLiteral' ? node.property.value : null)
+    : (node?.property?.name || null);
+  const valueKind = (node, scope) => {
+    if (!node) return false;
+    if (node.type === 'Identifier') return lookup(node.name, scope) || false;
+    if (node.type !== 'MemberExpression' && node.type !== 'OptionalMemberExpression') return false;
+    const property = propertyName(node);
+    if (property !== 'env') return false;
+    if (node.object?.type === 'Identifier' && lookup(node.object.name, scope) === 'pages-context') return 'worker-env';
+    if (node.object?.type === 'ThisExpression' && scope.thisEnv) return 'worker-env';
+    return false;
+  };
+
+  // Module imports and direct named exports are instantiated before execution,
+  // so collect their identity before walking source-order declarations.
+  for (const statement of ast.program.body || []) {
+    if (statement.type === 'ImportDeclaration') {
+      const trusted = statement.source?.value === 'cloudflare:workers';
+      for (const specifier of statement.specifiers || []) {
+        const imported = specifier.imported?.name || specifier.imported?.value;
+        const kind = trusted && imported === 'env' ? 'worker-env'
+          : trusted && WORKER_ENTRYPOINTS.has(imported) ? 'worker-entrypoint-class' : false;
+        if (specifier.local?.name) root.bindings.set(specifier.local.name, kind);
+      }
+    }
+    const declaration = statement.type === 'ExportNamedDeclaration' ? statement.declaration : null;
+    if (declaration?.type === 'FunctionDeclaration') exportedHandlers.add(declaration);
+    if (declaration?.type === 'VariableDeclaration') {
+      for (const item of declaration.declarations || []) if (item.init) exportedHandlers.add(item.init);
+    }
+  }
+
+  const functionTypes = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression', 'ObjectMethod', 'ClassMethod', 'ClassPrivateMethod']);
+  function visit(node, scope, parent) {
+    if (!node || typeof node.type !== 'string') return;
+    if (node.type === 'FunctionDeclaration' || node.type === 'ClassDeclaration') bind(node.id, scope);
+    if (functionTypes.has(node.type)) {
+      const inheritedThis = node.type === 'ArrowFunctionExpression' ? scope.thisEnv
+        : ['ClassMethod', 'ClassPrivateMethod'].includes(node.type) ? scope.thisEnv : false;
+      scope = { parent: scope, functionScope: true, bindings: new Map(), thisEnv: inheritedThis };
+      if (node.type === 'FunctionExpression') bind(node.id, scope);
+      const key = node.key?.name || node.key?.value || node.id?.name ||
+        (parent?.type === 'ObjectProperty' ? parent.key?.name || parent.key?.value : parent?.type === 'VariableDeclarator' ? parent.id?.name : '');
+      const request = workerType(node.params[0]) === 'Request';
+      for (const param of node.params) bind(param, scope, false);
+      if (exportedHandlers.has(node) && PAGES_HANDLER_RE.test(key) && node.params[0]) {
+        const target = node.params[0].type === 'AssignmentPattern' ? node.params[0].left : node.params[0];
+        if (target.type === 'Identifier') bind(target, scope, 'pages-context');
+        else bind(target, scope, false, 'pages-context');
+      } else for (const param of node.params) {
+        const target = param.type === 'AssignmentPattern' ? param.left : param;
+        const typed = /^(?:Env|[\w$]*Env|[\w$]*Bindings)$/.test(workerType(target));
+        const worker = target.type === 'Identifier' && target.name === 'env' &&
+          ((configured && WORKER_HANDLER_KEYS.has(key)) || (typed && (configured || (key === 'fetch' && request))));
+        if (worker) bind(target, scope, 'worker-env');
+      }
+    } else if (['BlockStatement', 'ForStatement', 'ForOfStatement', 'ForInStatement', 'CatchClause', 'SwitchStatement', 'ClassExpression', 'ClassDeclaration', 'StaticBlock'].includes(node.type)) {
+      const workerClass = ['ClassExpression', 'ClassDeclaration'].includes(node.type)
+        && node.superClass?.type === 'Identifier' && lookup(node.superClass.name, scope) === 'worker-entrypoint-class';
+      scope = { parent: scope, functionScope: node.type === 'StaticBlock', bindings: new Map(), thisEnv: workerClass || scope.thisEnv };
+      if (node.type === 'CatchClause') bind(node.param, scope);
+      if (node.type === 'ClassExpression' || node.type === 'ClassDeclaration') bind(node.id, scope);
+    }
+    if (node.type === 'VariableDeclaration') {
+      let declarationScope = scope;
+      if (node.kind === 'var') while (!declarationScope.functionScope && declarationScope.parent) declarationScope = declarationScope.parent;
+      for (const declaration of node.declarations) {
+        const kind = valueKind(declaration.init, scope);
+        bind(declaration.id, declarationScope, kind, kind);
+      }
+    }
+    if (node.type === 'ImportDeclaration') {
+      for (const spec of node.specifiers) if (!scope.bindings.has(spec.local?.name)) bind(spec.local, scope);
+    }
+    if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
+      const name = propertyName(node);
+      if (name) reads.push({ scope, name, object: node.object });
+    }
+    for (const [key, child] of Object.entries(node)) {
+      if (['loc', 'start', 'end', 'extra', 'comments', 'tokens'].includes(key)) continue;
+      if (Array.isArray(child)) for (const item of child) visit(item, scope, node);
+      else if (child && typeof child === 'object') visit(child, scope, node);
+    }
+  }
+  visit(ast.program, root, null);
+  return new Set(reads.filter(read => valueKind(read.object, read.scope) === 'worker-env').map(read => read.name));
+}
+
+/** Optional parser argument makes the absent/failed-parser contract testable. */
+export function extractWorkerEnvBindings(content, filename = 'file.ts', configured = false, parse = workerParse) {
+  if (parse) {
+    try {
+      const plugins = ['decorators-legacy', 'classProperties', 'topLevelAwait'];
+      if (/\.[cm]?tsx?$/.test(filename)) plugins.push('typescript');
+      if (/\.[jt]sx?$/.test(filename) && !filename.endsWith('.ts')) plugins.push('jsx');
+      const ast = parse(content, { sourceType: 'unambiguous', allowReturnOutsideFunction: true, plugins });
+      return workerAstBindings(ast, configured);
+    } catch { /* Failed parsing retains conservative lexical evidence. */ }
+  }
+  const result = workerEnvUsageFallback(content, classifyChars(content, extname(filename)), configured);
+  const fallbackOnly = [];
+  if (/cloudflare:workers/.test(content) && /\bimport\s*\{[^}]*\benv\b/.test(content)) fallbackOnly.push('worker-imported-env-needs-ast');
+  if (/\bonRequest(?:Get|Post|Put|Patch|Delete|Head|Options)?\b/.test(content) && /\bcontext\s*\.\s*env\b/.test(content)) fallbackOnly.push('pages-context-needs-ast');
+  if (/\bextends\s+(?:WorkerEntrypoint|DurableObject|WorkflowEntrypoint)\b/.test(content) && /\bthis\s*\.\s*env\b/.test(content)) fallbackOnly.push('worker-class-env-needs-ast');
+  result.limitations = fallbackOnly;
+  return result;
+}
+
+// Resolve binding positions in simple lexical patterns, not property names.
+// Defaults may refer to env without introducing a new local env binding.
+function lexicalEnvBinding(pattern) {
+  const split = (text, delimiter) => {
+    const parts = []; let depth = 0, start = 0;
+    for (let i = 0; i < text.length; i++) {
+      if ('([{'.includes(text[i])) depth++;
+      else if (')]}'.includes(text[i])) depth--;
+      else if (text[i] === delimiter && depth === 0) { parts.push(text.slice(start, i)); start = i + 1; }
+    }
+    return [...parts, text.slice(start)];
+  };
+  const binding = text => {
+    text = split(text.trim().replace(/^\.\.\./, ''), '=')[0].trim();
+    if (text.startsWith('{') && text.endsWith('}')) {
+      return split(text.slice(1, -1), ',').some(property => {
+        const pair = split(property, ':');
+        return binding(pair.length > 1 ? pair.slice(1).join(':') : property);
+      });
+    }
+    if (text.startsWith('[') && text.endsWith(']')) return split(text.slice(1, -1), ',').some(binding);
+    return /^env\s*(?::[^]*)?$/.test(text);
+  };
+  return split(pattern, ',').some(binding);
+}
+
+/** Conservative, parser-independent support for ordinary typed function bodies. */
+function workerEnvUsageFallback(content, kind, configured) {
+  // Mask regex literals where an expression may start. Division remains code.
+  for (let i = 0; i < content.length; i++) {
+    if (kind[i] || content[i] !== '/') continue;
+    const prefix = content.slice(0, i).trimEnd();
+    if (prefix && !/[=(:,[!&|?{};]$/.test(prefix) && !/(?:\b(?:return|throw|yield|case)|=>)$/.test(prefix)) continue;
+    let end = i + 1, bracket = false;
+    for (; end < content.length && content[end] !== '\n'; end++) {
+      if (content[end] === '\\') { end++; continue; }
+      if (content[end] === '[') bracket = true;
+      if (content[end] === ']') bracket = false;
+      if (content[end] === '/' && !bracket) break;
+    }
+    if (content[end] === '/') { kind.fill(1, i, end + 1); i = end; }
+  }
+  const code = content.split('').map((ch, i) => kind[i] === 0 ? ch : (ch === '\n' ? '\n' : ' ')).join('');
+  const braces = new Map(), parens = new Map();
+  const stack = [], parentheses = [];
+  for (let i = 0; i < code.length; i++) {
+    if (code[i] === '{') stack.push(i);
+    else if (code[i] === '}' && stack.length) braces.set(stack.pop(), i);
+    else if (code[i] === '(') parentheses.push(i);
+    else if (code[i] === ')' && parentheses.length) parens.set(parentheses.pop(), i);
+  }
+  const scopes = [], functionScopes = [], loops = [];
+  const functions = /\(([^()]*)\)\s*(?::\s*[\w$.[\]<>| ,]+)?\s*(?:=>\s*)?\{/g;
+  for (const match of code.matchAll(functions)) {
+    const prefix = code.slice(Math.max(0, match.index - 80), match.index);
+    if (/\b(?:if|for|while|switch|with)\s*$/.test(prefix)) continue;
+    const start = match.index + match[0].length - 1, end = braces.get(start);
+    if (end === undefined) continue;
+    const scope = { start, end };
+    if (!/\bcatch\s*$/.test(prefix)) functionScopes.push(scope);
+    const params = match[1];
+    if (!lexicalEnvBinding(params)) continue;
+    const typed = /(?:^|,)\s*env\s*:\s*(?:Env|[\w$]*Env|[\w$]*Bindings)\s*(?=,|$)/.test(params);
+    const fetch = /\bfetch\s*(?::|=)?\s*$/.test(prefix);
+    const request = /^\s*[\w$]+\s*:\s*Request\s*,/.test(params);
+    scopes.push({ ...scope, binding: typed && (configured || (fetch && request)) });
+  }
+  for (const match of code.matchAll(/(?:\(\s*env\s*\)|\benv)\s*=>\s*/g)) {
+    const start = match.index + match[0].length;
+    let end = braces.get(start);
+    if (end === undefined) {
+      end = start; let depth = 0;
+      for (; end < code.length; end++) {
+        const ch = code[end];
+        if (depth === 0 && /[,;\n)}\]]/.test(ch)) break;
+        if ('({['.includes(ch)) depth++;
+        else if (')}]'.includes(ch)) depth--;
+      }
+    }
+    scopes.push({ start: start - 1, end, binding: false });
+  }
+  for (const match of code.matchAll(/\bfor\s*(?:await\s*)?\(/g)) {
+    const open = match.index + match[0].length - 1, close = parens.get(open);
+    if (close === undefined) continue;
+    let body = close + 1;
+    while (/\s/.test(code[body] || '') && body < code.length) body++;
+    const end = braces.get(body) ?? code.indexOf(';', body);
+    if (end >= 0) loops.push({ start: match.index, end, headerEnd: close });
+  }
+  for (const match of code.matchAll(/\b(const|let|var)\s+(env\b|\{[^;]*?\}|\[[^;]*?\])/g)) {
+    if (!lexicalEnvBinding(match[2])) continue;
+    let scope;
+    if (match[1] === 'var') {
+      scope = functionScopes.filter(s => s.start < match.index && match.index < s.end).sort((a, b) => b.start - a.start)[0];
+    } else {
+      scope = loops.find(s => s.start < match.index && match.index < s.headerEnd);
+      if (!scope) scope = [...braces].filter(([start, end]) => start < match.index && match.index < end)
+        .sort(([a], [b]) => b - a).map(([start, end]) => ({ start, end }))[0];
+    }
+    scopes.push({ ...(scope || { start: -1, end: code.length }), binding: false });
+  }
   const names = new Set();
+  const access = /\benv\s*(?:(?:\?\.|\.)\s*([A-Za-z_$][\w$]*)|(?:\?\.)?\s*\[\s*['"]([A-Za-z_$][\w$]*)['"]\s*\])/g;
+  for (const match of content.matchAll(access)) {
+    if (kind[match.index] !== 0) continue;
+    if (/[\w$]$/.test(code.slice(0, match.index)) || /[.?]$/.test(code.slice(0, match.index).trimEnd())) continue;
+    const scope = scopes.filter(s => s.start < match.index && match.index < s.end)
+      .sort((a, b) => b.start - a.start || Number(a.binding) - Number(b.binding))[0];
+    if (scope?.binding) names.add(match[1] || match[2]);
+  }
+  return names;
+}
+
+/** 1-based line of `index`, from a sorted array of line-start offsets. */
+function lineOf(lineStarts, index) {
+  let lo = 0, hi = lineStarts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (lineStarts[mid] <= index) lo = mid; else hi = mid - 1;
+  }
+  return lo + 1;
+}
+
+/** A literal's source value (`'x'`, `3000`, `false`), or null for any expression. */
+function literalValue(text) {
+  const m = /^\s*(?:'([^'\n]*)'|"([^"\n]*)"|`([^`$\n]*)`|(-?\d[\w.]*|true|false|True|False|None|null))\s*$/.exec(text);
+  return m ? (m[1] ?? m[2] ?? m[3] ?? m[4]) : null;
+}
+
+/**
+ * The fallback a dotted/bracket read supplies, from the text right after it:
+ * JS `?? x` / `|| x` (patterns 0–2), Python's second argument to
+ * `os.environ.get` / `os.getenv` (patterns 4–5). `undefined` = none; a string =
+ * the literal; null = an expression whose value is not a literal.
+ */
+function readFallback(rest, patternIndex) {
+  const leading = (text) => {
+    const m = /^\s*(?:'([^'\n]*)'|"([^"\n]*)"|`([^`$\n]*)`|(-?\d[\w.]*|true|false|True|False|None|null)\b)/.exec(text);
+    return m ? (m[1] ?? m[2] ?? m[3] ?? m[4]) : null;
+  };
+  if (patternIndex <= 2) {
+    const m = /^\s*!?\s*(?:\?\?|\|\|)\s*(?=\S)/.exec(rest);
+    return m ? leading(rest.slice(m[0].length)) : undefined;
+  }
+  if (patternIndex === 4 || patternIndex === 5) {
+    // The Python patterns already consume the closing quote, so `rest` starts
+    // at the comma (docguard.generated-docs-consistency#FR-007).
+    const m = /^['"]?\s*,\s*(?=[^\s)])/.exec(rest);
+    return m ? leading(rest.slice(m[0].length)) : undefined;
+  }
+  return undefined;
+}
+
+/** Split `text` at top-level `sep` (outside brackets, strings and comments). */
+function splitTopLevel(text, sep) {
+  const parts = [];
+  let depth = 0, start = 0, quote = null;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue; }
+    if (ch === '/' && text[i + 1] === '/') { while (i < text.length && text[i] !== '\n') i++; continue; }
+    if (ch === '/' && text[i + 1] === '*') { i += 2; while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++; i++; continue; }
+    if ('([{'.includes(ch)) depth++;
+    else if (')]}'.includes(ch)) depth--;
+    else if (ch === sep && depth === 0 && !(sep === '=' && (text[i + 1] === '=' || text[i + 1] === '>' || '!<>='.includes(text[i - 1])))) {
+      parts.push({ text: text.slice(start, i), offset: start });
+      start = i + 1;
+    }
+  }
+  parts.push({ text: text.slice(start), offset: start });
+  return parts;
+}
+
+const ENV_NAME_RE = /^[A-Z][A-Z0-9_]*[A-Z0-9]$/;
+
+/**
+ * Names destructured from `process.env` / `import.meta.env`:
+ * `const { A, B = 'x', C: c, 'D': d = 1, ...rest } = process.env`.
+ * Returns `{ name, index, fallback, vite }` per property (`fallback` as in
+ * readFallback). Lexical, so both parser tiers read it the same way; the
+ * `{ … } = <env>` shape is self-delimiting.
+ * @implements docguard.js-ts-extraction#FR-003
+ */
+function destructuredEnvReads(content, kind) {
+  const out = [];
+  const source = /=\s*(process\s*\.\s*env|import\s*\.\s*meta\s*\.\s*env)\b(?!\s*(?:\.|\[|\?\.))/g;
+  let m;
+  while ((m = source.exec(content)) !== null) {
+    if (kind[m.index] !== 0) continue;
+    let close = m.index - 1;
+    while (close >= 0 && /\s/.test(content[close])) close--;
+    if (content[close] !== '}' || kind[close] !== 0) continue;
+    let depth = 0, open = -1;
+    for (let i = close; i >= 0; i--) {
+      if (kind[i] !== 0) continue;
+      if (content[i] === '}') depth++;
+      else if (content[i] === '{' && --depth === 0) { open = i; break; }
+    }
+    if (open < 0) continue;
+    const before = content.slice(Math.max(0, open - 16), open);
+    if (!/(?:\b(?:const|let|var)|\()\s*$/.test(before)) continue;
+    const inner = content.slice(open + 1, close);
+    for (const part of splitTopLevel(inner, ',')) {
+      const text = part.text;
+      const lead = text.length - text.trimStart().length;
+      const prop = text.trim();
+      if (!prop || prop.startsWith('...')) continue;
+      const key = /^(?:(['"])([^'"]+)\1|([A-Za-z_$][\w$]*))/.exec(prop);
+      if (!key) continue;
+      const name = key[2] ?? key[3];
+      if (!ENV_NAME_RE.test(name)) continue;
+      const afterKey = prop.slice(key[0].length);
+      const assign = splitTopLevel(afterKey, '=');
+      let fallback;
+      if (assign.length > 1) {
+        const value = afterKey.slice(assign[1].offset);
+        fallback = literalValue(value);
+      }
+      out.push({ name, index: open + 1 + part.offset + lead, fallback, vite: /^import/.test(m[1]) });
+    }
+  }
+  return out;
+}
+
+/**
+ * Env var names READ in code. `options.within` (a repository-relative directory)
+ * restricts the scan to one area, for as-built specs (docguard.as-built-specs#FR-001).
+ *
+ * The returned Set also carries:
+ * - `limitations`: Worker binding forms the parser fallback cannot verify;
+ * - `unscanned`: `[{ language, files }]` for source files in a language that
+ *   has no env patterns, so a variable read there is unseen
+ *   (docguard.fallback-language-coverage#FR-004);
+ * - `origins`: name → Set of file extensions it was read from, so a finding
+ *   can carry the analyzer tier of the files behind it (FR-002);
+ * - `sites`: name → [{ file, line, defaulted, default }], one per read. A read
+ *   is defaulted when the code supplies a fallback: a destructuring default,
+ *   `?? x` / `|| x`, or a second argument to `os.getenv` / `os.environ.get`.
+ *   `default` is the literal fallback, or null when it is an expression. A
+ *   consumer derives Required from every site.
+ *
+ * @implements docguard.fallback-language-coverage#FR-003
+ * @implements docguard.fallback-language-coverage#FR-004
+ * @implements docguard.fallback-language-coverage#FR-005
+ * @implements docguard.js-ts-extraction#FR-003
+ * @implements docguard.js-ts-extraction#FR-004
+ * @implements docguard.generated-docs-consistency#FR-007
+ * @implements docguard.generated-docs-consistency#FR-008
+ */
+export function grepEnvUsage(projectDir, config = {}, options = {}) {
+  const within = options.within ? String(options.within).replace(/\\/g, '/').replace(/\/+$/, '') : null;
+  const names = new Set();
+  names.limitations = [];
+  names.origins = new Map();
+  const unscannedFiles = [];
+  names.sites = new Map();
+  const recordSite = (name, file, line, fallback) => {
+    if (!names.sites.has(name)) names.sites.set(name, []);
+    names.sites.get(name).push({ file, line, defaulted: fallback !== undefined, default: fallback === undefined ? null : fallback });
+  };
   const roots = resolveSourceRoots(projectDir, config);
   const seen = new Set();
+  const add = (name, ext) => {
+    names.add(name);
+    if (!names.origins.has(name)) names.origins.set(name, new Set());
+    names.origins.get(name).add(ext);
+  };
 
   // Require names to start with a letter and END with a letter/digit (NOT an
   // underscore) — fixes "VITE_" being captured as a literal env var name.
@@ -338,38 +934,109 @@ export function grepEnvUsage(projectDir, config = {}) {
     new RegExp(`os\\.environ\\.get\\s*\\(\\s*['"]${NAME}['"]`, 'g'),
     new RegExp(`os\\.getenv\\s*\\(\\s*['"]${NAME}['"]`, 'g'),
   ];
+  // The same blind spot, one language at a time: a Go, Ruby, Java, C#, PHP or
+  // Rust service read none of its env vars, so the env check was skipped as
+  // vacuous and still said `checked` — and `diff` called a still-used variable
+  // "not found in code". Each form runs ONLY on its own language's files, so
+  // one language's syntax can never match inside another's.
+  const LANGUAGE_PATTERNS = [
+    { exts: ['.go'], re: new RegExp(`\\bos\\.(?:Getenv|LookupEnv)\\s*\\(\\s*["\`]${NAME}["\`]`, 'g') },
+    { exts: ['.rb'], re: new RegExp(`\\bENV\\s*\\[\\s*['"]${NAME}['"]\\s*\\]`, 'g') },
+    { exts: ['.rb'], re: new RegExp(`\\bENV\\.fetch\\s*\\(?\\s*['"]${NAME}['"]`, 'g') },
+    { exts: ['.java', '.kt', '.kts'], re: new RegExp(`\\bSystem\\.getenv\\s*\\(\\s*"${NAME}"`, 'g') },
+    // Spring injects `${X}` / `${X:default}` from the environment (among other sources).
+    { exts: ['.java', '.kt'], re: new RegExp(`@Value\\s*\\(\\s*"\\$\\{${NAME}[:}]`, 'g') },
+    { exts: ['.cs'], re: new RegExp(`\\bEnvironment\\.GetEnvironmentVariable\\s*\\(\\s*@?"${NAME}"`, 'g') },
+    { exts: ['.php'], re: new RegExp(`\\bgetenv\\s*\\(\\s*['"]${NAME}['"]`, 'g') },
+    { exts: ['.php'], re: new RegExp(`\\$_ENV\\s*\\[\\s*['"]${NAME}['"]\\s*\\]`, 'g') },
+    // Laravel's env() helper, the idiomatic read in its config/*.php files.
+    { exts: ['.php'], re: new RegExp(`(?<![\\w$>:])env\\s*\\(\\s*['"]${NAME}['"]`, 'g') },
+    { exts: ['.rs'], re: new RegExp(`\\benv::var(?:_os)?\\s*\\(\\s*"${NAME}"`, 'g') },
+  ];
   // Vite injects these at build time; they are not user-set env vars.
   const VITE_INTRINSICS = new Set(['DEV', 'PROD', 'MODE', 'BASE_URL', 'SSR']);
 
-  const visit = (filePath) => {
-    if (seen.has(filePath)) return;
-    seen.add(filePath);
-    if (!CODE_EXTENSIONS.has(extname(filePath))) return;
-    const rel = relative(projectDir, filePath);
-    if (shouldIgnore(rel, config)) return;
+  const inScope = (filePath) => {
+    const rel = relative(projectDir, filePath).replace(/\\/g, '/');
+    if (shouldIgnore(rel, config)) return null;
     // v0.26 (Bug #7): a token that appears only in a test/fixture file is not a
     // product env read. Skip non-product paths by default (no .docguardignore).
-    if (isNonProductPath(rel.replace(/\\/g, '/'), config)) return;
+    if (isNonProductPath(rel, config)) return null;
+    if (within && within !== '.' && rel !== within && !rel.startsWith(`${within}/`)) return null;
+    return rel;
+  };
+
+  const visitSpringConfig = (filePath, ext) => {
+    if (!inScope(filePath)) return;
+    const content = readScannable(filePath);
+    if (content === null || !content.includes('${')) return;
+    // YAML values are usually quoted, so the string/comment lexer would hide
+    // every placeholder. Drop whole comment lines instead (`#`, and `!` in a
+    // .properties file); upper-snake names only, because `${server.port}` is a
+    // property reference rather than an env var.
+    const comment = ext === '.properties' ? /^\s*[#!]/ : /^\s*#/;
+    for (const line of content.split(/\r?\n/)) {
+      if (comment.test(line)) continue;
+      for (const m of line.matchAll(new RegExp(`\\$\\{${NAME}(?::[^}]*)?\\}`, 'g'))) {
+        if (!isRunnerEnvVar(m[1])) add(m[1], ext);
+      }
+    }
+  };
+
+  const visit = (filePath, onlyExts = null) => {
+    if (seen.has(filePath)) return;
+    const ext = extname(filePath).toLowerCase();
+    if (onlyExts && !onlyExts.has(ext)) return;
+    seen.add(filePath);
+    if (SPRING_CONFIG_RE.test(filePath.replace(/\\/g, '/').split('/').pop())) { visitSpringConfig(filePath, ext); return; }
+    if (!CODE_EXTENSIONS.has(ext)) {
+      if (LANGUAGE_NAMES[ext] && inScope(filePath)) unscannedFiles.push(filePath);
+      return;
+    }
+    if (!inScope(filePath)) return;
+    const rel = relative(projectDir, filePath);
     const content = readScannable(filePath);
     if (content === null) return; // unreadable, generated, or too large to scan
-    if (!content.includes('env')) return;
+    // Python settings classes and `from os import environ` (py-env.mjs).
+    if (extname(filePath) === '.py' && /BaseSettings|environ|getenv/.test(content)) {
+      for (const name of pythonEnvNames(content)) if (!isRunnerEnvVar(name)) names.add(name);
+    }
+    if (!/env|Env|ENV/.test(content)) return;
     // v0.26 (Bug #7): classify chars so we count env vars actually READ in code,
     // not ones MENTIONED inside a string literal (a detection signature like
     // `r"os.environ.get('JWT_SECRET')"`) or a comment. We test the position of
     // the access KEYWORD (process/os/import) — for a real read the keyword is
     // code while only the argument 'X' is a string, so the name is still caught.
-    const kind = classifyChars(content, extname(filePath));
+    const kind = classifyChars(content, ext);
+    const file = rel.replace(/\\/g, '/');
+    const lineStarts = [0];
+    for (let i = 0; i < content.length; i++) if (content[i] === '\n') lineStarts.push(i + 1);
+    if (['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'].includes(ext)) {
+      for (const read of destructuredEnvReads(content, kind)) {
+        if (read.vite && VITE_INTRINSICS.has(read.name)) continue;
+        if (isRunnerEnvVar(read.name)) continue;
+        add(read.name, ext);
+        recordSite(read.name, file, lineOf(lineStarts, read.index), read.fallback);
+      }
+      const workerBindings = extractWorkerEnvBindings(content, filePath, workerConfigForFile(projectDir, filePath));
+      for (const name of workerBindings) add(name, ext);
+      for (const limitation of workerBindings.limitations || []) names.limitations.push({ code: limitation, file: rel.replace(/\\/g, '/') });
+    }
     // patterns[2] is the import.meta.env one — its matches are Vite-injected
     // when the name is an intrinsic, and must not be reported as user env vars.
-    for (let i = 0; i < patterns.length; i++) {
+    const own = LANGUAGE_PATTERNS.filter(p => p.exts.includes(ext)).map(p => p.re);
+    const active = [...patterns, ...own];
+    for (let i = 0; i < active.length; i++) {
       let m;
-      const rx = new RegExp(patterns[i].source, 'g');
+      const rx = new RegExp(active[i].source, 'g');
       const isViteSource = i === 2;
       while ((m = rx.exec(content)) !== null) {
         if (kind[m.index] !== 0) continue; // keyword inside a string/comment → a mention, not a read
         if (isViteSource && VITE_INTRINSICS.has(m[1])) continue;
         if (isRunnerEnvVar(m[1])) continue; // v0.27 (#7): runner/CI/SDK var, not product config
-        names.add(m[1]);
+        add(m[1], ext);
+        const end = m.index + m[0].length;
+        recordSite(m[1], file, lineOf(lineStarts, m.index), readFallback(content.slice(end, end + 200), i));
       }
     }
 
@@ -388,26 +1055,40 @@ export function grepEnvUsage(projectDir, config = {}) {
       // camelCase keys, so requiring UPPER_SNAKE keeps this env-specific.
       const keyRe = /^\s*['"]?([A-Z][A-Z0-9_]*[A-Z0-9])['"]?\s*:/gm;
       while ((km = keyRe.exec(content)) !== null) {
-        if (km[1].length >= 3 && !VITE_INTRINSICS.has(km[1]) && !isRunnerEnvVar(km[1])) names.add(km[1]);
+        if (km[1].length >= 3 && !VITE_INTRINSICS.has(km[1]) && !isRunnerEnvVar(km[1])) {
+          add(km[1], ext);
+          const at = km.index + km[0].indexOf(km[1]);
+          const lineText = content.slice(at, content.indexOf('\n', at) >>> 0);
+          const dflt = /\.default\(\s*([^)]*)\)/.exec(lineText);
+          recordSite(km[1], file, lineOf(lineStarts, at),
+            dflt ? literalValue(dflt[1]) : (/\.optional\(\)/.test(lineText) ? null : undefined));
+        }
       }
       // convict: the env var name is the `env:` property value, not the key.
       const convictRe = /\benv\s*:\s*['"]([A-Z][A-Z0-9_]*[A-Z0-9])['"]/g;
       while ((km = convictRe.exec(content)) !== null) {
-        if (km[1].length >= 3 && !isRunnerEnvVar(km[1])) names.add(km[1]);
+        if (km[1].length >= 3 && !isRunnerEnvVar(km[1])) add(km[1], ext);
       }
     }
   };
 
-  const walk = (dir) => {
+  const walk = (dir, onlyExts = null) => {
     let entries;
     try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
-      if (IGNORE_DIRS.has(e.name) || e.name.startsWith('.')) continue;
-      if (e.isDirectory() && isNonProductDir(e.name, config)) continue; // v0.26: skip test/fixture dirs in env detection
+      if (isIgnoredDirEntry(e.name, entries, IGNORE_DIRS) || e.name.startsWith('.')) continue;
       const full = join(dir, e.name);
-      if (e.isDirectory()) walk(full);
-      else if (e.isFile()) visit(full);
+      // v0.26: skip test/fixture dirs in env detection. The parent path lets a
+      // package segment (`src/main/java/com/example`) through (FR-006).
+      if (e.isDirectory() && isNonProductDir(e.name, config, relative(projectDir, dir).replace(/\\/g, '/'))) continue;
+      if (e.isDirectory()) walk(full, onlyExts);
+      else if (e.isFile()) visit(full, onlyExts);
     }
+  };
+
+  const finish = () => {
+    names.unscanned = countLanguages(unscannedFiles);
+    return names;
   };
 
   // v0.14-P2: when config.changedFiles is populated (by --changed-only),
@@ -417,9 +1098,291 @@ export function grepEnvUsage(projectDir, config = {}) {
     for (const rel of config.changedFiles) {
       visit(resolve(projectDir, rel));
     }
-    return names;
+    return finish();
   }
 
   for (const root of roots) walk(root);
-  return names;
+  // A Next.js app also reads env in root files: edge middleware,
+  // instrumentation and next.config (docguard.js-ts-extraction#FR-004).
+  if (isNextJsProject(projectDir)) {
+    for (const name of NEXT_ROOT_FILES) {
+      const abs = resolve(projectDir, name);
+      if (existsSync(abs)) visit(abs);
+    }
+  }
+  // A language's own layout, and nothing more (FR-005): every directory of a
+  // root-level Go module can hold a package, so `cmd/` and `internal/` must be
+  // read even when a conventional root such as `api/` exists and would hide
+  // them; a Rails app reads ENV in `config/` (initializers, environments).
+  // Restricted to that language's files so no other scanner input widens.
+  if (existsSync(join(projectDir, 'go.mod'))) walk(resolve(projectDir), new Set(['.go']));
+  if (existsSync(join(projectDir, 'Gemfile')) && existsSync(join(projectDir, 'config'))) {
+    walk(resolve(projectDir, 'config'), new Set(['.rb']));
+  }
+  return finish();
+}
+
+/** Env template files read at the project root, in precedence order. */
+export const ENV_TEMPLATE_FILES = ['.env.example', '.env.template'];
+
+/**
+ * The one set of environment variables `generate`, `generate --plan` and `diff`
+ * document and compare: names in a root env template plus names read in code.
+ * Values in a template are examples, never secrets DocGuard reads from `.env`.
+ *
+ * `required` is true when some read site has no fallback, false when every
+ * read site has one, and null when the code never reads the variable (it is
+ * only listed in a template). `default` is the first literal fallback.
+ * @implements docguard.generated-docs-consistency#FR-008
+ * @returns {Array<{name: string, files: string[], template: string|null, example: string|null, required: boolean|null, default: string|null}>}
+ */
+export function collectEnvVars(projectDir, config = {}, used = grepEnvUsage(projectDir, config)) {
+  const vars = new Map();
+  const entry = (name) => {
+    if (!vars.has(name)) vars.set(name, { name, files: [], template: null, example: null, required: null, default: null });
+    return vars.get(name);
+  };
+  for (const file of ENV_TEMPLATE_FILES) {
+    const abs = resolve(projectDir, file);
+    if (!existsSync(abs)) continue;
+    let content;
+    try { content = readFileSync(abs, 'utf-8'); } catch { continue; }
+    for (const m of content.matchAll(/^([A-Z][A-Z0-9_]*[A-Z0-9])\s*=[ \t]*(.*)$/gm)) {
+      const v = entry(m[1]);
+      if (v.template) continue;
+      v.template = file;
+      const example = m[2].trim().replace(/^(['"])(.*)\1$/, '$2');
+      v.example = example || null;
+    }
+  }
+  for (const name of used) {
+    const v = entry(name);
+    const sites = used.sites?.get(name) || [];
+    v.files = [...new Set(sites.map(site => site.file))].sort();
+    if (sites.length > 0) {
+      v.required = sites.some(site => !site.defaulted);
+      v.default = sites.find(site => typeof site.default === 'string')?.default ?? null;
+    }
+  }
+  return [...vars.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Spring Boot's own config files, whose `${X}` placeholders may name env vars. */
+const SPRING_CONFIG_RE = /^(?:application|bootstrap)(?:-[\w.-]+)?\.(?:ya?ml|properties)$/;
+
+// ─── Analyzer tier (docguard.calibrated-finding-channels#FR-010/011/012) ────
+//
+// Which analyzer actually produced a piece of evidence, decided where the
+// analyzer runs rather than guessed afterwards.
+//
+// DocGuard has two AST tiers and both are OPTIONAL by design (constitution II):
+// `@babel/parser` for JS/TS and the developer's own `python3` for Python. When
+// either is unavailable — or when a specific file fails to parse — the scanners
+// fall back to regex, which cannot see a multi-line decorator or a nested
+// object literal. That fallback is correct: DocGuard keeps working. What was
+// missing is that it was INVISIBLE. A finding produced by the regex tier looked
+// exactly like one produced from a real syntax tree, in every output channel,
+// so a reader had no way to know that "no findings" meant "nothing found by a
+// parser that cannot see half the syntax".
+//
+// A confidence score cannot warn you about this, because the detector is not
+// uncertain — it is reading a different, smaller input than it appears to be.
+// The only honest answer is to report the tier structurally, which is what
+// these helpers exist to carry.
+
+/** Parser tiers, matching the benchmark and feedback fixture vocabulary. */
+export const PARSER_TIERS = Object.freeze(['js-ast', 'py-ast', 'regex-fallback', 'fallback-language', 'mixed', 'not-applicable']);
+
+/** Tiers that mean an AST was available and used. */
+const FULL_TIERS = new Set(['js-ast', 'py-ast']);
+
+/** Extensions that have an AST tier at all. Anything else is fallback-language. */
+const AST_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.mts', '.cts', '.py']);
+
+/**
+ * The tier for one file, from the parse result the analyzer just produced.
+ *
+ * @param {string} filePath
+ * @param {{ok?: boolean, error?: string}|null|undefined} parsed
+ *   `null`/`undefined` — the tier was unavailable for the whole batch
+ *   (`@babel/parser` absent, or no usable `python3`).
+ *   `{ok: false}` — this particular file failed to parse.
+ *   `{ok: true}` — a real syntax tree.
+ * @param {string} [batchReason] why the whole batch fell back, when it did
+ * @returns {{tier: string, tierReason: string|null}}
+ */
+export function tierFor(filePath, parsed, batchReason = null) {
+  const ext = (String(filePath).match(/\.[^./\\]+$/) || [''])[0].toLowerCase();
+  if (!AST_EXTENSIONS.has(ext)) {
+    return { tier: 'fallback-language', tierReason: `No AST tier exists for ${ext || 'this file type'}; matched by pattern.` };
+  }
+  const full = ext === '.py' ? 'py-ast' : 'js-ast';
+  if (parsed && parsed.ok === true) return { tier: full, tierReason: null };
+  if (parsed && parsed.ok === false) {
+    return { tier: 'regex-fallback', tierReason: parsed.error ? `Parse failed: ${parsed.error}` : 'Parse failed for this file; matched by pattern.' };
+  }
+  return { tier: 'regex-fallback', tierReason: batchReason || (ext === '.py'
+    ? 'No usable python3 interpreter; matched by pattern.'
+    : 'JavaScript/TypeScript parser unavailable; matched by pattern.') };
+}
+
+/**
+ * Roll a set of tiered items up into one tier for a finding or a validator.
+ *
+ * `mixed` is reported whenever items disagree, and the reason names the
+ * WEAKEST tier present — the strength of a conclusion drawn from several
+ * files is the strength of its weakest input, never the average.
+ *
+ * `patternOnly` counts the `fallback-language` items (part of `degraded`), and
+ * `fallbackLanguages` names their languages when the items carry a `file`, so
+ * a coverage reason can say "3 Go files" rather than "3 inputs"
+ * (docguard.fallback-language-coverage#FR-001).
+ *
+ * @param {Array<{tier?: string, tierReason?: string|null, file?: string}>} items
+ * @returns {{tier: string, tierReason: string|null, degraded: number,
+ *   patternOnly: number, fallbackLanguages: string[], regexReason: string|null,
+ *   regexCauses: string[]}}
+ */
+export function summarizeTiers(items) {
+  const list = (items || []).filter(item => item && typeof item.tier === 'string' && PARSER_TIERS.includes(item.tier));
+  if (list.length === 0) return { tier: 'not-applicable', tierReason: null, degraded: 0, patternOnly: 0, fallbackLanguages: [], regexReason: null, regexCauses: [] };
+  const tiers = new Set(list.map(item => item.tier));
+  const degraded = list.filter(item => !FULL_TIERS.has(item.tier) && item.tier !== 'not-applicable').length;
+  const patternItems = list.filter(item => item.tier === 'fallback-language');
+  const channels = {
+    patternOnly: patternItems.length,
+    fallbackLanguages: [...new Set(patternItems.map(item => item.file && languageOf(item.file)).filter(Boolean))].sort(),
+    regexReason: list.find(item => item.tier === 'regex-fallback' && item.tierReason)?.tierReason || null,
+    // Why the fallback read each item, so advice can name the missing
+    // prerequisite (docguard.coverage-followups#FR-010). A nested summary
+    // passes its own causes up.
+    regexCauses: [...new Set(list.flatMap(item => (Array.isArray(item.regexCauses)
+      ? item.regexCauses
+      : item.tier === 'regex-fallback' ? [regexCause(item)] : [])))].sort(),
+  };
+  if (tiers.size === 1) {
+    const [only] = tiers;
+    return { tier: only, tierReason: list.find(item => item.tierReason)?.tierReason || null, degraded, ...channels };
+  }
+  const weakest = list.find(item => item.tier === 'regex-fallback') || list.find(item => item.tier === 'fallback-language');
+  return { tier: 'mixed', tierReason: weakest?.tierReason || null, degraded, ...channels };
+}
+
+/**
+ * The `applicability` a validator should report when some of its inputs were
+ * read without a syntax tree.
+ *
+ * Two causes, two sentences:
+ * - `regex-fallback`: the language has an AST tier that was unavailable or
+ *   failed for this file (calibrated-finding-channels#FR-012);
+ * - `fallback-language`: the language has no AST tier at all. No parser is
+ *   missing, but a form the patterns do not match is just as unseen, so it is
+ *   partial coverage too. The README always said so; this function used to
+ *   return null for it, and Go, Java and Ruby services reported `checked`
+ *   (docguard.fallback-language-coverage#FR-001).
+ *
+ * Findings are always RETAINED — what the patterns did find is still real.
+ * Only coverage is downgraded, exactly as the architecture and environment
+ * validators already do for their own limitations.
+ *
+ * @implements docguard.fallback-language-coverage#FR-001
+ * @returns {{status: string, reason: string}|null} null when coverage is full
+ */
+export function tierApplicability(summary, noun = 'input') {
+  if (!summary || summary.degraded === 0) return null;
+  const plural = n => `${n} ${noun}${n === 1 ? '' : 's'}`;
+  const patternOnly = Number.isInteger(summary.patternOnly)
+    ? summary.patternOnly
+    : (summary.tier === 'fallback-language' ? summary.degraded : 0);
+  const regex = summary.degraded - patternOnly;
+  const langs = summary.fallbackLanguages || [];
+  const where = langs.length ? `in ${langs.join(', ')}` : 'in a language DocGuard has no parser for';
+  const them = langs.length === 1 ? langs[0] : langs.length ? 'those languages' : 'it';
+  const patternPart = `${plural(patternOnly)} ${where} read by pattern only (no syntax tree exists for ${them})`;
+  if (regex === 0) {
+    return {
+      status: 'partial',
+      reason: `Findings are retained; ${patternPart}, so a form the patterns do not match is not seen and absence of a finding there is weak evidence.`,
+    };
+  }
+  const regexReason = summary.regexReason ?? summary.tierReason;
+  const reason = regexReason ? ` ${regexReason}` : '';
+  const alsoPattern = patternOnly > 0 ? `, and ${patternPart}` : '';
+  return {
+    status: 'partial',
+    reason: `Findings are retained; ${plural(regex)} read by the pattern fallback rather than a syntax tree${alsoPattern}, so absence of a finding there is weak evidence.${reason}`,
+  };
+}
+
+const JS_EXT_RE = /\.(?:[cm]?jsx?|[cm]?tsx?)$/i;
+
+/**
+ * Why one `regex-fallback` item was read by pattern:
+ * - `python-interpreter-missing`: no usable python3 on PATH;
+ * - `js-parser-missing`: `@babel/parser` could not be loaded;
+ * - `python-parse-error` / `js-parse-error`: that file did not parse;
+ * - `parse-error`: a parse failure whose language is not known.
+ * @implements docguard.coverage-followups#FR-010
+ */
+export function regexCause(item) {
+  const reason = String(item?.tierReason || '');
+  const file = String(item?.file || '');
+  if (/python3? interpreter|No usable python/i.test(reason)) return 'python-interpreter-missing';
+  if (/JavaScript\/TypeScript parser unavailable|@babel\/parser/i.test(reason)) return 'js-parser-missing';
+  if (/\.py$/i.test(file)) return 'python-parse-error';
+  if (JS_EXT_RE.test(file)) return 'js-parse-error';
+  return 'parse-error';
+}
+
+const CAUSE_ADVICE = {
+  'python-interpreter-missing': 'put python3 (or a Python 3 `python`) on PATH',
+  'js-parser-missing': 'reinstall docguard-cli so its `@babel/parser` dependency loads',
+  'python-parse-error': 'fix the Python syntax error',
+  'js-parse-error': 'fix the JavaScript/TypeScript syntax error',
+  'parse-error': 'fix the parse error',
+};
+const CAUSE_ORDER = Object.keys(CAUSE_ADVICE);
+
+/**
+ * The one sentence that tells a user how to get exact extraction back, naming
+ * only the prerequisites the affected files actually lack: `python3` for
+ * Python, `@babel/parser` for JavaScript/TypeScript, or the file's syntax
+ * error. Before, every note said "Install python3 (or fix the parse error)",
+ * also for a TypeScript file that did not parse.
+ *
+ * @implements docguard.coverage-followups#FR-010
+ * @param {string[]} causes - `regexCause` values (a summary's `regexCauses`)
+ * @returns {string}
+ */
+export function patternFallbackAdvice(causes) {
+  const steps = CAUSE_ORDER.filter(c => (causes || []).includes(c)).map(c => CAUSE_ADVICE[c]);
+  const list = steps.length ? steps : [CAUSE_ADVICE['parse-error']];
+  const text = list.length === 1 ? list[0] : `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`;
+  return `${text[0].toUpperCase()}${text.slice(1)}, then re-run for exact extraction.`;
+}
+
+/**
+ * The two pattern channels of a `summarizeTiers` result, kept apart: how many
+ * items were read by the pattern fallback although their language has a
+ * parser (`regex-fallback`: install or fix something and re-run), and how
+ * many were read by pattern because their language has none
+ * (`fallback-language`: nothing to install). A `mixed` tier says only that the
+ * items disagree, so it decides neither (docguard.coverage-followups#FR-001,
+ * FR-007).
+ *
+ * @implements docguard.coverage-followups#FR-001
+ * @implements docguard.coverage-followups#FR-007
+ * @param {object|null|undefined} summary
+ * @returns {{ regexRead: number, patternRead: number, patternLanguages: string[] }}
+ */
+export function patternChannels(summary) {
+  if (!summary) return { regexRead: 0, patternRead: 0, patternLanguages: [] };
+  const degraded = Number.isInteger(summary.degraded) ? summary.degraded : 0;
+  const patternRead = Number.isInteger(summary.patternOnly)
+    ? summary.patternOnly
+    : (summary.tier === 'fallback-language' ? Math.max(degraded, 1) : 0);
+  const regexRead = Number.isInteger(summary.degraded)
+    ? Math.max(0, degraded - patternRead)
+    : (summary.tier === 'regex-fallback' ? 1 : 0);
+  return { regexRead, patternRead, patternLanguages: [...(summary.fallbackLanguages || [])] };
 }

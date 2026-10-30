@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { assertDefaultDocWrites } from './shared-doc-roles.mjs';
 
 /**
  * DocGuard CLI — The enforcement tool for Canonical-Driven Development (CDD)
@@ -12,16 +13,15 @@
  *   npx docguard-cli --help    — Show help
  * 
  * @see https://github.com/raccioly/docguard
+ * @implements docguard.document-lifecycle#FR-012
+ * @implements docguard.document-lifecycle#FR-020
  */
 
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve, basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// Read version from package.json (single source of truth)
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const PKG = JSON.parse(readFileSync(resolve(__dirname, '..', 'package.json'), 'utf-8'));
-const VERSION = PKG.version;
+// Version comes from shared.mjs, which reads package.json (single source of truth).
 // audit is now an alias for guard (old audit.mjs deleted — guard does everything it did + more)
 import { runInit } from './commands/init.mjs';
 import { runGuard } from './commands/guard.mjs';
@@ -50,10 +50,17 @@ import { runMemory } from './commands/memory.mjs';
 import { runDemo } from './commands/demo.mjs';
 import { runAgent } from './commands/agent.mjs';
 import { runMcp } from './commands/mcp.mjs';
-import { ensureSkills } from './ensure-skills.mjs';
+import { runArchive } from './commands/retire.mjs';
+import { runSpecs } from './commands/specs.mjs';
+import { runReconcile } from './commands/reconcile.mjs';
+import { runReview } from './commands/review.mjs';
+import { runAnchors } from './commands/anchors.mjs';
+import { runRules } from './commands/rules.mjs';
+import { runIgnore } from './commands/ignore.mjs';
+import { detectRepositoryRootGuidance, renderRepositoryRootGuidance } from './repository-root.mjs';
 
 // ── Shared constants (imported to break circular dependencies) ──────────
-import { c, PROFILES } from './shared.mjs';
+import { c, PROFILES, TOOL_VERSION as VERSION } from './shared.mjs';
 import { loadConfig } from './config.mjs';
 export { c, PROFILES };
 
@@ -68,6 +75,9 @@ ${c.cyan}${c.bold}  ╔═══════════════════
 }
 
 // ── Help ───────────────────────────────────────────────────────────────────
+// Each summary line names every subcommand and mode its command's own --help
+// lists (tests/release-readiness.test.mjs).
+// @implements docguard.release-readiness#FR-005
 function printHelp() {
   printBanner();
   console.log(`${c.bold}Usage:${c.reset}
@@ -87,15 +97,22 @@ ${c.bold}Tools (situational, but day-to-day useful)${c.reset}
   ${c.green}demo${c.reset}       Zero-install tour: see what DocGuard catches against a sample project in 30s
   ${c.green}diagnose${c.reset}   AI orchestrator — guard → emit fix prompts in one command
   ${c.green}fix${c.reset}        Generate AI fix instructions for specific docs
-  ${c.green}generate${c.reset}   Reverse-engineer canonical docs from existing code (${c.cyan}--plan${c.reset} for AI scan)
-  ${c.green}agent${c.reset}      One-shot agent task graph — ordered tasks, pre-filled code-truth, per-task verify (${c.cyan}--format json${c.reset})
+  ${c.green}generate${c.reset}   Reverse-engineer canonical docs from existing code (${c.cyan}--plan${c.reset} for AI scan, ${c.cyan}--spec <area>${c.reset} for an as-built Spec Kit spec)
+  ${c.green}agent${c.reset}      Agent task graph or bounded task context (${c.cyan}--task <text>${c.reset}, ${c.cyan}--format json${c.reset})
   ${c.green}explain${c.reset}    Explain a validator key, warning text, or finding code (${c.cyan}docguard explain SEC001${c.reset})
-  ${c.green}verify${c.reset}     Extract documented numbers/limits/enums for an agent to check vs code (${c.cyan}--semantic${c.reset})
+  ${c.green}verify${c.reset}     Check declared local evidence or extract claims for review (${c.cyan}--evidence${c.reset}, ${c.cyan}--semantic${c.reset})
+  ${c.green}ignore${c.reset}     Every suppression with its reason and expiry (${c.cyan}--format claimspec${c.reset} exports the reasoned ones)
   ${c.green}feedback${c.reset}   Report likely false positives back to DocGuard (local-first + 1-click prefilled issue)
-  ${c.green}mcp${c.reset}        MCP server over stdio — guard/score/explain/verify/report/diagnose as agent tools
+  ${c.green}mcp${c.reset}        MCP server (stdio, or ${c.cyan}--transport http${c.reset} on loopback) — guard, score, verify, doc navigation and task context as agent tools
   ${c.green}report${c.reset}     Compliance-evidence bundle — guard + score + ALCOA+ + integrity hash (${c.cyan}--format json${c.reset}, ${c.cyan}--out <file>${c.reset})
   ${c.green}ci${c.reset}         Pipeline gate: guard + score in one command (${c.cyan}--threshold <n>${c.reset}, ${c.cyan}--fail-on-warning${c.reset}, ${c.cyan}--format json${c.reset}; records score history)
   ${c.green}memory${c.reset}     Show what DocGuard remembers (${c.cyan}--diff${c.reset} drills into drift)
+  ${c.green}retire${c.reset}     Remove reviewed docs from active AI context (${c.cyan}--plan${c.reset}; explicit ${c.cyan}--write --path${c.reset})
+  ${c.green}specs${c.reset}      Track spec lifecycle and evidence (${c.cyan}--check|--write${c.reset}; ${c.cyan}preflight${c.reset}, ${c.cyan}approve${c.reset}, ${c.cyan}complete${c.reset}, ${c.cyan}require${c.reset}, ${c.cyan}reanchor${c.reset})
+  ${c.green}reconcile${c.reset}  Classify code/spec changes since a Git ref before changing intent
+  ${c.green}review${c.reset}     Doc sections whose covered code changed (${c.cyan}--accept <doc>#<id>${c.reset}, ${c.cyan}--prune${c.reset}, ${c.cyan}--suggest <doc>${c.reset})
+  ${c.green}anchors${c.reset}    Code→requirement links, what each anchors to and whether it changed since review (${c.cyan}accept${c.reset}, ${c.cyan}--state <s>${c.reset}, ${c.cyan}--format json${c.reset})
+  ${c.green}rules${c.reset}      Which agent instruction files each harness loads for a path (${c.cyan}--for <path>${c.reset}, ${c.cyan}--harness <name>${c.reset})
   ${c.green}trace${c.reset}      Requirements traceability matrix (${c.cyan}--reverse${c.reset} for code→doc map, ${c.cyan}--features${c.reset} for per-feature adherence)
   ${c.green}upgrade${c.reset}    Migrate ${c.cyan}.docguard.json${c.reset} schema + CLI (${c.cyan}--apply --pr${c.reset} for team-wide PR)
   ${c.green}watch${c.reset}      Live mode: re-run guard on file changes
@@ -103,20 +120,20 @@ ${c.bold}Tools (situational, but day-to-day useful)${c.reset}
 ${c.bold}init --with <name>${c.reset} ${c.dim}— optional scaffolders, picked at init time${c.reset}
   ${c.dim}agents${c.reset}     AGENTS.md / CLAUDE.md / .cursor/rules / Copilot instructions
   ${c.dim}hooks${c.reset}      Git pre-commit / pre-push hooks
-  ${c.dim}ci${c.reset}         Run the CI gate (guard + score) once, right after init
+  ${c.dim}ci${c.reset}         GitHub Actions workflow that runs the CI gate (.github/workflows/docguard.yml)
   ${c.dim}badge${c.reset}      Shields.io score badges for README
   ${c.dim}llms${c.reset}       llms.txt generation
   ${c.dim}publish${c.reset}    External doc-site scaffold (Mintlify) ${c.dim}— experimental${c.reset}
 
-${c.bold}Deprecation aliases${c.reset} ${c.dim}— still work in v0.20.x with a yellow warning${c.reset}
+${c.bold}Deprecation aliases${c.reset} ${c.dim}— supported until v1.0 with a yellow warning${c.reset}
   ${c.dim}setup${c.reset} → ${c.cyan}init --wizard${c.reset}
   ${c.dim}agents · hooks · badge · llms · publish${c.reset} → ${c.cyan}init --with <name>${c.reset}
   ${c.dim}impact${c.reset} → ${c.cyan}diff --since <ref>${c.reset}
   ${c.dim}audit${c.reset} → ${c.green}guard${c.reset} ${c.dim}(permanent — no warning, no removal planned)${c.reset}
-  ${c.dim}See docs-implementation/MIGRATION-v0.20.md for the full timeline.${c.reset}
+  ${c.dim}Run the legacy form to see its replacement.${c.reset}
 
 ${c.bold}Options:${c.reset}
-  --dir <path>    Project directory (default: current directory)
+  --dir <path>    Project directory (default: current directory; explicit paths suppress ancestor-root guidance)
   --verbose       Show detailed output
   --format json   Output results as JSON (for CI)
   --fix           Auto-create missing files from templates
@@ -128,9 +145,10 @@ ${c.bold}Options:${c.reset}
   --threshold <n> Minimum score for CI pass (used with ci command)
   --fail-on-warning  Fail CI on warnings (used with ci command)
   --auto          Auto-fix what's possible (used with fix command)
-  --write         Apply deterministic fixes in place (fix command): removes
-                  documented endpoints the OpenAPI spec confirms are gone.
-                  Only edits docguard:generated docs unless --force.
+  --write         Apply a command's explicit deterministic write path. For fix,
+                  mapped human docs require unique source=code ownership and
+                  --force cannot grant ownership; specs
+                  refreshes observed registry evidence; retire requires --path.
   --plan          AI-powered Generate (generate command): scan any project
                   (JS/Python/Rust/Go/Java/…), emit the agent task manifest +
                   code-truth skeleton. Add --write to scaffold, --format json
@@ -178,9 +196,10 @@ ${c.bold}Learn more:${c.reset}
 // vetted global help above). Commands without a focused entry fall back to the
 // global help, which still lists them.
 const COMMAND_HELP = {
+  __proto__: null,
   init: {
     summary: 'Bootstrap CDD docs — smart-scans existing code, or writes blank templates.',
-    usage: 'docguard init [--skeleton|--wizard] [--profile <p>] [--with <name>] [--fix]',
+    usage: 'docguard init [--skeleton|--wizard] [--profile <p>] [--with <name>] [--fix] [--no-spec-kit|--spec-kit]',
     flags: [
       ['--skeleton', 'Blank templates instead of the smart scan-and-propose'],
       ['--wizard', 'Guided interactive onboarding'],
@@ -189,36 +208,41 @@ const COMMAND_HELP = {
       ['--skip-prompts', 'Non-interactive; create the profile defaults (CI)'],
       ['--fix', 'Headless: create any missing required docs from templates'],
       ['--force', 'Overwrite existing files (.bak backup kept)'],
+      ['--no-spec-kit', 'Skip Spec Kit: no `specify` call, no .specify/ (DocGuard\'s own agent skills still install)'],
+      ['--spec-kit', 'With --profile starter: initialize Spec Kit too (starter skips it by default)'],
     ],
-    examples: ['docguard init', 'docguard init --skeleton', 'docguard init --profile starter --skip-prompts', 'docguard init --with ci'],
+    examples: ['docguard init', 'docguard init --skeleton', 'docguard init --profile starter --skip-prompts', 'docguard init --no-spec-kit', 'docguard init --with ci'],
   },
   generate: {
     summary: 'Reverse-engineer canonical docs from existing code.',
-    usage: 'docguard generate [--plan [--write] [--format json]] [--force]',
+    usage: 'docguard generate [--plan [--write] [--format json]] [--force] | docguard generate --spec <area> [--id <spec-id>] [--write] [--format json]',
     flags: [
+      ['--spec <area>', 'As-built Spec Kit spec for one code area: one requirement candidate per route, export, env var or entity found there'],
+      ['--id <spec-id>', 'With --spec: Spec ID for the new spec (default: <project>.as-built-<area>)'],
       ['--plan', 'AI scan: emit the agent task manifest + code-truth skeleton'],
-      ['--write', 'With --plan: scaffold the skeleton docs to disk'],
+      ['--write', 'With --plan: scaffold the skeleton docs to disk. With --spec: create the spec and register it (origin: as_built)'],
       ['--format json', 'With --plan: machine-readable manifest'],
       ['--force', 'Overwrite existing docs (.bak backup kept)'],
     ],
-    examples: ['docguard generate', 'docguard generate --plan', 'docguard generate --plan --write', 'docguard generate --plan --format json'],
+    examples: ['docguard generate', 'docguard generate --plan', 'docguard generate --plan --write', 'docguard generate --plan --format json', 'docguard generate --spec src/billing --write'],
   },
   agent: {
-    summary: 'One-shot agent task graph: ordered, dependency-aware, with pre-filled code-truth + per-task verify.',
-    usage: 'docguard agent [--profile <name>] [--format json]',
+    summary: 'Agent task graph, or a bounded evidence packet for one explicit task.',
+    usage: 'docguard agent [--task <text>] [--profile <name>] [--format json]',
     flags: [
-      ['--format json', 'Machine-readable task graph (the agent-executable artifact)'],
+      ['--task <text>', 'Select current task-linked requirements and evidence; abstain when relevance is weak'],
+      ['--format json', 'Machine-readable task graph or deterministic task packet'],
       ['--profile <name>', 'Preview a profile (cli/library/standard/…) without running init first'],
     ],
-    examples: ['docguard agent', 'docguard agent --format json', 'docguard agent --profile cli --format json'],
+    examples: ['docguard agent', 'docguard agent --task "Fix SEC001 in src/config.mjs"', 'docguard agent --task "Implement acme.feature#FR-001" --format json'],
   },
   guard: {
     summary: 'Validate code against canonical docs (all validators).',
-    usage: 'docguard guard [--format json|sarif|junit] [--changed-only] [--fail-on-warning]',
+    usage: 'docguard guard [--format json|sarif|junit] [--changed-only]',
     flags: [
       ['--format json', 'Machine-readable results for CI (also: sarif, junit)'],
+      ['--compact', 'With --format json: each fact once (the form MCP returns by default); the default JSON is unchanged'],
       ['--changed-only', 'Only validate docs/code touched in the working tree'],
-      ['--fail-on-warning', 'Exit non-zero on warnings (strict CI)'],
       ['--update-baseline', 'Freeze current findings to .docguard.baseline.json — adopt on a legacy repo without a red day one'],
       ['--no-baseline', 'Ignore the committed baseline for this run (show everything)'],
     ],
@@ -242,10 +266,12 @@ const COMMAND_HELP = {
   },
   sync: {
     summary: 'Refresh code-truth doc sections (preview by default). `--tests` reconciles the TEST-SPEC Source-to-Test Map from disk.',
-    usage: 'docguard sync [--write] [--since <ref>] [--tests]',
+    usage: 'docguard sync [--write] [--since <ref>] [--tests] [--force] [--allow-partial]',
     flags: [
       ['--write', 'Apply the refresh (default is a dry-run preview)'],
       ['--since <ref>', 'Only sync sections whose source files changed since <ref>'],
+      ['--force', 'Also sync docs not marked docguard:generated'],
+      ['--allow-partial', 'Write a section drawn from incomplete evidence (e.g. a module graph without a Python interpreter)'],
       ['--tests', 'Reconcile the TEST-SPEC Source-to-Test Map: drop ghost-source rows, append newly-covered source↔test pairs (report ghost tests). Pair with --write to apply.'],
     ],
     examples: ['docguard sync', 'docguard sync --write', 'docguard sync --tests', 'docguard sync --tests --write'],
@@ -263,21 +289,31 @@ const COMMAND_HELP = {
   },
   trace: {
     summary: 'Requirements traceability matrix.',
-    usage: 'docguard trace [--reverse] [--features]',
-    flags: [['--reverse', 'Code→doc map instead of doc→code']],
-    examples: ['docguard trace', 'docguard trace --reverse'],
+    usage: 'docguard trace [--reverse <path>] [--features] [--owners [--suggest]] | docguard trace --matrix [--format csv|reqif|json] [--spec <id>] [--out <path>]',
+    flags: [
+      ['--matrix', 'Export every requirement → anchor → test path (CSV by default, or --format reqif|json)'],
+      ['--out <path>', 'With --matrix: write the export to this file instead of stdout (also --output)'],
+      ['--spec <id>', 'With --matrix: only this Spec ID\'s requirements'],
+      ['--reverse', 'Code→doc map instead of doc→code (the declared owner first, when an ownership map exists)'],
+      ['--owners', 'The ownership map: files per entry, unowned directories, ties'],
+      ['--owners --suggest', 'Print a draft ownership block from the source layout; never writes'],
+    ],
+    examples: ['docguard trace', 'docguard trace --reverse', 'docguard trace --matrix --format reqif --out trace.reqif'],
   },
   upgrade: {
-    summary: 'Migrate .docguard.json schema + CLI.',
-    usage: 'docguard upgrade [--apply] [--pr]',
+    // docguard.output-ux#FR-006: two jobs, both named.
+    summary: 'Check npm for a newer DocGuard release and the project\'s .docguard.json schema; --apply installs the release globally (npm install -g) and migrates the schema.',
+    usage: 'docguard upgrade [--check-only] [--apply [--schema-only] [--pr]]',
     flags: [
-      ['--apply', 'Write the migration (default is a preview)'],
-      ['--pr', 'Open a team-wide PR with the migration'],
+      ['--apply', 'Act on what is behind: npm install -g docguard-cli@latest when npm has a newer release, and migrate .docguard.json (default is a report)'],
+      ['--schema-only', 'Migrate .docguard.json only: no npm check, no install'],
+      ['--check-only', 'Report, and exit 1 when the CLI or the schema is behind (CI)'],
+      ['--pr', 'With --apply: open a team-wide PR with the schema migration'],
     ],
-    examples: ['docguard upgrade', 'docguard upgrade --apply'],
+    examples: ['docguard upgrade', 'docguard upgrade --apply --schema-only', 'docguard upgrade --apply'],
   },
   ci: {
-    summary: 'Generate CI / pipeline config.',
+    summary: 'Pipeline gate: guard + score in one command (exit 1 on errors, threshold or --fail-on-warning).',
     usage: 'docguard ci [--threshold <n>] [--fail-on-warning]',
     flags: [
       ['--threshold <n>', 'Minimum score for CI pass'],
@@ -287,25 +323,138 @@ const COMMAND_HELP = {
   },
   memory: {
     summary: 'Show what DocGuard remembers about the project.',
-    usage: 'docguard memory [--diff]',
-    flags: [['--diff', 'Drill into drift between memory and code']],
-    examples: ['docguard memory', 'docguard memory --diff'],
+    usage: 'docguard memory [--diff] | docguard memory --pack [--stdout] [--symbols]',
+    flags: [
+      ['--diff', 'Drill into drift between memory and code'],
+      ['--pack', 'Write .docguard/context-pack.md, a session-start snapshot for an agent'],
+      ['--stdout', 'With --pack: print the pack instead of writing it'],
+      ['--symbols', 'With --pack: add a symbol map (the most central files and their exported names, within memory.symbolMap.maxBytes). Opt-in: the agent-context benchmark found no benefit'],
+    ],
+    examples: ['docguard memory', 'docguard memory --diff', 'docguard memory --pack --symbols'],
   },
   feedback: {
-    summary: 'Report likely false positives back to DocGuard. Collects the low-confidence findings of a guard run, saves a full local record under .docguard/feedback/, and prints a one-click, prefilled, redacted GitHub issue URL (zero typing, no source code or secret values).',
-    usage: 'docguard feedback [--format json]',
-    flags: [['--format json', 'Machine-readable list of reportable findings + URLs']],
-    examples: ['docguard feedback'],
+    summary: 'Review detection feedback locally, or validate and reduce a synthetic fixture manifest. Duplicate searches cover open and closed work; nothing is submitted automatically.',
+    usage: 'docguard feedback [--code <CODE> | --all] [--classification <class>] [--fixture-manifest <path> [--reduce] [--contribution <path>]] [--preview] [--format json]',
+    flags: [['--code <CODE>', 'Select a finding regardless of confidence'], ['--all', 'Select every active finding'], ['--classification <class>', 'false_positive, false_negative, unsupported_syntax, ambiguous, or policy_disagreement'], ['--fixture-manifest <path>', 'Validate a reviewed synthetic fixture and opposite control'], ['--reduce', 'Deterministically reduce a reproducing fixture'], ['--contribution <path>', 'Write a test-only contribution when required evidence is present'], ['--preview', 'Skip local writes and return contribution text inline'], ['--format json', 'Machine-readable evidence and issue/search URLs']],
+    examples: ['docguard feedback', 'docguard feedback --code TRC005 --preview', 'docguard feedback --fixture-manifest feedback.json --reduce --preview --format json'],
   },
   verify: {
-    summary: 'Extract the semantic claims in your canonical docs — documented numbers, limits, and enums (retention days, rate limits, GSI/role counts, status enums) — as a verification task list the agent checks against the code. This is the highest-value bug class (a doc value that drifted from code) and the one regex/AST cannot judge. DocGuard finds the claims; the LLM confirms them.',
-    usage: 'docguard verify [--semantic|--instructions] [--format json]',
+    summary: 'Verify exact declared evidence, extract heuristic semantic claims, or audit agent instructions.',
+    usage: 'docguard verify [--evidence|--semantic|--instructions] [--format json]',
     flags: [
+      ['--evidence', 'Evaluate `.docguard-evidence.json` using local bounded JSON, collection, oasdiff, and Buf evidence'],
       ['--semantic', 'Extract documented numbers/limits/enums to verify against code (the current — and default — mode)'],
       ['--instructions', 'Audit AGENTS.md/CLAUDE.md for duplicate, contradictory, and stale-pointer rules (deterministic findings + agent conflict tasks)'],
       ['--format json', 'Machine-readable task list (the agent-executable artifact)'],
     ],
-    examples: ['docguard verify --semantic', 'docguard verify --semantic --format json'],
+    examples: ['docguard verify --evidence', 'docguard verify --evidence --format json', 'docguard verify --semantic --format json'],
+  },
+  retire: {
+    summary: 'Remove reviewed docs from active AI context while preserving recovery from a retained Git ref.',
+    usage: 'docguard retire [--plan|--check] | --write --path <document> [--path <document>...] --reason <text> [--superseded-by <document>] [--evidence <document>...] [--retention-ref <ref>]',
+    flags: [
+      ['--plan', 'Read-only lifecycle candidate inventory (default behavior)'],
+      ['--check', 'Exit 2 when high-confidence lifecycle candidates remain'],
+      ['--fail-on-warning', 'With --check: also gate low-confidence review candidates'],
+      ['--write', 'Retire only the explicitly selected clean tracked documents'],
+      ['--path <path>', 'Documentation file or document-only directory; repeatable'],
+      ['--reason <text>', 'Required explanation recorded in the archive manifest'],
+      ['--superseded-by <path>', 'Current document that replaces the archived material'],
+      ['--evidence <path>', 'Clean current document that contains the consolidated outcome; repeatable'],
+      ['--retention-ref <ref>', 'Branch ref that must retain the source revision'],
+      ['--format json', 'Machine-readable plan or result'],
+    ],
+    examples: ['docguard retire --plan', 'docguard retire --check --format json', 'docguard retire --write --path specs/001-done --reason "Implemented in v1.2"'],
+  },
+  specs: {
+    summary: 'Maintain the deterministic spec lifecycle and evidence registry.',
+    usage: 'docguard specs [--check|--write] | docguard specs preflight [--path <spec>] | docguard specs approve --id <spec-id> [--delivery <state>] [--write] | docguard specs complete --id <spec-id> [--since <ref>] [--write --reason <text>] | docguard specs require --since <ref> [--message-file <path>] | docguard specs reanchor --id <spec-id> [--from <revision>] [--to <revision>] [--write --reason <text>]',
+    flags: [
+      ['--check', 'Exit 2 when the committed registry is missing, stale, or inconsistent; planned lifecycle deferral requires a clean tracked registry'],
+      ['--write', 'Refresh observed evidence while preserving reviewed lifecycle fields'],
+      ['preflight', 'Brief prior specs, or gate a generated draft with --path'],
+      ['approve', 'Record a person\'s approval of a spec, and with --delivery its planned, in_progress or implemented state'],
+      ['complete', 'Plan or apply the implemented→verified evidence transaction'],
+      ['require', 'Spec-first gate: a change to governed paths must name its spec or declare Spec-Exempt (exit 1 uncovered, 2 inconclusive)'],
+      ['reanchor', 'Move recorded revisions a squash merge discarded (SPR008) to a commit on HEAD\'s history with byte-identical evidence'],
+      ['--to <revision>', 'With reanchor: target commit (a SHA, branch, tag or HEAD; the full SHA is recorded); required, with --reason, when the old revision no longer resolves'],
+      ['--from <revision>', 'With reanchor --to: move only this recorded revision, when a spec\'s dangling revisions came from different merges'],
+      ['--message-file <path>', 'With require: PR description or extra text to search for spec references'],
+      ['--id <spec-id>', 'Immutable spec identity to approve, complete or re-anchor'],
+      ['--delivery <state>', 'With approve: planned, in_progress or implemented (verified is recorded by complete)'],
+      ['--since <ref>', 'Reconciliation baseline: required when none is recorded; otherwise an older ref widens the review, and a newer one is accepted only when the recorded range exceeds the diff budgets even read in batches, and is recorded as narrowedFrom'],
+      ['--reason <text>', 'Reviewed implementation outcome required for completion writes'],
+      ['--deviation <text>', 'Accepted deviation to record; repeatable'],
+      ['--successor <id>', 'Approved current successor spec to record'],
+      ['--path <spec>', 'Generated spec to compare against current lifecycle state'],
+      ['--format json', 'Machine-readable registry or preflight result'],
+    ],
+    examples: ['docguard specs --check', 'docguard specs --write', 'docguard specs preflight --path specs/007-feature/spec.md', 'docguard specs approve --id acme.feature --delivery implemented --write', 'docguard specs require --since origin/main --message-file pr-body.txt', 'docguard specs complete --id acme.feature --since main --write --reason "Reviewed implementation"', 'docguard specs reanchor --id acme.feature --write'],
+  },
+  anchors: {
+    summary: 'List every code→requirement link, the symbol, statement, route or file it anchors to, and the tier that resolved it.',
+    usage: 'docguard anchors [--spec <id>] [--state <state>] [--file <path>] [--format json] [--no-cache] | docguard anchors --orphans [--spec <id>] [--file <path>] [--format json] | docguard anchors accept (--link <key> | --spec <id> | --file <path>) --reason <text> [--bulk] [--gitattributes] | docguard anchors accept --baseline --bulk --reason <text> | docguard anchors accept --remove <key> --reason <text> | docguard anchors disposition (--symbol <file>#<name> | --file <path> --bulk) --kind derived|dead|infrastructure --reason <text> | docguard anchors disposition --remove <file>#<name> --reason <text>',
+    flags: [
+      ['accept', 'Record a review of the selected links in .docguard-anchor-lock.jsonl, bound to the fingerprints it saw'],
+      ['disposition', 'Record why an untagged symbol implements no requirement: --kind derived, dead or infrastructure'],
+      ['--orphans', 'List the exported or top-level symbols under the governed paths that no tag anchors'],
+      ['--symbol <file>#<name>', 'With disposition: the one untagged symbol'],
+      ['--kind <kind>', 'With disposition: derived (an unwritten requirement), dead, or infrastructure'],
+      ['--spec <id>', 'Only links to this Spec ID (with accept: select them)'],
+      ['--file <path>', 'Only links in this file (with accept: select them)'],
+      ['--link <key>', 'With accept: the one link to accept'],
+      ['--state <state>', 'Only links in this state: unreviewed, baselined, reviewed, suspect, lost, retired-target, unverifiable'],
+      ['--reason <text>', 'With accept: what you checked (10-500 characters)'],
+      ['--bulk', 'With accept: confirm a selection of more than one link'],
+      ['--baseline', 'With accept --bulk: stamp every unreviewed link as baselined (adoption), never as reviewed'],
+      ['--remove <key>', 'With accept: delete a lock entry, such as a lost link; with disposition: <file>#<name>'],
+      ['--gitattributes', 'With accept: also add the lock\'s merge=union line to .gitattributes'],
+      ['--no-cache', 'Ignore the per-file extraction cache in .docguard/'],
+      ['--format json', 'Machine-readable output'],
+    ],
+    examples: ['docguard anchors', 'docguard anchors --state suspect --format json', 'docguard anchors accept --baseline --bulk --gitattributes --reason "adopt requirement anchors"', "docguard anchors accept --link 'acme.billing#FR-003|src/pricing.mjs|applyDiscount|symbol' --reason \"rounding fix keeps FR-003\""],
+  },
+  review: {
+    summary: 'Track which code each doc section describes, and review a section when that code changes.',
+    usage: 'docguard review [--format json] | docguard review --accept <doc>#<section>|<doc> --reason <text> | docguard review --prune | docguard review --suggest <doc>',
+    flags: [
+      ['--accept <doc>#<id>', 'Record a review: fingerprint the section\'s covers= dependencies at HEAD (requires --reason)'],
+      ['--reason <text>', 'With --accept: what you checked (8-500 characters)'],
+      ['--prune', 'Remove lock entries whose section no longer declares covers='],
+      ['--suggest <doc>', 'Propose covers= values from paths the doc already mentions (low confidence; never writes)'],
+      ['--format json', 'Machine-readable status'],
+    ],
+    examples: ['docguard review', 'docguard review --accept docs-canonical/ARCHITECTURE.md#as-built --reason "Checked against checkAsBuiltSync"', 'docguard review --suggest docs-canonical/ARCHITECTURE.md'],
+  },
+  rules: {
+    summary: 'Which agent instruction files each harness loads for a path, why, and how many bytes.',
+    usage: 'docguard rules --for <path> [--harness <name>] [--format json]',
+    flags: [
+      ['--for <path>', 'Project-relative path to resolve (it need not exist)'],
+      ['--harness <name>', 'Only one harness: codex, claude, cursor, copilot, openhands'],
+      ['--format json', 'Machine-readable listing'],
+    ],
+    examples: ['docguard rules --for src/api/users.ts', 'docguard rules --for src/api/users.ts --harness cursor --format json'],
+  },
+  ignore: {
+    summary: 'Every suppression in the project, with its reason, expiry, state and source. Writes nothing.',
+    usage: 'docguard ignore [--format json|claimspec]',
+    flags: [
+      ['--format json', 'The suppression model plus the claimspec export report'],
+      ['--format claimspec', 'A claimspec v1 ignore document on stdout (reasoned .docguardignore entries only); what it leaves out goes to stderr'],
+    ],
+    examples: ['docguard ignore', 'docguard ignore --format claimspec > ignore.claimspec.json'],
+  },
+  reconcile: {
+    summary: 'Classify changed implementation facts, approved intent, decisions, and unsupported evidence.',
+    usage: 'docguard reconcile --since <ref> [--check|--write] [--format json]',
+    flags: [
+      ['--since <ref>', 'Required Git baseline for the review graph'],
+      ['--check', 'Exit 2 while reviewed reconciliation remains'],
+      ['--write', 'Apply only deterministic generated-section refreshes'],
+      ['--format json', 'Machine-readable nodes, edges, classifications, and write plan'],
+    ],
+    examples: ['docguard reconcile --since main --format json', 'docguard reconcile --since HEAD~1 --write'],
   },
 };
 
@@ -336,6 +485,7 @@ async function main() {
   // Parse flags
   const flags = {
     dir: '.',
+    dirExplicit: false,
     verbose: false,
     format: 'text',
     fix: false,
@@ -346,6 +496,7 @@ async function main() {
   for (let i = 1; i < args.length; i++) {
     if (args[i] === '--dir' && args[i + 1]) {
       flags.dir = args[i + 1];
+      flags.dirExplicit = true;
       i++;
     } else if (args[i] === '--verbose') {
       flags.verbose = true;
@@ -356,6 +507,8 @@ async function main() {
       flags.fix = true;
     } else if (args[i] === '--force') {
       flags.force = true;
+    } else if (args[i] === '--allow-partial') {
+      flags.allowPartial = true;
     } else if (args[i] === '--agent' && args[i + 1]) {
       flags.agent = args[i + 1];
       i++;
@@ -364,7 +517,7 @@ async function main() {
       i++;
     } else if (args[i] === '--list') {
       flags.list = true;
-    } else if (args[i] === '--remove') {
+    } else if (args[i] === '--remove' && command !== 'anchors') {
       flags.remove = true;
     } else if (args[i] === '--threshold' && args[i + 1]) {
       flags.threshold = args[i + 1];
@@ -383,6 +536,8 @@ async function main() {
       // v0.28 (field report #5): `docguard verify --semantic` extracts
       // documented numbers/enums/limits for the agent to check against code.
       flags.semantic = true;
+    } else if (args[i] === '--evidence') {
+      flags.evidence = true;
     } else if (args[i] === '--instructions') {
       // v0.30: `docguard verify --instructions` audits AGENTS.md/CLAUDE.md for
       // duplicate/contradictory/stale rules (MemoryLint-inspired).
@@ -415,10 +570,20 @@ async function main() {
       flags.checkOnly = true;
     } else if (args[i] === '--apply') {
       flags.apply = true;
+    } else if (args[i] === '--schema-only') {
+      flags.schemaOnly = true;
     } else if (args[i] === '--changed-only') {
       flags.changedOnly = true;
     } else if (args[i] === '--reverse') {
       flags.reverse = true;
+    } else if (args[i] === '--compact') {
+      flags.compact = true;
+    } else if (args[i] === '--symbols') {
+      flags.symbols = true;
+    } else if (args[i] === '--owners') {
+      flags.owners = true;
+    } else if (args[i] === '--suggest' && command === 'trace') {
+      flags.suggest = true;
     } else if (args[i] === '--features') {
       // v0.30: `docguard trace --features` — per-feature spec-adherence report.
       flags.features = true;
@@ -445,14 +610,14 @@ async function main() {
       flags.out = args[i + 1];
       i++;
     } else if (args[i] === '--quiet' || args[i] === '-q') {
-      // v0.16-P5: suppress the banner + ensureSkills decorative line.
+      // v0.16-P5: suppress the banner.
       // Useful inside git hooks (every commit prints the banner otherwise)
       // and any CI/script that pipes docguard's output.
       flags.quiet = true;
     } else if (args[i] === '--no-spec-kit') {
       // v0.16-P8: opt-out of automatic Spec Kit init during `docguard init`.
-      // Default stays on (discoverability), but lets minimalist library
-      // projects skip the .specify/.agent/commands scaffolding.
+      // Skips Spec Kit only (no `specify` call, no .specify/); DocGuard's own
+      // agent skills still install (docguard.spec-kit-integration-honesty#FR-007).
       flags.noSpecKit = true;
     } else if (args[i] === '--spec-kit') {
       // v0.24: explicit opt-IN to the Spec Kit framework scaffold. The
@@ -489,6 +654,12 @@ async function main() {
       // v0.21: `docguard demo --keep` doesn't delete the temp fixture after
       // running (useful for poking around what DocGuard set up).
       flags.keep = true;
+    } else if (args[i] === '--for' && args[i + 1]) {
+      flags.for = args[++i];
+    } else if (args[i] === '--harness' && args[i + 1]) {
+      flags.harness = args[++i];
+    } else if (args[i] === '--task') {
+      flags.task = args[i + 1] && !args[i + 1].startsWith('--') ? args[++i] : '';
     } else if (!args[i].startsWith('--') && i > 0) {
       // Positional args go into flags.args for commands that take them (e.g.
       // `docguard trace --reverse <path>`). Skip the command itself (i === 0).
@@ -533,9 +704,119 @@ async function main() {
     } else if (args[i] === '--api-key' && args[i + 1]) {
       flags.apiKey = args[i + 1];
       i++;
+    } else if (args[i] === '--root' && args[i + 1]) {
+      // mcp: another directory tree tool calls may target with projectDir
+      // (repeatable). The served directory is always one
+      // @implements docguard.mcp-project-confinement#FR-005 {scope=statement}
+      flags.roots = flags.roots || [];
+      flags.roots.push(args[i + 1]);
+      i++;
+    } else if (args[i] === '--message-file' && args[i + 1]) {
+      // `specs require`: pull-request description or commit text, read from a
+      // file so CI never interpolates an untrusted body into a shell command.
+      flags.messageFile = args[i + 1];
+      i++;
     } else if (args[i] === '--path' && args[i + 1]) {
-      // mcp --transport http: HTTP mount path (default /mcp).
-      flags.path = args[i + 1];
+      if (command === 'retire' || command === 'archive') {
+        flags.paths = flags.paths || [];
+        flags.paths.push(args[i + 1]);
+      } else {
+        // mcp --transport http: HTTP mount path (default /mcp).
+        flags.path = args[i + 1];
+      }
+      i++;
+    } else if (args[i] === '--accept' && args[i + 1] && command === 'review') {
+      flags.accept = args[i + 1];
+      i++;
+    } else if (args[i] === '--suggest' && command === 'review') {
+      // docguard.output-ux#FR-012: `--suggest` with no document is a usage
+      // error, not a silent fall-through to the status view.
+      if (args[i + 1] && !args[i + 1].startsWith('--')) { flags.suggest = args[i + 1]; i++; }
+      else flags.suggest = true;
+    } else if (args[i] === '--prune' && command === 'review') {
+      flags.prune = true;
+    } else if (args[i] === '--spec' && args[i + 1] && command === 'anchors') {
+      flags.spec = args[++i];
+    } else if (args[i] === '--file' && args[i + 1] && command === 'anchors') {
+      flags.file = args[++i];
+    } else if (args[i] === '--state' && args[i + 1] && command === 'anchors') {
+      flags.state = args[++i];
+    } else if (args[i] === '--no-cache' && command === 'anchors') {
+      flags.noCache = true;
+    } else if (args[i] === '--link' && args[i + 1] && command === 'anchors') {
+      flags.link = args[++i];
+    } else if (args[i] === '--remove' && args[i + 1] && command === 'anchors') {
+      flags.remove = args[++i];
+    } else if (args[i] === '--bulk' && command === 'anchors') {
+      flags.bulk = true;
+    } else if (args[i] === '--baseline' && command === 'anchors') {
+      flags.baseline = true;
+    } else if (args[i] === '--gitattributes' && command === 'anchors') {
+      flags.gitattributes = true;
+    } else if (args[i] === '--matrix' && command === 'trace') {
+      flags.matrix = true;
+    } else if (args[i] === '--output' && args[i + 1] && command === 'trace') {
+      flags.out = args[++i];
+    } else if (args[i] === '--spec' && args[i + 1] && command === 'trace') {
+      flags.spec = args[++i];
+    } else if (args[i] === '--orphans' && command === 'anchors') {
+      flags.orphans = true;
+    } else if (args[i] === '--symbol' && args[i + 1] && command === 'anchors') {
+      flags.symbol = args[++i];
+    } else if (args[i] === '--kind' && args[i + 1] && command === 'anchors') {
+      flags.kind = args[++i];
+    } else if (args[i] === '--from' && args[i + 1] && command === 'specs') {
+      flags.from = args[++i];
+    } else if (args[i] === '--to' && args[i + 1] && command === 'specs') {
+      // `specs reanchor --to <revision>` (docguard.completion-revision-anchoring#FR-003)
+      flags.to = args[i + 1];
+      i++;
+    } else if (args[i] === '--reason' && args[i + 1]) {
+      flags.reason = args[i + 1];
+      i++;
+    } else if (args[i] === '--superseded-by' && args[i + 1]) {
+      flags.supersededBy = args[i + 1];
+      i++;
+    } else if (args[i] === '--evidence' && args[i + 1]) {
+      flags.evidencePaths = flags.evidencePaths || [];
+      flags.evidencePaths.push(args[i + 1]);
+      i++;
+    } else if (args[i] === '--retention-ref' && args[i + 1]) {
+      flags.retentionRef = args[i + 1];
+      i++;
+    } else if (args[i] === '--spec' && args[i + 1] && command === 'generate') {
+      // `generate --spec <area>`: as-built spec for one code area.
+      flags.spec = args[i + 1];
+      i++;
+    } else if (args[i] === '--delivery' && args[i + 1] && command === 'specs') {
+      // `specs approve --delivery <state>` (docguard.first-spec-preflight#FR-005)
+      flags.delivery = args[++i];
+    } else if (args[i] === '--id' && args[i + 1]) {
+      flags.id = args[i + 1];
+      i++;
+    } else if (args[i] === '--deviation' && args[i + 1]) {
+      flags.deviations = flags.deviations || [];
+      flags.deviations.push(args[i + 1]);
+      i++;
+    } else if (args[i] === '--successor' && args[i + 1]) {
+      flags.successor = args[i + 1];
+      i++;
+    } else if (args[i] === '--code') {
+      flags.code = args[i + 1] && !args[i + 1].startsWith('--') ? args[++i] : '';
+    } else if (args[i] === '--all') {
+      flags.all = true;
+    } else if (args[i] === '--preview') {
+      flags.preview = true;
+    } else if (args[i] === '--classification' && args[i + 1]) {
+      flags.classification = args[i + 1].replaceAll('-', '_');
+      i++;
+    } else if (args[i] === '--fixture-manifest' && args[i + 1]) {
+      flags.fixtureManifest = args[i + 1];
+      i++;
+    } else if (args[i] === '--reduce') {
+      flags.reduce = true;
+    } else if (args[i] === '--contribution' && args[i + 1]) {
+      flags.contribution = args[i + 1];
       i++;
     } else if (args[i] === '--signals') {
       flags.signals = true;
@@ -571,20 +852,26 @@ async function main() {
     process.exit(0);
   }
 
-  // In JSON mode the entire stdout MUST be parseable JSON. The banner and
-  // ensureSkills' install message would corrupt the output for any
+  // `trace --matrix` exports CSV unless asked for ReqIF or JSON
+  // (docguard.requirement-anchors#FR-037); the export is the whole of stdout.
+  if (command === 'trace' && flags.matrix && !args.includes('--format')) flags.format = 'csv';
+
+  // In JSON mode the entire stdout MUST be parseable JSON. The banner would
+  // corrupt the output for any
   // programmatic consumer (CI, dashboards, the Score-on-PR Action recipe).
   // Headless flags (`--write`, `--check-only`, `--auto`) also suppress chrome.
   // v0.16-P5: --quiet (-q) joins the headless club for users who want
   // banner-free output without committing to a specific machine format.
   // v0.24 (field report): `--plan` is a read-only preview — "show me, don't
-  // touch" — so it joins the club to suppress the banner AND ensureSkills'
-  // .agent/.specify writes, which were a surprising side effect of a bare
-  // `generate --plan` (and were already suppressed for `--plan --write`).
+  // touch" — so it joins the club. (Skill installation no longer depends on
+  // this flag: only init installs skills; see the scaffolding rule below.)
   // v0.29: 'sarif' joins 'json' — any machine format where stdout IS the
   // artifact belongs here, or the banner corrupts the payload.
   // v0.33: 'junit' joins for the same reason (GitLab/Jenkins parse stdout XML).
-  const jsonMode = flags.format === 'json' || flags.format === 'sarif' || flags.format === 'junit';
+  // 'claimspec' (docguard ignore): stdout IS the claimspec document.
+  // 'csv' and 'reqif' (`trace --matrix`): stdout IS the exported matrix.
+  const jsonMode = flags.format === 'json' || flags.format === 'sarif' || flags.format === 'junit' || flags.format === 'claimspec'
+    || flags.format === 'csv' || flags.format === 'reqif';
   // `agent` emits a machine task graph (JSON by default) — it must be banner-
   // free and side-effect-free like the other read-only commands.
   // `mcp`: stdout IS the JSON-RPC transport — any banner byte corrupts the stream.
@@ -592,68 +879,50 @@ async function main() {
   // byte corrupts the JSON the hook runner parses.
   // `report`: stdout IS the evidence artifact (markdown or JSON) — banner
   // bytes would corrupt it for redirection/piping in both formats.
-  const headless = jsonMode || flags.write || flags.checkOnly || flags.changedOnly || flags.quiet || flags.plan || command === 'agent' || command === 'mcp' || command === 'nudge-hook' || command === 'report';
+  // `--stdout` (memory --pack, llms): stdout IS the artifact, so no banner
+  // (docguard.output-ux#FR-001).
+  const headless = jsonMode || flags.stdout || flags.write || flags.checkOnly || flags.changedOnly || flags.quiet || flags.plan || command === 'agent' || command === 'mcp' || command === 'nudge-hook' || command === 'report';
 
   if (!headless) printBanner();
 
+  const rootGuidance = detectRepositoryRootGuidance(projectDir, {
+    explicitDir: flags.dirExplicit,
+    argv: args,
+  });
+  if (rootGuidance) {
+    process.stderr.write(renderRepositoryRootGuidance(rootGuidance, { machine: jsonMode }) + '\n');
+  }
   const config = loadConfig(projectDir);
+  // Init and diagnose --auto can scaffold several unrelated files and retain
+  // their legacy default-layout contract. Generate, sync, and fix perform their
+  // own target/section authorization so mapped layouts can use bounded writers.
+  // `init` is deliberately absent: it configures a mapped layout and scaffolds
+  // only the roles the mapping has not placed, so it never generates into a mapped
+  // document. `setup` and `diagnose --auto` do generate and repair whole documents.
+  if (command === 'setup' || command === 'diagnose' && flags.auto) assertDefaultDocWrites(config);
 
   // `--no-baseline` disables the committed adoption baseline for this run —
   // threaded through config so guard, ci, report, and mcp all honor it the
   // same way runGuardInternal sees everything else.
   if (flags.noBaseline) config.baseline = false;
 
-  // Commands that only READ and REPORT — they must never mutate the working
-  // tree. Scaffolding (ensureSkills → .agent/.specify, spawning `specify`)
-  // belongs to setup/init/generate and the `init --with` family, where the
-  // user is establishing or expanding their setup, not auditing it.
-  //
-  // v0.26 (field report Bug #3): a bare `docguard guard` used to run
-  // ensureSkills → auto-init Spec Kit → spawn `specify` and write ~9 files into
-  // the tree BEFORE printing results. Surprising for a *validate* command, and
-  // fatal for a read-only CI audit or a clean-tree precondition check. These
-  // commands are now exempt regardless of flags. (`audit` is the guard alias;
-  // `diff`/`impact` only read; `demo` runs against a throwaway fixture.)
-  const READ_ONLY_COMMANDS = new Set([
-    'guard', 'audit', 'score', 'diff', 'impact',
-    'diagnose', 'trace', 'explain', 'memory', 'demo', 'agent',
-    // feedback only writes its own .docguard/feedback/ — it must NOT scaffold
-    // skills or touch source, so it's gated out of ensureSkills like the rest.
-    'feedback',
-    // verify only reads docs and emits a task list — pure report.
-    'verify',
-    // report gathers evidence (guard+score, read-only); --out writes only the
-    // user-named file — it must never scaffold or mutate the tree otherwise.
-    'report',
-    // ci is the pipeline gate — it must never scaffold into the workspace it
-    // gates (review finding H1: bare `docguard ci` in text mode ran
-    // ensureSkills and wrote ~9 files before gating). Its only write is its
-    // own .docguard/history.jsonl, same carve-out as feedback.
-    'ci',
-    // mcp serves read-only tools over stdio — scaffolding writes are off-limits.
-    'mcp',
-    // nudge-hook runs inside an agent's PostToolUse hook — it may write only
-    // its own .docguard/nudge-state.json throttle file, never scaffold skills.
-    'nudge-hook',
-  ]);
+  // Scaffolding rule (docguard.read-only-commands#FR-001): only `init`, and the
+  // aliases that run it (setup, agents, hooks, badge, llms, publish), may install
+  // DocGuard's agent skills and slash commands. runInit calls ensureSkills
+  // itself; the dispatcher never does. Every other command, in
+  // every mode, writes only the outputs it documents. The v0.26 deny-list of
+  // read-only commands that gated a dispatcher-wide install here failed open:
+  // `rules`, `reconcile`, `upgrade`, `watch`, the `generate --spec` and `sync`
+  // previews, and even an unknown command name scaffolded ~17 files.
+  // @implements docguard.read-only-commands#FR-001 {scope=file}
+  // @implements docguard.read-only-commands#FR-002 {scope=file}
+  // @implements docguard.read-only-commands#FR-003 {scope=file}
+  // @implements docguard.read-only-commands#FR-004 {scope=file}
 
-  // Silent auto-check: install skills/commands if missing. Skip entirely in
-  // headless modes (deterministic, parseable output; no side effects expected)
-  // and for read-only commands (see above).
-  if (
-    command !== 'setup' &&
-    command !== 'init' &&
-    !READ_ONLY_COMMANDS.has(command) &&
-    !headless
-  ) {
-    ensureSkills(projectDir, flags);
-  }
-
-  // v0.20: deprecation aliases. The legacy command keeps working through v0.20
+  // v0.20: deprecation aliases. The legacy command keeps working until v1.0
   // and emits a yellow stderr warning suggesting the new shape. Quiet mode
   // (e.g. inside hooks) suppresses the warning so CI output stays clean.
-  // The full deprecation timeline is in docs-implementation/MIGRATION-v0.20.md.
-  const DEPRECATED_COMMANDS = {
+  const DEPRECATED_COMMANDS = { __proto__: null,
     setup:   { since: '0.20', replacement: 'docguard init --wizard' },
     agents:  { since: '0.20', replacement: 'docguard init --with agents' },
     hooks:   { since: '0.20', replacement: 'docguard init --with hooks' },
@@ -668,7 +937,7 @@ async function main() {
   // v0.20: dropped aliases — the 10 cute variants the audit identified.
   // `audit` is intentionally NOT here; it remains a permanent silent alias
   // for `guard` (per SURFACE-AUDIT §8.1 — older CI scripts depend on it).
-  const DROPPED_ALIASES = {
+  const DROPPED_ALIASES = { __proto__: null,
     onboard:        'setup (deprecated) — try `docguard init --wizard`',
     gen:            'generate',
     badges:         'badge (deprecated) — try `docguard init --with badge`',
@@ -684,7 +953,7 @@ async function main() {
   if (DROPPED_ALIASES[command]) {
     console.error(`${c.red}Unknown command: ${command}${c.reset}`);
     console.error(`${c.yellow}Hint: this alias was removed in v0.20. Try ${c.cyan}docguard ${DROPPED_ALIASES[command]}${c.yellow}.${c.reset}`);
-    console.error(`${c.dim}See docs-implementation/MIGRATION-v0.20.md for the full list.${c.reset}`);
+    console.error(`${c.dim}Use the replacement shown above; removed aliases are not restored.${c.reset}`);
     process.exit(1);
   }
 
@@ -693,7 +962,7 @@ async function main() {
   if (DEPRECATED_COMMANDS[command] && !flags.quiet && !(command === 'hooks' && flags.claude)) {
     const { since, replacement } = DEPRECATED_COMMANDS[command];
     console.error(`${c.yellow}⚠ Deprecated since v${since}:${c.reset} ${c.cyan}docguard ${command}${c.reset} → use ${c.cyan}${replacement}${c.reset}`);
-    console.error(`${c.dim}  The old form still works in v0.20.x but will be removed in v1.0. See MIGRATION-v0.20.md.${c.reset}`);
+    console.error(`${c.dim}  The old form remains compatible until v1.0.${c.reset}`);
   }
 
   switch (command) {
@@ -725,8 +994,10 @@ async function main() {
       }
       break;
     case 'agents':
-      // v0.20: deprecated → dispatches through init --with
-      await runInit(projectDir, config, { ...flags, with: ['agents'], skipPrompts: true });
+      // A staleness check or a sync must bypass init's scaffolding, skill
+      // installation and Spec Kit step (docguard.docs-verification-findings#FR-003).
+      if (flags.check || flags.sync) runAgents(projectDir, config, flags);
+      else await runInit(projectDir, config, { ...flags, with: ['agents'], skipPrompts: true });
       break;
     case 'generate':
       runGenerate(projectDir, config, flags);
@@ -734,11 +1005,13 @@ async function main() {
     case 'agent':
       // v0.26 (field report §2): one-shot, dependency-ordered task graph with
       // pre-filled code-truth + per-task verify. Read-only; JSON by default.
+      // @implements docguard.task-specific-agent-context#FR-010 {scope=statement}
       runAgent(projectDir, config, flags);
       break;
     case 'hooks':
-      if (flags.claude) {
-        // Agent nudge hook (.claude/settings.json) — direct path, no wizard.
+      if (flags.claude || flags.list) {
+        // Agent nudge and read-only inventory paths bypass the setup wizard.
+        // Listing hooks must not refresh unrelated skills in the repository.
         runHooks(projectDir, config, flags);
         break;
       }
@@ -818,6 +1091,32 @@ async function main() {
       break;
     case 'memory':
       runMemory(projectDir, config, flags);
+      break;
+    case 'retire':
+    case 'archive': // Development alias; `retire` avoids collision with Spec Kit Archive.
+      runArchive(projectDir, config, flags);
+      break;
+    case 'specs':
+      runSpecs(projectDir, config, flags);
+      break;
+    case 'reconcile':
+      runReconcile(projectDir, config, flags);
+      break;
+    case 'review':
+      // docguard.doc-dependency-lock#FR-005: the doc lock's only writer.
+      runReview(projectDir, config, flags);
+      break;
+    case 'anchors':
+      // docguard.requirement-anchors#FR-021: read-only listing.
+      runAnchors(projectDir, config, flags);
+      break;
+    case 'rules':
+      // docguard.path-scoped-rules#FR-005: read-only.
+      runRules(projectDir, config, flags);
+      break;
+    case 'ignore':
+      // docguard.ignore-reasons#FR-007, FR-008: read-only.
+      runIgnore(projectDir, config, flags);
       break;
     case 'demo':
       // v0.21: zero-install "ah-ha" moment — runs guard against a baked-in

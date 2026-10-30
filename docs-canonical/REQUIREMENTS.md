@@ -1,69 +1,73 @@
 # Requirements
 
-<!-- docguard:version 0.1.0 -->
-<!-- docguard:status draft -->
-<!-- docguard:last-reviewed 2026-07-03 -->
-
-> Tracks functional requirements, non-functional requirements, and success criteria.
-> Use requirement IDs (FR-001, NFR-001, SC-001) for traceability back to code and tests.
-
-![CDD Canonical](https://img.shields.io/badge/CDD-Canonical-blue)
+<!-- docguard:quality negation-load off — requirements define explicit failure and non-disclosure boundaries -->
+<!-- docguard:version 0.9.3 -->
+<!-- docguard:status active -->
+<!-- docguard:last-reviewed 2026-10-13 -->
 
 ## Functional Requirements
 
-<!-- List functional requirements with FR-NNN IDs -->
-
-| ID | Priority | Requirement | Status | Test Coverage |
-|----|----------|-------------|--------|---------------|
-| FR-001 | P1 | System MUST [capability] | 🔴 Draft | ❌ |
-| FR-002 | P1 | System MUST [capability] | 🔴 Draft | ❌ |
-| FR-003 | P2 | Users MUST be able to [interaction] | 🔴 Draft | ❌ |
+| ID | Priority | Requirement | Verification |
+|---|---|---|---|
+| FR-001 | P1 | Score distinguishes structural maturity from unverified factual accuracy, even when candidate extraction finds nothing. | tests/score-assurance.test.mjs |
+| FR-002 | P1 | Users can dispute any active finding, preview feedback, and prepare public metadata without sharing source-derived strings automatically. | tests/feedback-contributions.test.mjs |
+| FR-003 | P1 | CI, diagnose, and report preserve score assurance limits in machine output. Existing score thresholds keep their numeric meaning. | tests/score-assurance.test.mjs |
+| FR-004 | P1 | Detector quality is measured with independently labelled defect/control pairs, split-safe repository groups, explicit unsupported coverage, null-safe metrics, confidence limits, and case-first baseline comparison. | tests/benchmark-manifest.test.mjs, tests/benchmark-metrics.test.mjs, tests/benchmark-runner.test.mjs |
+| FR-005 | P1 | Users can turn a false positive, false negative, unsupported syntax case, ambiguity, or policy dispute into a redaction-attested synthetic fixture with an opposite control, deterministic reduction, duplicate search, and optional test-only contribution. | tests/feedback-fixture.test.mjs, tests/feedback-contributions.test.mjs |
+| FR-006 | P1 | Teams can bind an exact Markdown statement to safe, local, typed evidence and receive scoped verified, contradicted, stale, inconclusive, or unsupported results through verify, guard, and agent assurance without granting whole-document accuracy. Direct verification must fail CI on contradiction or invalid input and distinguish unresolved evidence with the warning exit status. | tests/evidence-manifest.test.mjs, tests/evidence-adapters.test.mjs, tests/evidence-integration.test.mjs |
+| FR-016 | P1 | A finding answers three independent questions in three fields: whether CI blocks (`severity`), who decides (`disposition`: act or escalate), and how well the code is measured (`evidence`), alongside the analyzer that produced it (`parserTier`). A certain observation is never labelled uncertain, and a suggestion with an unsupported kind is omitted rather than coerced. | tests/findings-channels.test.mjs, tests/calibrated-channels-acceptance.test.mjs |
+| FR-017 | P1 | Feedback selection covers every finding whose code is unmeasured or whose confidence is low, and discloses what it excludes, so the channel that validates a confidence label is never restricted to findings that label already doubts. | tests/feedback-sampling.test.mjs |
+| FR-018 | P1 | A reviewed disagreement is recorded as a corpus row with rationale, date and opposite control, counted per code and corpus-wide, and excluded from every precision and recall denominator. Removing one fails baseline comparison. | tests/adjudication-record.test.mjs |
+| FR-019 | P1 | The analyzer tier is computed at run time, carried on every finding, and a validator whose inputs fell back to pattern matching for an AST-capable language reports partial coverage naming the cause. Findings are retained; only coverage is downgraded. | tests/parser-tier.test.mjs |
+| FR-020 | P2 | A threshold derived from observed data is fitted against a strictly proper scoring rule; every hand-set threshold names that constraint. The badge reports coverage honestly and withholds its top grade from a run that could not check everything it was asked to. | tests/threshold-constraint.test.mjs, tests/coverage-headline.test.mjs |
+| FR-021 | P2 | A completed task naming a deliverable path that exists but that the feature never changed is reported as a review signal, distinct from a task whose deliverable is absent. | tests/untouched-claims.test.mjs |
+| FR-007 | P1 | An agent can request a deterministic bounded task-context packet that prioritizes exact current evidence, excludes retired and unsafe material, preserves retrieval-only assurance, and abstains rather than returning weak matches. Existing task-graph behavior remains compatible. | tests/task-context.test.mjs, tests/agent-context-benchmark.test.mjs |
+| FR-008 | P1 | The packed-package adoption journey distinguishes foreign hooks, composes one self-repairing managed block with user hook commands, emits complete remediation text, explains deterministic registry drift by field, follows proposed actions, and verifies the resulting state. | tests/adoption-workflow.test.mjs, tests/hooks.test.mjs, tests/hooks-contract.test.mjs, tests/spec-registry.test.mjs, tests/npm-pack-smoke.test.mjs |
+| FR-009 | P1 | Reconciliation keeps changed-path inventory independent from bounded patch text. A patch that overflows or times out in one read is read again in bounded batches of changed paths; coverage is partial, never a ready result, when a batch still exceeds a bound or Git fails. | tests/shared-git.test.mjs, tests/reconcile.test.mjs |
+| FR-010 | P1 | Instruction pointers resolve only safe exact paths or one unique basename; Git-ignored paths and nested Git checkouts are excluded from basename evidence, while ambiguity, symlinks, unsafe paths, and incomplete indexes remain explicit. | tests/instruction-audit.test.mjs |
+| FR-011 | P1 | Planned requirements defer test traceability only when committed, clean, digest-current schema-v2 lifecycle evidence proves they remain planned. A structurally current registry that is new, removed from the Git index, or modified pending commit remains non-authoritative and explains restore-or-commit remediation without recommending artificial test markers. | tests/traceability-lifecycle.test.mjs |
+| FR-012 | P1 | Exact finding-code policy can promote or demote one finding without weakening its validator, while intrinsic and effective severity remain visible in machine formats. | tests/severity.test.mjs, tests/sarif.test.mjs, tests/junit.test.mjs |
+| FR-013 | P1 | CI, diagnose, and report expose combined READY, ATTENTION, or BLOCKED assessment while standalone score remains structural maturity rather than a guard verdict. | tests/assessment.test.mjs |
+| FR-014 | P1 | Python collection-size evidence uses bounded non-executable static literal parsing and abstains on dynamic or ambiguous syntax. | tests/evidence-python-literal.test.mjs, tests/evidence-integration.test.mjs |
+| FR-015 | P1 | JavaScript route discovery excludes HTTP-client calls and non-product helpers before deduplication, and composes static Express mounts (literal or built from `const` strings) across imported routers; a route path or mount prefix that cannot be read is recorded as partial coverage, never reported at a placeholder or at the root. | tests/js-ast.test.mjs, tests/routes-express-mounts.test.mjs, tests/js-route-shapes.test.mjs |
+| FR-022 | P1 | API contract omissions remain review-only because negative route extraction cannot prove runtime absence or authorize deletion. | tests/api-authority-precision.test.mjs, tests/api-write.test.mjs, tests/doc-role-boundaries.test.mjs |
+| FR-023 | P1 | Field warning precision preserves historical prose, multiline skip reasons, test-fixture context, package-local capability counts, package-local env templates, authoritative OpenAPI selection, route-parameter equivalence, service boundaries, and runtime/schema parity. | tests/metrics-consistency.test.mjs, tests/todo-tracking.test.mjs, tests/field-context-precision.test.mjs, tests/environment.test.mjs, tests/docs-sync.test.mjs, tests/docguard-config-schema.test.mjs |
+| FR-024 | P1 | A repo-wide Git hook must not block a working tree that never adopted DocGuard: guard reports errors in a project without `.docguard.json` as exit 3 rather than 1, the installed hook skips such a tree and permits exit 3, and adopted projects stay gated. Overwriting a foreign hook requires explicit repeated `--force` and never silently discards its backup. Hooks are installed, replaced or removed only in a hooks folder the repository owns, never in a global, system, command-line or out-of-repository `core.hooksPath`. | tests/hook-fail-open.test.mjs, tests/hooks-contract.test.mjs, tests/hooks-repo-scope.test.mjs |
+| FR-025 | P2 | Metrics-Consistency compares a documented count with what ships (validators counted from `cli/validators/`), and reports one drifted value once per file and label, not once per occurrence. | tests/metrics-dedup.test.mjs |
 
 ## Non-Functional Requirements
 
-<!-- Quality attributes: performance, security, reliability -->
-
-| ID | Category | Requirement | Verified by |
-|----|----------|-------------|-------------|
-| NFR-001 | Security | CLI subprocess invocations are injection-safe — agent/config-derived values are allowlist-validated and passed via `execFileSync` (no shell interpolation of untrusted input) | `tests/security-init-injection.test.mjs` |
-| NFR-002 | Portability | The published package runs with **zero runtime dependencies** on Node.js ≥18 — the packaged tarball executes standalone | `tests/npm-pack-smoke.test.mjs` |
-| NFR-003 | Performance | Repeat `guard` runs reuse a cross-process plan cache that is invalidated on any working-tree change | `tests/plan-disk-cache.test.mjs` |
+| ID | Category | Requirement | Verification |
+|---|---|---|---|
+| NFR-001 | Security | Untrusted input passed to subprocesses uses argv-based invocation and validation appropriate to the command. | tests/security-init-injection.test.mjs |
+| NFR-002 | Portability | The distributed CLI runs on supported Node versions. Babel supplies the full JS/TS tier; the CLI retains a regex fallback when the parser is absent. | tests/npm-pack-smoke.test.mjs |
+| NFR-003 | Correctness | Cached memory plans invalidate when relevant working-tree inputs, configuration, or scanner implementation change. Unreadable or unsupported cache inputs cause a miss. | tests/plan-disk-cache.test.mjs |
+| NFR-004 | Distribution integrity | Every relative README link in the npm artifact resolves inside that artifact; repository-only material uses an absolute URL. | tests/npm-pack-smoke.test.mjs |
 
 ## Success Criteria
 
-<!-- Measurable outcomes — aligned with spec-kit SC-NNN format -->
-
-| ID | Criteria | Measurement | Target |
-|----|----------|-------------|--------|
-| SC-001 | [Measurable user outcome] | [How measured] | [Target value] |
-| SC-002 | [Performance metric] | [How measured] | [Target value] |
+The full supported-runtime test matrix and guard determine local release readiness. The reviewed benchmark records observed detector precision and recall with explicit coverage limits; its finite confidence interval is not universal accuracy. The frozen R7 evaluation supports opt-in task context through equal measured correctness, 50% fewer median steps, and 17% lower median latency against context packs. It also recorded 80% more median uncached input and does not establish universal agent productivity. The symbol map (`memory --pack --symbols`, spec 036) stays opt-in: the frozen protocol, not an impression, decided it. v2 could not run, so v3 (v2 with only the executable pin changed) ran all 54 trials on 2026-10-10 and computed `opt-in`, with no regression and no predeclared benefit.
 
 ## User Scenarios
 
-<!-- Spec-kit aligned: Given/When/Then acceptance scenarios -->
-
-### User Story 1 - [Title] (Priority: P1)
-
-[Description of user journey]
-
-**Acceptance Scenarios**:
-1. **Given** [initial state], **When** [action], **Then** [expected outcome]
-2. **Given** [initial state], **When** [action], **Then** [expected outcome]
+A developer edits a source file without committing. The next memory plan reflects that change. An adopter upgrades DocGuard in an existing repository and can inspect hooks, follow every proposed remediation, and verify the result without hidden initialization. An agent requests context for one qualified requirement and receives current hashed excerpts and linked tests, or an explicit abstention. The agent inspects a high structural grade and sees the separate readiness verdict and that factual accuracy remains unverified. A contributor challenges a confident finding, previews a metadata-only report, checks existing work, and supplies a synthetic regression example voluntarily.
 
 ## Traceability Matrix
 
-<!-- Maps requirements → code → tests -->
-
-| Requirement | Source File | Test File | Status |
-|-------------|------------|-----------|--------|
-| FR-001 | `src/[file]` | `tests/[file]` | ❌ |
+The verification column above links each requirement to executable tests. The tests carry explicit requirement annotations. Fixture content and example IDs cannot satisfy a real requirement.
 
 ## Revision History
 
-| Version | Date | Author | Changes |
-|---------|------|--------|---------|
-| 0.1.0 | 2026-05-26 | DocGuard Init | Initial template |
-
----
-
-*Generated by [DocGuard](https://github.com/raccioly/docguard) — aligned with [Spec Kit](https://github.com/github/spec-kit) standards.*
+| Version | Date | Changes |
+|---|---|---|
+| 0.9.3 | 2026-10-13 | Freshness review after specs 070–078: FR-009 reads an over-budget range in batches before it reports partial coverage (spec 028 FR-008); those specs state their own requirements under `specs/` |
+| 0.9.2 | 2026-10-11 | FR-024: hooks are written only into a folder the repository owns (spec 065) |
+| 0.9.1 | 2026-10-10 | Freshness review for specs 038–053: every requirement and verification path still holds; those specs state their own requirements under `specs/`, so none is copied here |
+| 0.9.0 | 2026-09-30 | Add FR-025 (Metrics-Consistency counts what ships and reports each drifted value once); record that the symbol map stays opt-in until the v2 protocol runs |
+| 0.8.0 | 2026-09-29 | Renumber the second FR-016/017/018 rows to FR-022/023/024: each ID was used for two different requirements, and path-qualified test annotations bound to the second meaning |
+| 0.7.0 | 2026-09-18 | Record the uninitialised-project hook boundary (exit 3) and foreign-hook backup protection shipped without a stated requirement |
+| 0.6.0 | 2026-09-15 | Exclude disposable checkout copies from pointer evidence, distinguish shipped capability counts from enabled configuration, and explain non-clean planned registries without weakening traceability |
+| 0.5.0 | 2026-09-15 | Require composable managed hooks, CI-safe evidence exits, and field-level registry drift explanations |
+| 0.4.0 | 2026-09-15 | Make API omission remediation review-only and add field-replay precision contracts for routes, fixtures, histories, monorepos, design sync, and config schemas |
+| 0.3.0 | 2026-09-15 | Add packed adoption, fail-closed reconciliation and pointers, lifecycle-aware traceability, exact-code policy, combined assessment, Python literal evidence, and route-discovery precision contracts |
+| 0.2.0 | 2026-09-11 | Replace template requirements with implemented trust, feedback, and cache contracts |

@@ -19,15 +19,23 @@
  *   - Tech:      ARCHITECTURE.md vs detected stack
  *
  * Zero NPM dependencies. Pure orchestration of existing diff helpers.
+ * @implements docguard.read-only-commands#FR-005
+ * @implements docguard.spec-kit-integration-honesty#FR-006
  */
 
-import { existsSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { buildSymbolMap } from '../scanners/symbol-map.mjs';
+import { releaseAge, updateHintText } from '../release-age.mjs';
+import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { c } from '../shared.mjs';
-import { listCanonicalDocs } from '../shared-ignore.mjs';
+import { createEvidenceReader, evidenceDocs, extractSemanticClaims, contentHash, gitEvidence, SEMANTIC_COVERAGE_LIMITATION } from '../scanners/semantic-claims.mjs';
+import { safeWrite } from '../writers/generate-io.mjs';
+import { ensureStateDir } from '../writers/state-dir.mjs';
+import { buildScoreAssurance } from './score.mjs';
 import { diffRoutes, diffEntities, diffEnvVars, diffTechStack } from './diff.mjs';
 import { buildMemoryPlan } from '../scanners/memory-plan.mjs';
 import { runGuardInternal } from './guard.mjs';
+import { readAgentSurface, commandHint } from '../agent-surface.mjs';
 
 /**
  * Compute an accuracy score for a single domain. Returns:
@@ -75,13 +83,17 @@ function extractConventions(agentsMd, capLines = 60) {
 
 /**
  * `docguard memory --pack` — write .docguard/context-pack.md: a compact,
- * code-truth-stamped session-start context for an AI agent. Everything in it
- * is derived from scanners (buildMemoryPlan) and guard — numbers, not prose —
- * so it can't hallucinate and is always regenerable.
+ * session-start snapshot for an AI agent. Scanner output and copied prose
+ * remain unverified; hashes identify captured inputs, not factual accuracy.
  */
 function runMemoryPack(projectDir, config, flags) {
-  const plan = buildMemoryPlan(projectDir, config);
+  const plan = buildMemoryPlan(projectDir, { ...config, diskCache: false });
   const guard = runGuardInternal(projectDir, config);
+  const read = createEvidenceReader(projectDir);
+  const git = gitEvidence(projectDir);
+  const assurance = buildScoreAssurance(projectDir, config);
+  let claims = null;
+  try { claims = extractSemanticClaims(projectDir, config, read); } catch { /* unknown, not an empty verified set */ }
   const lines = [];
 
   lines.push(`# Context Pack — ${config.projectName}`);
@@ -91,6 +103,15 @@ function runMemoryPack(projectDir, config, flags) {
   lines.push(`**Guard:** ${guard.status} — ${guard.passed}/${guard.total} checks (${guard.errors} error(s), ${guard.warnings} warning(s))`);
   lines.push('');
 
+  lines.push('**Provenance:** snapshot only — not reviewed or verified');
+  lines.push(`- Git revision: ${git.revision ?? 'unknown'} · dirty: ${git.dirty ?? 'unknown'}`);
+  lines.push(`- Assurance: structural-only · factual accuracy: unknown · status: ${assurance.status}`);
+  lines.push(`- Unverified claims: ${assurance.unverifiedClaims ?? 'unknown'} extracted candidates (heuristic and capped; zero does not establish prose correctness)`);
+  lines.push(`- Claim evidence fingerprint: ${claims ? contentHash(JSON.stringify(claims.map(c => [c.stableId, c.evidence.snapshotHash]).sort())) : 'unknown'}`);
+  lines.push(`- Coverage limitation: ${SEMANTIC_COVERAGE_LIMITATION}`);
+  lines.push('Hashes capture current document and cited-source content. Regenerate after changes; timestamps and last-reviewed labels do not establish accuracy.');
+  lines.push('');
+
   lines.push('## Code-truth surface');
   lines.push('');
   lines.push(`- Stack: ${plan.profile.languages.join(', ') || 'unknown'}${plan.profile.frameworks.length ? ` · ${plan.profile.frameworks.join(', ')}` : ''} · kind: ${plan.profile.kind}`);
@@ -98,17 +119,18 @@ function runMemoryPack(projectDir, config, flags) {
   lines.push(`- Tests: ${plan.surface.tests.totalFiles} files, ${plan.surface.tests.totalCases} cases`);
   lines.push('');
 
-  const canonicalDocs = listCanonicalDocs(projectDir);
+  const canonicalDocs = evidenceDocs(projectDir, config);
   if (canonicalDocs.length > 0) {
     lines.push('## Canonical docs');
     lines.push('');
     for (const doc of canonicalDocs) {
       let reviewed = '';
       try {
-        const m = readFileSync(doc.abs, 'utf-8').match(/docguard:last-reviewed\s+(\d{4}-\d{2}-\d{2})/);
+        const m = (read(doc).content || '').match(/docguard:last-reviewed\s+(\d{4}-\d{2}-\d{2})/);
         if (m) reviewed = ` (last-reviewed ${m[1]})`;
       } catch { /* ignore */ }
-      lines.push(`- ${doc.rel}${reviewed}`);
+      const evidence = read(doc).evidence;
+      lines.push(`- ${doc}${reviewed} — content: ${evidence.hash ?? `unknown (${evidence.reason})`}`);
     }
     lines.push('');
   }
@@ -116,7 +138,7 @@ function runMemoryPack(projectDir, config, flags) {
   const agentsPath = resolve(projectDir, 'AGENTS.md');
   if (existsSync(agentsPath)) {
     let conventions = [];
-    try { conventions = extractConventions(readFileSync(agentsPath, 'utf-8')); } catch { /* ignore */ }
+    try { conventions = extractConventions(read('AGENTS.md').content || ''); } catch { /* ignore */ }
     if (conventions.length > 0) {
       lines.push('## Project rules (from AGENTS.md)');
       lines.push('');
@@ -128,7 +150,7 @@ function runMemoryPack(projectDir, config, flags) {
   const driftPath = resolve(projectDir, 'DRIFT-LOG.md');
   if (existsSync(driftPath)) {
     try {
-      const drift = readFileSync(driftPath, 'utf-8');
+      const drift = read('DRIFT-LOG.md').content || '';
       const entries = drift.match(/^##\s+.+$/gm) || [];
       if (entries.length > 0) {
         lines.push('## Known drift');
@@ -139,6 +161,18 @@ function runMemoryPack(projectDir, config, flags) {
     } catch { /* ignore */ }
   }
 
+  // docguard.symbol-map#FR-004: opt-in. The agent-context benchmark (protocol
+  // v3, FR-008/FR-011) computed `opt-in`; without the flag the pack is unchanged.
+  if (flags.symbols) {
+    lines.push(...buildSymbolMap(projectDir, config).text.split('\n'));
+    lines.push('');
+  }
+
+  // docguard.update-awareness#FR-004: only when the release is old; the text
+  // names the date, not a day count, so the pack does not change daily.
+  const versionNote = updateHintText(releaseAge(), 'pack');
+  if (versionNote) lines.push('## DocGuard version', '', versionNote, '');
+
   lines.push('---');
   lines.push('Verify claims: `docguard verify --semantic` · Full docs: `llms-full.txt`');
   lines.push('');
@@ -148,10 +182,9 @@ function runMemoryPack(projectDir, config, flags) {
     console.log(content);
     return;
   }
-  const outDir = resolve(projectDir, '.docguard');
-  if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
-  const outPath = resolve(outDir, 'context-pack.md');
-  writeFileSync(outPath, content, 'utf-8');
+  const outPath = resolve(projectDir, '.docguard/context-pack.md');
+  ensureStateDir(projectDir);
+  safeWrite(outPath, content);
   console.log(`${c.bold}🧠 DocGuard Context Pack${c.reset}`);
   console.log(`${c.green}✅ Wrote ${outPath}${c.reset} ${c.dim}(${lines.length} lines — load at agent session start)${c.reset}`);
   console.log('');
@@ -262,6 +295,6 @@ export function runMemory(projectDir, config, flags) {
   } else {
     console.log(`\n  ${c.dim}Fix options:${c.reset}`);
     console.log(`    ${c.dim}• Removed-from-code items: ${c.cyan}docguard fix --write${c.dim} (deletes documented-but-absent endpoints)${c.reset}`);
-    console.log(`    ${c.dim}• Missing-from-docs items: ${c.cyan}/docguard.fix --doc <name>${c.dim} (AI fills in the gap)${c.reset}`);
+    console.log(`    ${c.dim}• Missing-from-docs items: ${c.cyan}${commandHint(projectDir, readAgentSurface(projectDir), 'fix', '--doc <name>')}${c.dim} (AI fills in the gap)${c.reset}`);
   }
 }

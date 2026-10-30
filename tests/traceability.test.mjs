@@ -43,7 +43,7 @@ describe('Traceability Validator', () => {
     const joined = result.warnings.join(' | ');
     assert.ok(!/\bT300\b|\bT1000\b|\bT200\b/.test(joined),
       `prose T### must not be flagged as untraced requirements; got: ${joined}`);
-    assert.ok(/Requirement T001 .* no test coverage/.test(joined),
+    assert.ok(/Requirement T001 .* no recognized test annotation or label/.test(joined),
       `the real checklist task T001 must be collected + traced; got: ${joined}`);
   });
 
@@ -125,6 +125,19 @@ describe('Traceability Validator', () => {
     assert.deepEqual(result.warnings, []);
   });
 
+  it('resolves immutable spec ID qualifiers to the current spec path', () => {
+    const id = 'FR' + '-' + '777';
+    mkdirSync(join(tmpDir, 'specs', '001-feature'), { recursive: true });
+    writeFileSync(join(tmpDir, 'specs', '001-feature', 'spec.md'),
+      `# Feature\n\n**Spec ID**: \`acme.feature\`\n\n- **${id}**: The system MUST work.\n`);
+    mkdirSync(join(tmpDir, 'tests'), { recursive: true });
+    writeFileSync(join(tmpDir, 'tests', 'feature.test.js'), `// @req acme.feature#${id}\ntest('works', () => {});\n`);
+    const result = validateTraceability(tmpDir, { requiredFiles: { canonical: [] } });
+    assert.equal(result.total, 1);
+    assert.equal(result.passed, 1);
+    assert.deepEqual(result.warnings, []);
+  });
+
   it('warns when a requirement has no test coverage', () => {
     const ID2 = 'REQ' + '-' + '902';
     mkdirSync(join(tmpDir, 'docs-canonical'), { recursive: true });
@@ -138,7 +151,7 @@ describe('Traceability Validator', () => {
     assert.strictEqual(result.total, 1);
     assert.deepEqual(result.errors, []);
     assert.strictEqual(result.warnings.length, 1);
-    assert.strictEqual(result.warnings[0], `Requirement ${ID2} (REQUIREMENTS.md:2) has no test coverage. Add @req ${ID2} comment to the test that verifies this requirement`);
+    assert.strictEqual(result.warnings[0], `Requirement ${ID2} (REQUIREMENTS.md:2) has no recognized test annotation or label; behavioral coverage is unknown.`);
   });
 
   it('warns when an orphaned test reference exists', () => {
@@ -165,13 +178,41 @@ describe('Traceability Validator', () => {
     assert.strictEqual(hasOrphanedWarning, true);
   });
 
-  // Regression for hugocross Bug 5 (compound):
+  it('keeps retired identities as tombstones without rebinding bare coverage', () => {
+    const ID2 = 'REQ' + '-' + '904';
+    mkdirSync(join(tmpDir, 'docs-canonical'), { recursive: true });
+    writeFileSync(join(tmpDir, 'REQUIREMENTS.md'), `# Requirements\n${ID2}\n`);
+    writeFileSync(join(tmpDir, '.docguard-archive.json'), JSON.stringify({
+      schemaVersion: 1,
+      strategy: 'git-history',
+      retention: { ref: 'refs/heads/main', objectFormat: 'sha1', recoverability: 'verified' },
+      entries: [{
+        path: 'specs/retired/spec.md',
+        archivedFrom: '0'.repeat(40),
+        blob: '1'.repeat(40),
+        reason: 'Superseded',
+        requirementIds: [ID2],
+      }],
+    }));
+    mkdirSync(join(tmpDir, 'tests'), { recursive: true });
+    writeFileSync(join(tmpDir, 'tests', 'app.test.js'), `// @req ${ID2}\n`);
+
+    const config = { requiredFiles: { canonical: [] } };
+    const result = validateTraceability(tmpDir, config);
+
+    assert.equal(result.findings.some(finding => finding.code === 'TRC005'), false,
+      'the historical identity remains known');
+    assert.equal(result.findings.some(finding => finding.code === 'TRC004'), true,
+      'a bare reference shared with a tombstone must not certify the active requirement');
+  });
+
+  // Regression for a downstream project Bug 5 (compound):
   //   (a) `// @doc API-REFERENCE.md` annotations were documented in templates
   //       but never actually scanned — they had zero effect on traceability.
   //   (b) Next.js App Router route files (`src/app/api/...`) did not match
   //       any TRACE_MAP pattern, so a fully-populated API tree was reported
   //       as "API-REFERENCE.md — unlinked doc".
-  describe('@doc annotations and Next.js App Router (hugocross bug 5)', () => {
+  describe('@doc annotations and Next.js App Router (a downstream project bug 5)', () => {
     it('@doc annotation links a source file to a canonical doc', () => {
       mkdirSync(join(tmpDir, 'docs-canonical'), { recursive: true });
       writeFileSync(join(tmpDir, 'docs-canonical', 'API-REFERENCE.md'), '# API');
@@ -192,6 +233,17 @@ describe('Traceability Validator', () => {
         !result.warnings.some(w => w.includes('API-REFERENCE.md — exists but no matching')),
         'no unlinked-doc warning expected when @doc annotation is present'
       );
+    });
+
+    it('a JSDoc continuation line (` * @doc X.md`) links too, and a string literal does not (docguard.mcp-doc-tools#FR-003)', () => {
+      mkdirSync(join(tmpDir, 'docs-canonical'), { recursive: true });
+      writeFileSync(join(tmpDir, 'docs-canonical', 'API-REFERENCE.md'), '# API');
+      mkdirSync(join(tmpDir, 'src', 'weird-place'), { recursive: true });
+      writeFileSync(join(tmpDir, 'src', 'weird-place', 'thing.ts'), '/**\n * Things.\n * @doc API-REFERENCE.md\n */\nexport const foo = 1;\n');
+      const config = { requiredFiles: { canonical: ['API-REFERENCE.md'] } };
+      assert.strictEqual(validateTraceability(tmpDir, config).passed, 1, 'the JSDoc form is the common one');
+      writeFileSync(join(tmpDir, 'src', 'weird-place', 'thing.ts'), 'export const s = "@doc API-REFERENCE.md";\n');
+      assert.strictEqual(validateTraceability(tmpDir, config).passed, 0, 'a string literal is not an annotation');
     });
 
     it('Next.js App Router src/app/api/ is recognised by TRACE_MAP', () => {

@@ -6,9 +6,14 @@ Thank you for your interest in contributing to DocGuard! This document provides 
 
 1. **Fork** the repository
 2. **Clone** your fork: `git clone https://github.com/YOUR_USERNAME/docguard.git`
-3. **Install**: `npm install` (only dev dependencies — DocGuard itself has zero runtime deps)
+3. **Install**: `npm install` (one runtime dependency, `@babel/parser`, exact-pinned; no dev dependencies)
 4. **Run tests**: `npm test`
 5. **Run DocGuard on itself**: `node cli/docguard.mjs guard`
+6. **Spec Kit** (optional, needed to run the `/speckit-*` workflow): install the
+   [`specify` CLI](https://github.com/github/spec-kit), then `npm run speckit:dev`
+   to register this repository's own extension and its hooks. The Spec Kit core
+   skills for Claude Code (`.claude/skills/speckit-*`) and Codex
+   (`.agents/skills/speckit-*`) are already tracked.
 
 ## Development Workflow
 
@@ -50,7 +55,10 @@ machine-governed by the `canonical-sync` validator.)
 - **Minimal dependencies**: exactly one runtime dep (`@babel/parser`, exact-pinned, optional-load). New deps require constitution-level justification + exact pinning + supply-chain vetting. Default to Node.js built-ins.
 - **Validators are pure**: Each validator receives `(projectDir, config)` and returns results. No side effects.
 - **Commands don't cross-import**: Commands import from validators, never from other commands.
-- **AI is the author**: The CLI flags problems and generates prompts. It never writes doc content.
+- **Writes are explicit and bounded**: The CLI previews first. Deterministic
+  writes require a write flag, preserve recovery evidence, and fail closed on
+  ambiguous ownership. Human-authored intent is never rewritten to match code
+  automatically.
 
 ## Adding a New Command
 
@@ -66,8 +74,27 @@ machine-governed by the `canonical-sync` validator.)
 2. Import it in `cli/docguard.mjs`
 3. Add it to the help text, command routing switch, and argument parsing
 4. Update the README commands table + count (Canonical-Sync/Surface-Sync enforce these)
-5. Add tests in `tests/commands.test.mjs`
+5. Add focused tests in `tests/<command>.test.mjs` or the nearest existing suite
 6. Update `CHANGELOG.md`
+
+## Contributing a detection case
+
+Search open and closed issues and pull requests before filing. Include a minimal
+synthetic reproduction, a neighboring valid control, the expected and actual
+finding codes, and the smallest relevant configuration. Classify the report as a
+suspected false positive, false negative, unsupported syntax, or policy
+disagreement. Test-only contributions are welcome; maintainers can own the
+detector change after the behavior is reproduced.
+
+## Contributing an agent-context case
+
+Run `npm run benchmark:agent-context` to validate the frozen synthetic fixtures
+without invoking a model. New task classes belong in a new predeclared protocol,
+not in the completed v1 matrix. Include an agent-visible fixture, evaluator-only
+fail-to-pass and pass-to-pass checks, reviewed reference behavior, an exact
+changed-file allowlist, model/harness identity, repetitions, and promotion
+thresholds before collecting observations. Keep private repositories, prompts,
+source patches, credentials, and raw model prose out of committed results.
 
 ## Adding a New Validator
 
@@ -111,6 +138,27 @@ test: add edge case tests for score command
 - ANSI colors via the shared `c` object from `docguard.mjs`
 - No TypeScript — plain JavaScript for maximum portability
 
+## Tests That Create Git Repositories
+
+Fixture git goes through `tests/helpers/git.mjs`; product git does not.
+
+- A test that builds or inspects a throwaway repository passes `FIXTURE_GIT` on every git call (`spawnSync('git', [...FIXTURE_GIT, ...args])`), or `FIXTURE_GIT_SHELL` in a `git …` command line. The options turn hooks off (`core.hooksPath` set to the null device) and commit and tag signing off, for that one call.
+- Prefer `fixtureGit(cwd, args)` for setup steps. It throws with git's stderr when the step fails, so a fixture that was never committed cannot let the test pass against an empty repository.
+- Pin the branch when the test depends on it: `git init -b main`.
+- Never set the options in the environment, and never add them to `cli/`. DocGuard's own git calls must keep meeting the user's real configuration. The exception is a scratch repository DocGuard itself creates, such as the `demo` fixture.
+- `tests/test-git-hermeticity.test.mjs` fails on a git spawn in `tests/` that bypasses the helper. A call that must bypass it (a control that proves a config bites) carries a `fixture-git-exempt:` comment with the reason.
+
+CI's `hermeticity` job runs the suite under a global config whose hooks all fail, whose signing always fails and whose default branch is `trunk`. To reproduce it locally without touching your own config:
+
+```bash
+H=$(mktemp -d); mkdir "$H/hooks"
+for h in pre-commit prepare-commit-msg commit-msg post-commit pre-push post-checkout; do
+  printf '#!/bin/sh\nexit 1\n' > "$H/hooks/$h"; chmod +x "$H/hooks/$h"
+done
+printf '[core]\n\thooksPath = %s\n[commit]\n\tgpgsign = true\n[tag]\n\tgpgsign = true\n[gpg]\n\tprogram = false\n[init]\n\tdefaultBranch = trunk\n' "$H/hooks" > "$H/gitconfig"
+GIT_CONFIG_GLOBAL="$H/gitconfig" npm test
+```
+
 ## Reporting Bugs
 
 Open a GitHub issue with:
@@ -144,7 +192,7 @@ The following papers directly influenced DocGuard's design:
 
 | DocGuard Feature | Research Origin | Paper |
 |-----------------|----------------|-------|
-| Quality labels (HIGH/MED/LOW) in `guard` output | CJE quality stratification | TRACE [2] |
+| Quality labels (HIGH/MED/LOW) in `guard` output — label vocabulary only; the labels are deterministic strata, not calibrated probabilities (see PHILOSOPHY.md) | CJE quality stratification | TRACE [2] |
 | Standards citations in generated docs | RAG-grounded standards alignment | AITPG [1] |
 | Multi-signal composite scoring in `score` | 5-signal weighted composite (Eq. 1) | TRACE [2] |
 | Traceability matrix (`trace` command) | Requirements traceability | AITPG [1] |
@@ -156,3 +204,20 @@ The following papers directly influenced DocGuard's design:
 ## License
 
 By contributing, you agree that your contributions will be licensed under the MIT License.
+
+## Turn a finding into a regression test
+
+A report or a test-only contribution is useful even when you cannot fix the detector. Start with `docguard feedback --code <CODE> --preview` for a disputed finding, or copy `templates/feedback-fixture.json` for a false negative or unsupported syntax case. Validate without writes using `docguard feedback --fixture-manifest <path> --reduce --preview --format json`.
+
+1. Open the generated search link and check existing issues and pull requests, including closed work. Add evidence to a matching discussion instead of opening a duplicate. A previously fixed issue needs a current reproduction before it is treated as a regression.
+2. State expected behavior and actual behavior. Distinguish a false positive, a missed defect, unsupported syntax, and a policy preference. A suppression by itself does not demonstrate a bug.
+3. Create the smallest synthetic project that preserves the behavior. Use invented names and values. Include the tool version, runtime version, minimal configuration, exact command, and expected finding code. Avoid attaching the full local feedback record: it can contain private project details.
+4. Set `provenance.synthetic` and `redactionAttested` only after reviewing every inline file. Record the parser tier, exact expected identity, explicit predicate, same-path opposite control, supported scope, and candidate benchmark delta. The command refuses incomplete contribution evidence.
+5. Generate a direct test with `--contribution tests/<name>.test.mjs`. A false-positive case should stay clean while its neighboring real defect still emits; a missed detection should emit while its clean control remains clean. Ambiguous and policy cases require adjudication before test generation.
+6. Run the focused test and `node benchmarks/run.mjs --external --baseline benchmarks/baseline.json` against the affected version. Describe the result honestly. A test that never exercised the intended parser path is not evidence of a fix.
+7. If the baseline must change, regenerate it with `--write-baseline benchmarks/baseline.json --replace-baseline` and set `review.status`, `reviewedAt`, and `reviewer` by hand after adjudicating every case. Never edit `review.caveat` or `core.metrics`: both are derived from `core.cases` and the loader rejects an envelope where they disagree. When quoting a benchmark number anywhere, quote it with its `n`, its Wilson bound, and the envelope's `review.caveat` — a precision figure without them reads as a calibrated probability, which DocGuard does not measure.
+7. Submit the reviewed example or a test-only PR. Include the duplicate identity so maintainers can find related open and closed work. Follow the repository's changelog and canonical-documentation rules when changing behavior.
+
+Maintainers should acknowledge reproducible reports, preserve contributor attribution with consent, and record the causal defect family in the regression test. Reproduction success and triage time matter more than issue volume. Do not execute arbitrary submitted scripts with repository credentials. Security-sensitive reports belong in the private channel described by SECURITY.md.
+
+The public issue draft contains metadata only. Opening a link is optional, and DocGuard never submits a report automatically.

@@ -8,11 +8,56 @@
  * "X commits since last doc update" counter — silently hiding drift.
  *
  * Zero NPM dependencies. Pure Node.js built-ins.
+ * @implements docguard.adoption-workflow-integrity#FR-004
  */
 
-import { execFileSync, execSync } from 'node:child_process';
-import { existsSync, statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { execFileSync, execSync, spawnSync } from 'node:child_process';
+import { existsSync, realpathSync, statSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+
+/**
+ * Three git states (docguard.unreadable-git-metadata#FR-001):
+ *   ok         — git commands work here.
+ *   absent     — no `.git` in this directory or any ancestor: a project
+ *                without version control, where history checks do not apply.
+ *   unreadable — a `.git` exists (or git is missing) but git fails. Agent
+ *                sandboxes produce this: they mount the worktree and hide the
+ *                gitdir its `.git` file points at. History checks could not
+ *                run, which must never read as "nothing to check".
+ *
+ * @implements docguard.unreadable-git-metadata#FR-001
+ * @implements docguard.unreadable-git-metadata#FR-004
+ * @returns {{ status: 'ok'|'absent'|'unreadable', reason: string|null }}
+ */
+export function gitMetadataStatus(dir) {
+  try {
+    execFileSync('git', ['rev-parse', '--is-inside-work-tree'], {
+      cwd: dir, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    return { status: 'ok', reason: null };
+  } catch (err) {
+    if (err?.code === 'ENOENT') return { status: 'unreadable', reason: 'git is not installed' };
+    let cur = resolve(dir);
+    for (;;) {
+      if (existsSync(resolve(cur, '.git'))) {
+        const first = String(err?.stderr || err?.message || '').split('\n').find(l => l.trim()) || 'git failed';
+        return { status: 'unreadable', reason: first.trim() };
+      }
+      const parent = dirname(cur);
+      if (parent === cur) return { status: 'absent', reason: null };
+      cur = parent;
+    }
+  }
+}
+
+/** The applicability a history-based validator reports when git is unreadable. */
+export function unreadableGitApplicability(state) {
+  return {
+    status: 'missing-prerequisite',
+    reason: `Git metadata is present but unreadable (${state.reason}); history-based checks did not run. `
+      + 'In an agent sandbox, expose the repository\'s git directory (ai-jail: --worktree; other sandboxes: mount the gitdir named in .git).',
+  };
+}
 
 /**
  * True if the directory is inside a git work tree. Cached per-call.
@@ -149,6 +194,63 @@ export function changedFilesSince(dir, ref = 'HEAD~1') {
 }
 
 /**
+ * The project's tracked files, minus those deleted from the working tree, as
+ * POSIX paths relative to `dir`. Tracked only, so guard gives the same answer
+ * on a laptop with untracked files as in CI. Without usable git, returns null;
+ * the caller walks the tree and reports its check as partial
+ * (docguard.path-scoped-rules edge cases).
+ *
+ * @returns {string[]|null}
+ */
+export function listTrackedFiles(dir) {
+  const run = args => execFileSync('git', args, {
+    cwd: dir, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
+  }).split('\0').filter(Boolean);
+  try {
+    const deleted = new Set(run(['ls-files', '-z', '--deleted']));
+    const files = run(['ls-files', '-z', '--cached']);
+    return [...new Set(files)].filter(f => !deleted.has(f)).sort();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Which of `paths` the repository's ignore rules exclude, whether or not the
+ * file exists here: a pointer to a machine-local file (a gitignored note)
+ * must read the same on a laptop that has it and in CI that does not.
+ * A path git refuses to evaluate (one that runs through a symlink) is
+ * `unknown`. Returns null when git is unusable.
+ *
+ * @param {string[]} paths project-relative POSIX paths
+ * @returns {{ ignored: Set<string>, unknown: Set<string> }|null}
+ */
+export function gitIgnoredPaths(dir, paths) {
+  const check = list => spawnSync('git', ['check-ignore', '--no-index', '-z', '--stdin'], {
+    cwd: dir, input: `${list.join('\0')}\0`, encoding: 'utf-8', maxBuffer: 16 * 1024 * 1024,
+  });
+  const out = { ignored: new Set(), unknown: new Set() };
+  if (paths.length === 0) return out;
+  try {
+    const r = check(paths);
+    if (r.error) return null;
+    // 0: some ignored, 1: none ignored. Anything else fails the whole batch.
+    if (r.status === 0 || r.status === 1) {
+      for (const p of r.stdout.split('\0').filter(Boolean)) out.ignored.add(p);
+      return out;
+    }
+    for (const path of paths) {
+      const one = check([path]);
+      if (one.status === 0) out.ignored.add(path);
+      else if (one.status !== 1) out.unknown.add(path);
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Return the raw unified-diff TEXT between `ref` and HEAD, restricted to code
  * files (docs are excluded — a doc changing is not a code change that could
  * make OTHER docs stale). Consumed by shared-diff.parseUnifiedDiff.
@@ -170,6 +272,164 @@ export function getDiffText(dir, ref = 'HEAD~1', pathspec = null) {
   } catch {
     return '';
   }
+}
+
+const DEFAULT_DIFF_LIMITS = Object.freeze({
+  maxPatchBytes: 5 * 1024 * 1024,
+  maxInventoryBytes: 5 * 1024 * 1024,
+  maxChangedFiles: 5_000,
+  timeoutMs: 30_000,
+  // Batched reading (readPatchBatches): paths per Git call, and the bounds on
+  // the whole range so a long one cannot run unbounded.
+  maxBatchPaths: 200,
+  maxRangePatchBytes: 64 * 1024 * 1024,
+  rangeTimeoutMs: 120_000,
+});
+
+function diffFailure(error) {
+  if (error?.code === 'ENOBUFS' || /maxBuffer/i.test(error?.message || '')) return 'too-large';
+  if (error?.code === 'ETIMEDOUT' || error?.signal === 'SIGTERM') return 'timeout';
+  return 'error';
+}
+
+function parseNameStatus(raw) {
+  const tokens = raw.toString('utf8').split('\0');
+  if (tokens.at(-1) === '') tokens.pop();
+  const files = [];
+  for (let i = 0; i < tokens.length;) {
+    const status = tokens[i++];
+    if (!status) continue;
+    if (/^[RC]/.test(status)) {
+      const oldPath = tokens[i++];
+      const newPath = tokens[i++];
+      if (oldPath && newPath) files.push({ status, oldPath, newPath });
+    } else {
+      const path = tokens[i++];
+      if (path) files.push({ status, oldPath: status.startsWith('D') ? path : null, newPath: status.startsWith('D') ? null : path });
+    }
+  }
+  return files;
+}
+
+/**
+ * Read a reconciliation diff without converting overflow, timeout, or Git
+ * failure into an empty successful range. The path inventory is independent
+ * from patch text so binary files, deletes, and renames remain visible.
+ */
+export function getDiffSnapshot(dir, ref = 'HEAD~1', options = {}) {
+  const limits = { ...DEFAULT_DIFF_LIMITS, ...options };
+  const base = {
+    status: 'error', ref, commitCount: null, changedFiles: [], patch: '',
+    patchBytes: 0, limits, reason: null,
+  };
+  let inventory;
+  try {
+    inventory = execFileSync('git', [
+      'diff', '--name-status', '-z', '--no-color', '--no-ext-diff', '--no-textconv', ref, 'HEAD',
+    ], {
+      cwd: dir, encoding: 'buffer', stdio: ['pipe', 'pipe', 'pipe'],
+      maxBuffer: limits.maxInventoryBytes, timeout: limits.timeoutMs,
+    });
+  } catch (error) {
+    const status = diffFailure(error);
+    return { ...base, status, reason: status === 'too-large'
+      ? 'Changed-file inventory exceeded its byte budget.'
+      : status === 'timeout' ? 'Changed-file inventory timed out.' : 'Changed-file inventory could not be read.' };
+  }
+  const changedFiles = parseNameStatus(inventory);
+  if (changedFiles.length > limits.maxChangedFiles) {
+    return { ...base, status: 'too-large', changedFiles: changedFiles.slice(0, limits.maxChangedFiles),
+      reason: `Changed-file inventory exceeded the ${limits.maxChangedFiles}-path budget.` };
+  }
+  let commitCount;
+  try {
+    commitCount = Number(execFileSync('git', ['rev-list', '--count', `${ref}..HEAD`], {
+      cwd: dir, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: limits.timeoutMs,
+    }).trim());
+    if (!Number.isSafeInteger(commitCount) || commitCount < 0) throw new Error('invalid commit count');
+  } catch (error) {
+    const status = diffFailure(error);
+    return { ...base, status, changedFiles, reason: status === 'timeout'
+      ? 'Commit-range inspection timed out.' : 'Commit range could not be inspected.' };
+  }
+  let patch;
+  try {
+    patch = execFileSync('git', [
+      'diff', '--no-color', '--no-ext-diff', '--no-textconv', ref, 'HEAD',
+    ], {
+      cwd: dir, encoding: 'buffer', stdio: ['pipe', 'pipe', 'pipe'],
+      maxBuffer: limits.maxPatchBytes, timeout: limits.timeoutMs,
+    });
+  } catch (error) {
+    const status = diffFailure(error);
+    return { ...base, status, commitCount, changedFiles, reason: status === 'too-large'
+      ? 'Patch exceeded its byte budget; use a newer --since revision.'
+      : status === 'timeout' ? 'Patch generation timed out; use a newer --since revision.' : 'Patch could not be read.' };
+  }
+  return {
+    ...base,
+    status: 'ok',
+    commitCount,
+    changedFiles,
+    patch: patch.toString('utf8'),
+    patchBytes: patch.length,
+  };
+}
+
+/**
+ * Read a range's patch in batches of changed paths, for a range whose single
+ * read exceeded the per-call budget or timed out. Every Git call keeps the
+ * per-call byte budget and timeout; `visit` receives each batch's patch and
+ * the caller keeps only what it derives, so memory stays bounded by one batch.
+ * A rename's two paths share a batch so Git still pairs them, and
+ * `--literal-pathspecs` keeps every path a path. A batch that overflows is
+ * halved; a single path that overflows on its own, the range total, the range
+ * time or a Git failure ends the read with a status other than `ok`.
+ * @implements docguard.completion-revision-anchoring#FR-008
+ */
+export function readPatchBatches(dir, ref, files, visit, options = {}) {
+  const limits = { ...DEFAULT_DIFF_LIMITS, ...options };
+  const units = files.map(file => [...new Set([file.oldPath, file.newPath].filter(Boolean))]).filter(unit => unit.length);
+  const queue = [];
+  for (let i = 0; i < units.length; i += limits.maxBatchPaths) queue.push(units.slice(i, i + limits.maxBatchPaths));
+  const started = Date.now();
+  let batches = 0;
+  let patchBytes = 0;
+  const stop = (status, reason) => ({ status, batches, patchBytes, reason });
+  while (queue.length) {
+    if (Date.now() - started > limits.rangeTimeoutMs) {
+      return stop('timeout', `Range patch exceeded its ${limits.rangeTimeoutMs} ms total budget; use a newer --since revision.`);
+    }
+    const batch = queue.shift();
+    let patch;
+    try {
+      patch = execFileSync('git', [
+        '--literal-pathspecs', 'diff', '--no-color', '--no-ext-diff', '--no-textconv', ref, 'HEAD', '--', ...batch.flat(),
+      ], {
+        cwd: dir, encoding: 'buffer', stdio: ['pipe', 'pipe', 'pipe'],
+        maxBuffer: limits.maxPatchBytes, timeout: limits.timeoutMs,
+      });
+    } catch (error) {
+      const status = diffFailure(error);
+      if (status === 'error') return stop(status, 'Patch could not be read.');
+      if (batch.length > 1) {
+        const half = Math.ceil(batch.length / 2);
+        queue.unshift(batch.slice(0, half), batch.slice(half));
+        continue;
+      }
+      const path = batch[0].at(-1);
+      return stop(status, status === 'too-large'
+        ? `Patch for ${path} exceeds the ${limits.maxPatchBytes}-byte per-call budget; use a newer --since revision.`
+        : `Patch for ${path} timed out; use a newer --since revision.`);
+    }
+    batches += 1;
+    patchBytes += patch.length;
+    if (patchBytes > limits.maxRangePatchBytes) {
+      return stop('too-large', `Range patch exceeds its ${limits.maxRangePatchBytes}-byte total budget; use a newer --since revision.`);
+    }
+    visit(patch.toString('utf8'));
+  }
+  return stop('ok', null);
 }
 
 /**
@@ -242,9 +502,19 @@ export function lastCommitHash(dir, filePath) {
 }
 
 /**
+ * `git status` pathspec that keeps the whole repository in scope but leaves out
+ * this project's own `.docguard/` state (plan cache, history, context pack…).
+ * Relative to the git working directory, so callers run git in the project
+ * directory. It also covers state an earlier version let a project commit,
+ * which an ignore file cannot untrack.
+ * @implements docguard.read-only-commands#FR-006
+ */
+export const OWN_STATE_PATHSPEC = Object.freeze(['--', ':/', ':(exclude).docguard']);
+
+/**
  * Resolve HEAD identity for evidence reports: { commit, branch, dirty }.
  * `branch` is null on a detached HEAD (common in CI checkouts); `dirty` is
- * true when tracked files have uncommitted changes — evidence consumers need
+ * true when tracked files outside `.docguard/` have uncommitted changes — evidence consumers need
  * to know the report may not describe a reproducible tree. Returns null when
  * the dir isn't a git repo or git is unavailable.
  */
@@ -257,7 +527,7 @@ export function getHeadInfo(dir) {
     if (!commit) return null;
     const branchRaw = run(['rev-parse', '--abbrev-ref', 'HEAD']);
     const branch = branchRaw === 'HEAD' ? null : branchRaw;
-    const dirty = run(['status', '--porcelain', '--untracked-files=no']) !== '';
+    const dirty = run(['status', '--porcelain', '--untracked-files=no', ...OWN_STATE_PATHSPEC]) !== '';
     return { commit, branch, dirty };
   } catch {
     return null;
@@ -305,4 +575,70 @@ export function getHooksDir(dir) {
     }
   } catch { /* ignore */ }
   return null;
+}
+
+// Scopes whose core.hooksPath this repository set for itself.
+const REPO_SCOPES = new Set(['local', 'worktree']);
+
+// realpath of the nearest existing ancestor, so a hooks folder that does not
+// exist yet still compares correctly against symlinked roots (macOS /tmp).
+function canonicalPath(p) {
+  try { return realpathSync(p); } catch { /* not there yet */ }
+  const parent = dirname(p);
+  return parent === p ? p : join(canonicalPath(parent), basename(p));
+}
+
+function isInside(root, target) {
+  const rel = relative(root, target);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+/**
+ * Where DocGuard may write Git hooks for `dir`, and whether that folder belongs
+ * to the repository. A `core.hooksPath` from the global, system or command-line
+ * configuration — or one resolving outside the working tree and the Git
+ * directory — is shared with other repositories, so `owned` is false and
+ * callers must not write, overwrite or remove hooks there.
+ *
+ * @implements docguard.hooks-repo-scope#FR-001
+ * @implements docguard.hooks-repo-scope#FR-003
+ * @returns {{ dir: string|null, owned: boolean, scope: string|null, configured: string|null, reason: 'not-a-repo'|'scope'|'outside'|null }}
+ */
+export function resolveHooksTarget(dir) {
+  const hooksDir = getHooksDir(dir);
+  if (!hooksDir) return { dir: null, owned: false, scope: null, configured: null, reason: 'not-a-repo' };
+  const git = args => spawnSync('git', args, { cwd: dir, encoding: 'utf-8' });
+
+  let scope = null;
+  let configured = null;
+  const scoped = git(['config', '--show-scope', '--get', 'core.hooksPath']);
+  if (scoped.status === 0) {
+    const [s, ...value] = scoped.stdout.replace(/\r?\n$/, '').split('\t');
+    scope = s;
+    configured = value.join('\t');
+  } else if (scoped.status !== 1) {
+    // Git before 2.26 has no --show-scope: a value the repository's own
+    // configuration does not hold came from somewhere else.
+    const effective = git(['config', '--get', 'core.hooksPath']);
+    if (effective.status === 0) {
+      configured = effective.stdout.trim();
+      const holds = args => { const r = git(args); return r.status === 0 && r.stdout.trim() === configured; };
+      scope = holds(['config', '--worktree', '--get', 'core.hooksPath']) ? 'worktree'
+        : holds(['config', '--local', '--get', 'core.hooksPath']) ? 'local' : 'unknown';
+    }
+  }
+
+  // Unset, or /dev/null (getHooksDir then falls back to .git/hooks, bug-200):
+  // the folder is the repository's own.
+  if (configured === null || configured === '/dev/null') {
+    return { dir: hooksDir, owned: true, scope, configured, reason: null };
+  }
+  if (!REPO_SCOPES.has(scope)) return { dir: hooksDir, owned: false, scope, configured, reason: 'scope' };
+
+  const roots = [git(['rev-parse', '--show-toplevel']), git(['rev-parse', '--git-common-dir'])]
+    .filter(r => r.status === 0 && r.stdout.trim())
+    .map(r => canonicalPath(resolve(dir, r.stdout.trim())));
+  const target = canonicalPath(hooksDir);
+  const inside = roots.some(root => isInside(root, target));
+  return { dir: hooksDir, owned: inside, scope, configured, reason: inside ? null : 'outside' };
 }

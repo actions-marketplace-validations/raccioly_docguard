@@ -1,9 +1,10 @@
 /**
  * Hooks Command — Generate pre-commit/pre-push hooks for DocGuard
  * Creates git hooks that run guard/score before commits.
+ * @implements docguard.adoption-workflow-integrity#FR-003
  */
 
-import { existsSync, writeFileSync, mkdirSync, chmodSync, readFileSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, chmodSync, readFileSync, unlinkSync } from 'node:fs';
 
 // v0.16-P3: managed-block markers. Letting users extend the hook with their
 // own commands (data-file guards, lint checks, etc.) without us clobbering
@@ -21,8 +22,54 @@ import { existsSync, writeFileSync, mkdirSync, chmodSync, readFileSync, unlinkSy
 // On re-install, we splice ONLY the content between the markers, preserving
 // everything else verbatim. Without markers (legacy hooks or third-party
 // pre-existing hooks), behavior falls back to the existing --force flow.
+// Hook managers own the hooks directory: husky v9 points core.hooksPath at
+// .husky/_ (generated dispatchers), lefthook and simple-git-hooks write their
+// own dispatchers into .git/hooks. Replacing a dispatcher disables EVERY hook
+// that manager runs (#454), so DocGuard never overwrites one — it says where
+// the line belongs instead. (docguard.field-report-followups#FR-004)
+const MANAGER_COMMANDS = {
+  __proto__: null,
+  'pre-commit': 'npx docguard-cli guard --changed-only',
+  'pre-push': 'npx docguard-cli ci',
+};
+
+/**
+ * @implements docguard.field-report-followups#FR-004
+ * @returns {{ name: string, target: string } | null}
+ */
+export function detectHookManager(projectDir, hooksDir, hookName, existing = '') {
+  const rel = hooksDir.replace(/\\/g, '/');
+  if (/(^|\/)\.husky\/_\/?$/.test(rel) || existsSync(resolve(hooksDir, 'h')) && existsSync(resolve(projectDir, '.husky'))
+    || /\bhusky\b/.test(existing)) {
+    return { name: 'husky', target: `.husky/${hookName}` };
+  }
+  if (/\blefthook\b/.test(existing)
+    || ['lefthook.yml', 'lefthook.yaml', '.lefthook.yml', '.lefthook.yaml'].some(f => existsSync(resolve(projectDir, f)))) {
+    return { name: 'lefthook', target: `lefthook.yml → ${hookName}: commands:` };
+  }
+  let pkg = null;
+  try { pkg = JSON.parse(readFileSync(resolve(projectDir, 'package.json'), 'utf-8')); } catch { /* no package.json */ }
+  if (/simple-git-hooks/.test(existing) || (pkg && pkg['simple-git-hooks'])) {
+    return { name: 'simple-git-hooks', target: `package.json → "simple-git-hooks"."${hookName}" (then run npx simple-git-hooks)` };
+  }
+  return null;
+}
+
 const BEGIN_MARKER = '# BEGIN DOCGUARD MANAGED — do not edit between these markers';
 const END_MARKER   = '# END DOCGUARD MANAGED';
+const escapeRegExp = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+function managedBounds(content) {
+  const starts = [...content.matchAll(new RegExp(`^${escapeRegExp(BEGIN_MARKER)}\\r?$`, 'gm'))]
+    .map(match => match.index);
+  const ends = [...content.matchAll(new RegExp(`^${escapeRegExp(END_MARKER)}\\r?$`, 'gm'))]
+    .map(match => match.index);
+  const start = starts[0];
+  const end = ends.at(-1);
+  return Number.isInteger(start) && Number.isInteger(end) && end > start
+    ? { start, end }
+    : null;
+}
 
 /**
  * Wrap a hook body in BEGIN/END markers so future re-installs can splice
@@ -43,23 +90,85 @@ function wrapManaged(body) {
  * the BEGIN/END markers. Returns the new file content (string) or null
  * when the markers aren't found (caller falls back to legacy behavior).
  */
-function spliceManagedBlock(existing, newBody) {
-  const startIdx = existing.indexOf(BEGIN_MARKER);
-  const endIdx   = existing.indexOf(END_MARKER);
-  if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) return null;
+function spliceManagedBlock(existing, rawBody) {
+  const bounds = managedBounds(existing);
+  if (!bounds) return null;
+  const startIdx = bounds.start;
+  // Use the outermost end marker so one reinstall also repairs hooks written
+  // by v0.40.5-v0.41.2, which accidentally nested a second managed block.
+  const endIdx = bounds.end;
   const before = existing.slice(0, startIdx);
   const after  = existing.slice(endIdx + END_MARKER.length);
-  // newBody has its own shebang — strip it since we're splicing into the
+  // rawBody has its own shebang — strip it since we're splicing into the
   // middle of an existing file (which already has one).
-  const bodyNoShebang = newBody.replace(/^#!.*\n/, '');
+  const bodyNoShebang = rawBody.replace(/^#!.*\n/, '');
   return `${before}${BEGIN_MARKER}\n${bodyNoShebang.replace(/\n+$/, '')}\n${END_MARKER}${after}`;
+}
+
+function hookState(name, hooksDir) {
+  const path = resolve(hooksDir, name);
+  if (!existsSync(path)) return { kind: 'missing', path, content: '' };
+  let content;
+  try { content = readFileSync(path, 'utf-8'); }
+  catch { return { kind: 'unreadable', path, content: '' }; }
+  if (managedBounds(content)) {
+    return { kind: 'managed', path, content };
+  }
+  const legacySignature = new RegExp(`^# DocGuard ${escapeRegExp(name)} hook(?: \\(auto-fix mode\\))?$`, 'm');
+  if (legacySignature.test(content)) return { kind: 'legacy', path, content };
+  return { kind: 'foreign', path, content };
+}
+
+function removeManagedBlock(content) {
+  const bounds = managedBounds(content);
+  if (!bounds) return null;
+  const start = bounds.start;
+  // Match spliceManagedBlock's outermost recovery boundary so removal also
+  // cleans up already-nested blocks from affected releases.
+  const end = bounds.end;
+  const remaining = `${content.slice(0, start)}${content.slice(end + END_MARKER.length)}`
+    .replace(/\n{3,}/g, '\n\n');
+  return remaining;
 }
 import { resolve, relative, basename } from 'node:path';
 import { c } from '../shared.mjs';
-import { getHooksDir } from '../shared-git.mjs';
+import { safeWrite } from '../writers/generate-io.mjs';
+import { ensureStateDir } from '../writers/state-dir.mjs';
+import { resolveHooksTarget } from '../shared-git.mjs';
 import { listCanonicalDocs } from '../shared-ignore.mjs';
+import { namesToken } from '../scanners/doc-references.mjs';
+
+// Git enforcement is offline and fail-closed; agent nudges stay best-effort.
+const ENFORCEMENT_RUNTIME = `
+# A Git hook is repo-wide (it lives in the common .git/hooks and is shared by
+# every linked worktree), but .docguard.json is a branch-local tracked file.
+# During adoption the two cannot be consistent: the hook is already active
+# everywhere while the config exists on one branch only. A project that has not
+# adopted DocGuard must not be blocked by a hook installed from another branch.
+if [ ! -f ".docguard.json" ]; then
+  echo "DocGuard: not initialised here (no .docguard.json) — skipping."
+  echo "          Adopt it with: docguard init"
+  exit 0
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "❌ Node.js runtime not found — operation blocked" >&2
+  exit 1
+fi
+
+# Git runs these hooks from the worktree root. Prefer its installed version.
+if [ -x "./node_modules/.bin/docguard" ]; then
+  DOCGUARD="./node_modules/.bin/docguard"
+elif command -v docguard >/dev/null 2>&1; then
+  DOCGUARD="docguard"
+else
+  echo "❌ DocGuard not found locally or on PATH — operation blocked" >&2
+  exit 1
+fi
+`;
 
 const HOOKS = {
+  __proto__: null,
   'pre-commit': {
     description: 'Run docguard guard before every commit',
     content: `#!/bin/sh
@@ -70,20 +179,14 @@ const HOOKS = {
 
 echo "🛡️  Running DocGuard guard..."
 
-# Check if docguard is available
-if command -v npx &> /dev/null; then
-  npx docguard-cli guard
-  EXIT_CODE=$?
-elif command -v docguard &> /dev/null; then
-  docguard guard
-  EXIT_CODE=$?
-else
-  echo "⚠️  DocGuard not found. Skipping guard check."
-  echo "   Install: npm install -g docguard"
-  exit 0
-fi
+${ENFORCEMENT_RUNTIME}
+"$DOCGUARD" guard
+EXIT_CODE=$?
 
-if [ $EXIT_CODE -eq 1 ]; then
+if [ "$EXIT_CODE" -eq 3 ]; then
+  echo ""
+  echo "DocGuard: project not initialised — commit allowed"
+elif [ "$EXIT_CODE" -ne 0 ] && [ "$EXIT_CODE" -ne 2 ]; then
   echo ""
   echo "❌ DocGuard guard FAILED — commit blocked"
   echo "   Fix the errors above, then try again."
@@ -94,7 +197,7 @@ elif [ $EXIT_CODE -eq 2 ]; then
   echo "⚠️  DocGuard guard found warnings — commit allowed"
 fi
 
-exit 0
+:
 `,
   },
 
@@ -110,22 +213,28 @@ MIN_SCORE=60
 
 echo "📊 Running DocGuard score check (minimum: $MIN_SCORE)..."
 
-# Get score as JSON
-if command -v npx &> /dev/null; then
-  RESULT=$(npx docguard-cli score --format json 2>/dev/null)
-elif command -v docguard &> /dev/null; then
-  RESULT=$(docguard score --format json 2>/dev/null)
-else
-  echo "⚠️  DocGuard not found. Skipping score check."
-  exit 0
+${ENFORCEMENT_RUNTIME}
+
+# Score has no warning exit status: any command failure blocks the push.
+RESULT=$("$DOCGUARD" score --format json)
+EXIT_CODE=$?
+if [ "$EXIT_CODE" -ne 0 ]; then
+  echo "❌ DocGuard score failed (exit $EXIT_CODE) — push blocked" >&2
+  exit 1
 fi
 
-# Parse score from JSON
-SCORE=$(echo "$RESULT" | grep -o '"score":[0-9]*' | head -1 | cut -d: -f2)
-
-if [ -z "$SCORE" ]; then
-  echo "⚠️  Could not determine CDD score. Push allowed."
-  exit 0
+# Parse the complete JSON document, never a substring or a nested score.
+SCORE=$(printf '%s' "$RESULT" | node -e '
+  try {
+    const result = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+    if (!result || Array.isArray(result) || !Number.isInteger(result.score) ||
+        result.score < 0 || result.score > 100) process.exit(1);
+    process.stdout.write(String(result.score));
+  } catch { process.exit(1); }
+')
+if [ "$?" -ne 0 ] || [ -z "$SCORE" ]; then
+  echo "❌ Could not determine a valid CDD score — push blocked" >&2
+  exit 1
 fi
 
 echo "   CDD Score: $SCORE/100"
@@ -139,7 +248,7 @@ if [ "$SCORE" -lt "$MIN_SCORE" ]; then
 fi
 
 echo "   ✅ Score meets minimum threshold"
-exit 0
+:
 `,
   },
 
@@ -175,7 +284,7 @@ if ! echo "$COMMIT_MSG" | head -1 | grep -qE "$PATTERN"; then
   exit 1
 fi
 
-exit 0
+:
 `,
   },
 };
@@ -188,31 +297,76 @@ const PRE_COMMIT_AUTOFIX = `#!/bin/sh
 # Install: docguard hooks --type pre-commit --auto-fix
 # Remove: rm .git/hooks/pre-commit
 
-RUN="npx docguard-cli"
-if command -v docguard >/dev/null 2>&1; then RUN="docguard"; fi
+${ENFORCEMENT_RUNTIME}
 
 echo "🛡️  DocGuard: applying mechanical fixes…"
 # 1. Deterministically remove stale documented endpoints (safe, no AI).
-$RUN fix --write
+if ! "$DOCGUARD" fix --write; then
+  echo "❌ DocGuard fix failed — commit blocked" >&2
+  exit 1
+fi
 # 2. Re-stage anything DocGuard rewrote so the fix is part of THIS commit.
-git add docs-canonical/ 2>/dev/null
+if ! git add docs-canonical/; then
+  echo "❌ Could not stage DocGuard fixes — commit blocked" >&2
+  exit 1
+fi
 
 # 3. Validate.
-$RUN guard
+"$DOCGUARD" guard
 EXIT_CODE=$?
 
-if [ $EXIT_CODE -eq 1 ]; then
+if [ "$EXIT_CODE" -eq 3 ]; then
+  echo ""
+  echo "DocGuard: project not initialised — commit allowed"
+elif [ "$EXIT_CODE" -ne 0 ] && [ "$EXIT_CODE" -ne 2 ]; then
   echo ""
   echo "❌ DocGuard guard FAILED — commit blocked."
   echo "   Remaining issues need an AI agent (content rewrites, not mechanical):"
-  echo "   Run: $RUN diagnose   (emits ready-to-paste agent fix prompts)"
+  echo "   Run: $DOCGUARD diagnose   (emits ready-to-paste agent fix prompts)"
   echo "   To skip: git commit --no-verify"
   exit 1
 elif [ $EXIT_CODE -eq 2 ]; then
   echo "⚠️  DocGuard guard found warnings — commit allowed"
 fi
-exit 0
+:
 `;
+
+/** Who set a core.hooksPath that is not this repository's own. */
+function sharedFolderOrigin(target) {
+  if (target.reason === 'outside') return `set in this repository's ${target.scope} config, but outside the repository, where other repositories can use it`;
+  if (target.scope === 'global') return 'core.hooksPath from your global Git config, shared by every repository on this machine';
+  if (target.scope === 'system') return 'core.hooksPath from the system Git config, shared by every repository on this machine';
+  if (target.scope === 'command') return 'core.hooksPath from the command line or GIT_CONFIG_* environment, not from this repository';
+  return 'core.hooksPath from a configuration outside this repository';
+}
+
+/**
+ * @implements docguard.hooks-repo-scope#FR-001
+ */
+function refuseSharedFolder(target, hookTypes, flags) {
+  console.log(`  ${c.red}❌ core.hooksPath points at ${target.dir}${c.reset}`);
+  console.log(`     ${sharedFolderOrigin(target)}.`);
+  console.log(`     DocGuard writes, replaces and removes hooks only in this repository's own folder, so it changed nothing.\n`);
+  if (flags.remove) {
+    const present = hookTypes.map(name => hookState(name, target.dir)).filter(s => s.kind === 'managed' || s.kind === 'legacy');
+    if (present.length) {
+      console.log(`  ${c.dim}To remove DocGuard's hooks from the shared folder (every repository that uses it loses them):${c.reset}`);
+      for (const s of present) console.log(`     ${c.cyan}rm ${s.path}${c.reset}`);
+    } else {
+      console.log(`  ${c.dim}No DocGuard hook is installed there.${c.reset}`);
+    }
+  } else {
+    console.log(`  ${c.dim}Choose one:${c.reset}`);
+    console.log(`   ${c.dim}• Add DocGuard to the shared hooks yourself:${c.reset}`);
+    for (const name of hookTypes) {
+      if (MANAGER_COMMANDS[name]) console.log(`       ${name}: ${c.cyan}${MANAGER_COMMANDS[name]}${c.reset}`);
+    }
+    console.log(`   ${c.dim}• Or give this repository its own hooks folder (Git then skips the shared hooks here):${c.reset}`);
+    console.log(`       ${c.cyan}git config --local core.hooksPath .githooks && docguard hooks${c.reset}`);
+  }
+  console.log('');
+  process.exit(1);
+}
 
 export function runHooks(projectDir, config, flags) {
   console.log(`${c.bold}🪝 DocGuard Hooks — ${config.projectName}${c.reset}`);
@@ -221,7 +375,7 @@ export function runHooks(projectDir, config, flags) {
   // ── Claude Code agent nudge: `docguard hooks --claude` ──
   // Separate path from git hooks: it edits .claude/settings.json, needs no
   // git repo, and is explicitly opt-in (writing agent config unasked is a
-  // trust break — same class as the ensureSkills READ_ONLY_COMMANDS rule).
+  // trust break — the same rule that keeps skill installation inside init).
   if (flags.claude) {
     installClaudeNudge(projectDir, { remove: !!flags.remove });
     return;
@@ -230,7 +384,8 @@ export function runHooks(projectDir, config, flags) {
   // Resolve the real hooks dir via git — NOT `<projectDir>/.git/hooks`, which
   // is wrong inside a linked worktree (where `.git` is a file, not a dir) and
   // ignores a custom core.hooksPath.
-  const hooksDir = getHooksDir(projectDir);
+  const target = resolveHooksTarget(projectDir);
+  const hooksDir = target.dir;
   if (!hooksDir) {
     console.log(`  ${c.red}❌ Not a git repository. Run ${c.cyan}git init${c.red} first.${c.reset}\n`);
     process.exit(1);
@@ -255,10 +410,21 @@ export function runHooks(projectDir, config, flags) {
 
   // List mode
   if (flags.list) {
+    if (!target.owned) {
+      console.log(`  ${c.yellow}⚠ These hooks come from a shared folder: ${hooksDir} (${sharedFolderOrigin(target)}).${c.reset}\n`);
+    }
     console.log(`  ${c.bold}Available hooks:${c.reset}\n`);
     for (const [name, hook] of Object.entries(HOOKS)) {
-      const installed = existsSync(resolve(hooksDir, name));
-      const status = installed ? `${c.green}✅ installed${c.reset}` : `${c.dim}not installed${c.reset}`;
+      const state = hookState(name, hooksDir);
+      const status = state.kind === 'managed'
+        ? `${c.green}✅ DocGuard installed${c.reset}`
+        : state.kind === 'legacy'
+          ? `${c.yellow}⚠ legacy DocGuard hook — upgrade with --force${c.reset}`
+          : state.kind === 'foreign'
+            ? `${c.yellow}existing non-DocGuard hook${c.reset}`
+            : state.kind === 'unreadable'
+              ? `${c.red}unreadable hook${c.reset}`
+              : `${c.dim}not installed${c.reset}`;
       console.log(`    ${c.cyan}${name}${c.reset}: ${hook.description} [${status}]`);
     }
     console.log(`\n  ${c.dim}Install: docguard hooks --type <name>${c.reset}`);
@@ -266,20 +432,33 @@ export function runHooks(projectDir, config, flags) {
     return;
   }
 
+  // A shared hooks folder runs in other repositories too: installing, forcing
+  // or removing there would change every one of them.
+  if (!target.owned) refuseSharedFolder(target, hookTypes, flags);
+
   // Remove mode
   if (flags.remove) {
     let removed = 0;
     for (const name of hookTypes) {
-      const hookPath = resolve(hooksDir, name);
-      if (existsSync(hookPath)) {
-        const content = readFileSync(hookPath, 'utf-8');
-        if (content.includes('DocGuard')) {
-          unlinkSync(hookPath);
-          console.log(`  ${c.yellow}🗑️  Removed: ${name}${c.reset}`);
-          removed++;
+      const state = hookState(name, hooksDir);
+      if (state.kind === 'managed') {
+        const remaining = removeManagedBlock(state.content);
+        const meaningful = remaining.replace(/^#!.*(?:\n|$)/, '').trim();
+        if (meaningful) {
+          safeWrite(state.path, remaining);
+          chmodSync(state.path, 0o755);
+          console.log(`  ${c.yellow}🗑️  Removed DocGuard block from ${name}; preserved other hook commands${c.reset}`);
         } else {
-          console.log(`  ${c.dim}⏭️  ${name}: not a DocGuard hook (skipped)${c.reset}`);
+          unlinkSync(state.path);
+          console.log(`  ${c.yellow}🗑️  Removed: ${name}${c.reset}`);
         }
+        removed++;
+      } else if (state.kind === 'legacy') {
+        unlinkSync(state.path);
+        console.log(`  ${c.yellow}🗑️  Removed legacy DocGuard hook: ${name}${c.reset}`);
+        removed++;
+      } else if (state.kind !== 'missing') {
+        console.log(`  ${c.dim}⏭️  ${name}: not a recognized DocGuard hook (skipped)${c.reset}`);
       }
     }
     console.log(`\n  Removed: ${removed}\n`);
@@ -294,8 +473,23 @@ export function runHooks(projectDir, config, flags) {
   for (const name of hookTypes) {
     const hookPath = resolve(hooksDir, name);
     const useAutofix = name === 'pre-commit' && flags.autoFix;
-    const newContent = wrapManaged(useAutofix ? PRE_COMMIT_AUTOFIX : HOOKS[name].content);
+    const rawContent = useAutofix ? PRE_COMMIT_AUTOFIX : HOOKS[name].content;
+    const newContent = wrapManaged(rawContent);
     const desc = useAutofix ? 'Apply mechanical fixes (fix --write) then guard' : HOOKS[name].description;
+
+    // A hook manager owns this hook (its dispatcher, or its generated
+    // directory where a written file would be regenerated away): never offer
+    // --force, never write. A DocGuard-managed block is still refreshed below.
+    const current = existsSync(hookPath) ? readFileSync(hookPath, 'utf-8') : '';
+    const manager = current.includes(BEGIN_MARKER) ? null : detectHookManager(projectDir, hooksDir, name, current);
+    if (manager) {
+      const line = MANAGER_COMMANDS[name];
+      console.log(`  ${c.yellow}⚠️  ${name}: ${manager.name} manages this hook — DocGuard will not write to its hooks directory${flags.force ? ' (--force ignored)' : ''}.${c.reset}`);
+      if (line) console.log(`     ${c.dim}Add this line to${c.reset} ${c.cyan}${manager.target}${c.reset}${c.dim}:${c.reset} ${c.cyan}${line}${c.reset}`);
+      else console.log(`     ${c.dim}Add DocGuard's ${name} check to${c.reset} ${c.cyan}${manager.target}${c.reset}`);
+      skipped++;
+      continue;
+    }
 
     if (existsSync(hookPath)) {
       const existing = readFileSync(hookPath, 'utf-8');
@@ -304,9 +498,9 @@ export function runHooks(projectDir, config, flags) {
       // preserve everything outside it. The user can extend the hook with
       // their own commands above/below the markers without losing them on
       // re-install.
-      const spliced = spliceManagedBlock(existing, newContent);
+      const spliced = spliceManagedBlock(existing, rawContent);
       if (spliced !== null) {
-        writeFileSync(hookPath, spliced, 'utf-8');
+        safeWrite(hookPath, spliced);
         chmodSync(hookPath, 0o755);
         console.log(`  ${c.green}↻ ${name}${c.reset}: updated DocGuard managed block (preserved user content around it)`);
         installed++;
@@ -330,7 +524,7 @@ export function runHooks(projectDir, config, flags) {
       // --force path: write fresh managed-block version
     }
 
-    writeFileSync(hookPath, newContent, 'utf-8');
+    safeWrite(hookPath, newContent);
     chmodSync(hookPath, 0o755);
     console.log(`  ${c.green}✅ ${name}${c.reset}: ${desc}`);
     installed++;
@@ -402,7 +596,7 @@ export function installClaudeNudge(projectDir, { remove = false } = {}) {
     settings.hooks.PostToolUse = groups.filter(g => !isOurNudgeGroup(g));
     if (settings.hooks.PostToolUse.length === 0) delete settings.hooks.PostToolUse;
     if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
-    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
+    safeWrite(settingsPath, JSON.stringify(settings, null, 2) + '\n');
     console.log(`  ${c.yellow}🗑️  Removed the DocGuard nudge hook from .claude/settings.json${c.reset} ${c.dim}(everything else preserved)${c.reset}\n`);
     return;
   }
@@ -420,7 +614,7 @@ export function installClaudeNudge(projectDir, { remove = false } = {}) {
   });
 
   if (!existsSync(settingsDir)) mkdirSync(settingsDir, { recursive: true });
-  writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
+  safeWrite(settingsPath, JSON.stringify(settings, null, 2) + '\n');
   console.log(`  ${c.green}✅ Installed the DocGuard nudge hook${c.reset} → .claude/settings.json (PostToolUse)`);
   console.log(`  ${c.dim}After an agent edits a canonical doc (or code the docs reference), it is${c.reset}`);
   console.log(`  ${c.dim}nudged toward docguard guard --changed-only / docguard impact.${c.reset}`);
@@ -471,8 +665,9 @@ export function runNudgeHook(projectDir) {
     if (state[rel] && now - state[rel] < NUDGE_THROTTLE_MS) return;
     state[rel] = now;
     try {
+      ensureStateDir(projectDir);
       mkdirSync(resolve(projectDir, '.docguard'), { recursive: true });
-      writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n', 'utf-8');
+      safeWrite(statePath, JSON.stringify(state, null, 2) + '\n');
     } catch { /* state is best-effort; still nudge */ }
 
     process.stdout.write(JSON.stringify({ decision: 'block', reason }) + '\n');
@@ -481,12 +676,16 @@ export function runNudgeHook(projectDir) {
   }
 }
 
-/** Which canonical/agent docs mention this basename? Cheap line scan. */
+/**
+ * Which canonical/agent docs name this basename as a whole file name? A doc
+ * naming `hub.mjs` does not name `b.mjs`.
+ * @implements docguard.whole-token-sibling-matchers#FR-001
+ */
 function docsReferencingFile(projectDir, base) {
   const docs = [];
   const check = (name, full) => {
     try {
-      if (readFileSync(full, 'utf-8').includes(base)) docs.push(name);
+      if (namesToken(readFileSync(full, 'utf-8'), base)) docs.push(name);
     } catch { /* unreadable */ }
   };
   // Recursive — a nested doc mentioning the edited file must still trigger

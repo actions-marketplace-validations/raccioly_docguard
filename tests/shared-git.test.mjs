@@ -8,10 +8,10 @@
  * @req SC-L3-002 — getFileHistory follows renames
  * @req SC-L3-003 — getRenameHistory returns historical paths in reverse-chrono
  * @req SC-L3-004 — changedFilesSince returns ACMR diff against a ref
+ * @req docguard.completion-revision-anchoring#FR-008
  */
 import { describe, it, afterEach } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -23,17 +23,25 @@ import {
   getRenameHistory,
   changedFilesSince,
   countCommitsSince,
+  getDiffSnapshot,
+  getDiffText,
+  readPatchBatches,
+  fileContentAtRev,
+  symbolExistsAtRev,
 } from '../cli/shared-git.mjs';
+import { fixtureGit } from './helpers/git.mjs';
+// @implements docguard.test-git-hermeticity#FR-001: this file's fixture git goes through the helper.
 
 function tmp() {
   return mkdtempSync(join(tmpdir(), 'docguard-git-'));
 }
 
+function cleanup(dir) {
+  if (dir) rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+}
+
 function git(dir, ...args) {
-  const env = { ...process.env };
-  return spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t'].concat(args), {
-    cwd: dir, encoding: 'utf-8', env,
-  });
+  return fixtureGit(dir, ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args]);
 }
 
 function commit(dir, msg) {
@@ -47,7 +55,7 @@ describe('isGitRepo', () => {
     try {
       assert.equal(isGitRepo(dir), false);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      cleanup(dir);
     }
   });
 
@@ -57,14 +65,14 @@ describe('isGitRepo', () => {
       git(dir, 'init', '-q');
       assert.equal(isGitRepo(dir), true);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      cleanup(dir);
     }
   });
 });
 
 describe('getLastCommitDate (follows renames)', () => {
   let dir;
-  afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
+  afterEach(() => cleanup(dir));
 
   it('returns null when file is untracked', () => {
     dir = tmp();
@@ -106,7 +114,7 @@ describe('getLastCommitDate (follows renames)', () => {
 
 describe('getFileHistory (follows renames)', () => {
   let dir;
-  afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
+  afterEach(() => cleanup(dir));
 
   it('returns commits that touched the file under both old and new names', () => {
     dir = tmp();
@@ -147,7 +155,7 @@ describe('getFileHistory (follows renames)', () => {
 
 describe('getRenameHistory', () => {
   let dir;
-  afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
+  afterEach(() => cleanup(dir));
 
   it('returns [path] for files that have not been renamed', () => {
     dir = tmp();
@@ -180,7 +188,7 @@ describe('getRenameHistory', () => {
 
 describe('changedFilesSince', () => {
   let dir;
-  afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
+  afterEach(() => cleanup(dir));
 
   it('returns files modified between a ref and HEAD', () => {
     dir = tmp();
@@ -203,5 +211,182 @@ describe('changedFilesSince', () => {
     // HEAD~5 doesn't exist
     const changed = changedFilesSince(dir, 'HEAD~5');
     assert.deepEqual(changed, []);
+  });
+});
+
+describe('getDiffText', () => {
+  let dir;
+  afterEach(() => cleanup(dir));
+
+  it('returns diff patch text between refs', () => {
+    dir = tmp();
+    git(dir, 'init', '-q');
+    writeFileSync(join(dir, 'a.ts'), 'v1\n');
+    commit(dir, 'first');
+    const base = git(dir, 'rev-parse', 'HEAD').trim();
+    writeFileSync(join(dir, 'a.ts'), 'v2\n');
+    commit(dir, 'second');
+    const diff = getDiffText(dir, base);
+    assert.ok(diff.includes('-v1'));
+    assert.ok(diff.includes('+v2'));
+  });
+
+  it('filters by pathspec if provided', () => {
+    dir = tmp();
+    git(dir, 'init', '-q');
+    writeFileSync(join(dir, 'a.ts'), 'v1\n');
+    writeFileSync(join(dir, 'b.ts'), 'v1\n');
+    commit(dir, 'first');
+    const base = git(dir, 'rev-parse', 'HEAD').trim();
+    writeFileSync(join(dir, 'a.ts'), 'v2\n');
+    writeFileSync(join(dir, 'b.ts'), 'v2\n');
+    commit(dir, 'second');
+    const diff = getDiffText(dir, base, ['a.ts']);
+    assert.ok(diff.includes('a.ts'));
+    assert.ok(!diff.includes('b.ts'));
+  });
+});
+
+describe('fileContentAtRev', () => {
+  let dir;
+  afterEach(() => cleanup(dir));
+
+  it('returns file content at a specific revision', () => {
+    dir = tmp();
+    git(dir, 'init', '-q');
+    writeFileSync(join(dir, 'a.ts'), 'v1\n');
+    commit(dir, 'first');
+    const base = git(dir, 'rev-parse', 'HEAD').trim();
+    writeFileSync(join(dir, 'a.ts'), 'v2\n');
+    commit(dir, 'second');
+    const content = fileContentAtRev(dir, base, 'a.ts');
+    assert.equal(content, 'v1\n');
+  });
+
+  it('returns null if file did not exist at revision', () => {
+    dir = tmp();
+    git(dir, 'init', '-q');
+    writeFileSync(join(dir, 'a.ts'), 'v1\n');
+    commit(dir, 'first');
+    const base = git(dir, 'rev-parse', 'HEAD').trim();
+    writeFileSync(join(dir, 'b.ts'), 'v1\n');
+    commit(dir, 'second');
+    const content = fileContentAtRev(dir, base, 'b.ts');
+    assert.equal(content, null);
+  });
+});
+
+describe('symbolExistsAtRev', () => {
+  let dir;
+  afterEach(() => cleanup(dir));
+
+  it('returns true if symbol exists at revision', () => {
+    dir = tmp();
+    git(dir, 'init', '-q');
+    writeFileSync(join(dir, 'a.ts'), 'export function testSymbol() {}\n');
+    commit(dir, 'first');
+    const base = git(dir, 'rev-parse', 'HEAD').trim();
+    writeFileSync(join(dir, 'a.ts'), 'export function renamedSymbol() {}\n');
+    commit(dir, 'second');
+    assert.equal(symbolExistsAtRev(dir, 'testSymbol', base), true);
+  });
+
+  it('returns false if symbol does not exist at revision', () => {
+    dir = tmp();
+    git(dir, 'init', '-q');
+    writeFileSync(join(dir, 'a.ts'), 'export function otherSymbol() {}\n');
+    commit(dir, 'first');
+    const base = git(dir, 'rev-parse', 'HEAD').trim();
+    assert.equal(symbolExistsAtRev(dir, 'testSymbol', base), false);
+  });
+});
+
+describe('getDiffSnapshot', () => {
+  let dir;
+  afterEach(() => cleanup(dir));
+
+  it('keeps rename, deletion, and patch evidence in one bounded snapshot', () => {
+    dir = tmp();
+    git(dir, 'init', '-q');
+    writeFileSync(join(dir, 'old.ts'), 'export const oldValue = 1;\n');
+    writeFileSync(join(dir, 'deleted.ts'), 'export const removed = true;\n');
+    commit(dir, 'base');
+    const base = git(dir, 'rev-parse', 'HEAD').trim();
+    renameSync(join(dir, 'old.ts'), join(dir, 'new.ts'));
+    rmSync(join(dir, 'deleted.ts'));
+    commit(dir, 'change paths');
+
+    const snapshot = getDiffSnapshot(dir, base);
+    assert.equal(snapshot.status, 'ok');
+    assert.equal(snapshot.commitCount, 1);
+    assert.ok(snapshot.changedFiles.some(file => file.oldPath === 'old.ts' && file.newPath === 'new.ts'));
+    assert.ok(snapshot.changedFiles.some(file => file.oldPath === 'deleted.ts' && file.newPath === null));
+    assert.ok(snapshot.patchBytes > 0);
+  });
+
+  it('returns explicit too-large status instead of an empty successful diff', () => {
+    dir = tmp();
+    git(dir, 'init', '-q');
+    writeFileSync(join(dir, 'large.ts'), 'base\n');
+    commit(dir, 'base');
+    const base = git(dir, 'rev-parse', 'HEAD').trim();
+    writeFileSync(join(dir, 'large.ts'), 'x'.repeat(4096));
+    commit(dir, 'large patch');
+
+    const snapshot = getDiffSnapshot(dir, base, { maxPatchBytes: 128 });
+    assert.equal(snapshot.status, 'too-large');
+    assert.match(snapshot.reason, /newer --since revision/);
+    assert.equal(snapshot.changedFiles.length, 1);
+  });
+});
+
+describe('readPatchBatches (docguard.completion-revision-anchoring#FR-008)', () => {
+  let dir;
+  afterEach(() => cleanup(dir));
+
+  function range() {
+    dir = tmp();
+    git(dir, 'init', '-q');
+    writeFileSync(join(dir, 'old.ts'), Array.from({ length: 40 }, (_, i) => `export const v${i} = ${i};`).join('\n'));
+    writeFileSync(join(dir, 'gone.ts'), 'export const removed = true;\n');
+    commit(dir, 'base');
+    const base = git(dir, 'rev-parse', 'HEAD').trim();
+    renameSync(join(dir, 'old.ts'), join(dir, 'new.ts'));
+    rmSync(join(dir, 'gone.ts'));
+    for (const name of ['a', 'b', 'c']) writeFileSync(join(dir, `${name}.txt`), `${name}\n`.repeat(200));
+    writeFileSync(join(dir, ':(glob)*.txt'), 'a path that looks like pathspec magic\n');
+    commit(dir, 'change');
+    return base;
+  }
+
+  it('reads every file once, keeps a rename paired, and treats paths literally', () => {
+    const base = range();
+    const snapshot = getDiffSnapshot(dir, base);
+    const patches = [];
+    const result = readPatchBatches(dir, base, snapshot.changedFiles, patch => patches.push(patch), { maxPatchBytes: 1024, maxBatchPaths: 2 });
+    assert.equal(result.status, 'ok', result.reason);
+    assert.ok(result.batches > 1);
+    assert.equal(result.patchBytes, snapshot.patchBytes);
+    const joined = patches.join('');
+    assert.match(joined, /rename from old\.ts\nrename to new\.ts/);
+    for (const name of ['a.txt', 'b.txt', 'c.txt', 'gone.ts', ':(glob)*.txt']) {
+      assert.equal(joined.split(`diff --git a/${name} b/${name}`).length, 2, `${name} read exactly once`);
+    }
+  });
+
+  it('names a single file whose patch alone exceeds the per-call budget', () => {
+    const base = range();
+    const snapshot = getDiffSnapshot(dir, base);
+    const result = readPatchBatches(dir, base, snapshot.changedFiles, () => {}, { maxPatchBytes: 512 });
+    assert.equal(result.status, 'too-large');
+    assert.match(result.reason, /Patch for [a-c]\.txt exceeds the 512-byte per-call budget/);
+  });
+
+  it('stops at the total range budget', () => {
+    const base = range();
+    const snapshot = getDiffSnapshot(dir, base);
+    const result = readPatchBatches(dir, base, snapshot.changedFiles, () => {}, { maxPatchBytes: 1024, maxRangePatchBytes: 1500 });
+    assert.equal(result.status, 'too-large');
+    assert.match(result.reason, /Range patch exceeds its 1500-byte total budget/);
   });
 });

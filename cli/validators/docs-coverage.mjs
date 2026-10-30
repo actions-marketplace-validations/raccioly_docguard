@@ -1,3 +1,4 @@
+import { docRolePath, resolveDocRole } from '../shared-doc-roles.mjs';
 /**
  * Docs-Coverage Validator — Detects code features not referenced in docs.
  *
@@ -18,10 +19,12 @@
  * existing tests are unaffected; guard just renders richer output.
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { resolve, join, relative, basename, extname } from 'node:path';
+import { existsSync, readFileSync, readdirSync, statSync, lstatSync } from 'node:fs';
+import { resolve, join, relative, basename, extname, isAbsolute } from 'node:path';
 import { resolveSourceRoots } from '../shared-source.mjs';
-import { shouldIgnore, walkFiles as sharedWalkFiles, listCanonicalDocs } from '../shared-ignore.mjs';
+import { shouldIgnore, walkFiles as sharedWalkFiles, buildIgnoreFilter, mergeIgnoreFile, DEFAULT_IGNORE_DIRS, isDocguardOwnedDir } from '../shared-ignore.mjs';
+import { resolveDocDirs } from '../shared.mjs';
+import { parseJsTs, walk } from '../scanners/js-ast.mjs';
 import { detectIaC, hasInfrastructureHeading, buildIaCWarning } from '../scanners/iac.mjs';
 import { mkFinding, resultFromFindings } from '../findings.mjs';
 
@@ -48,15 +51,24 @@ const COMMON_DOTFILES = new Set([
   // (e.g. `guard --update-baseline` writing the baseline instantly produced
   // a DCV001 about the baseline file itself).
   '.docguard.json', '.docguardignore', '.docguard.baseline.json',
+  // State files DocGuard's own commands write (the spec registry after
+  // `generate --spec --write`, the doc lock, the retirement archive, the
+  // evidence manifest) — docguard.generated-docs-consistency#FR-005.
+  '.docguard-specs.json', '.docguard-doc-lock.json', '.docguard-archive.json', '.docguard-evidence.json',
 ]);
 
 // Generated tool artifacts (caches, coverage data, lock-data) that land at the
 // repo root but are NOT configuration a human authors or documents. Treating
 // them as "undocumented config files" is a false positive (field test:
-// quick-recon-tool flagged pytest's `.coverage` SQLite data file). Matched by
+// a downstream project flagged pytest's `.coverage` SQLite data file). Matched by
 // exact name OR prefix (`.coverage.<host>.<pid>` is coverage.py's parallel form).
 const GENERATED_DOTFILE_PREFIXES = ['.coverage', '.eslintcache', '.stylelintcache', '.tsbuildinfo'];
 function isGeneratedArtifact(name) {
+  // `.bak` is written by DocGuard's own safeWrite before it overwrites a file.
+  // Reporting it as an undocumented config file made the tool flag its own
+  // backup (field report: `specs --write` -> DCV001 on
+  // `.docguard-specs.json.bak`).
+  if (name.endsWith('.bak')) return true;
   return GENERATED_DOTFILE_PREFIXES.some(p => name === p || name.startsWith(p + '.'));
 }
 
@@ -72,7 +84,7 @@ export function validateDocsCoverage(projectDir, config) {
   let total = 0;
 
   // Collect all doc content for searching
-  const allDocContent = collectDocContent(projectDir);
+  const allDocContent = collectDocContent(projectDir, config);
   if (!allDocContent) {
     // Literal legacy shape (no findings key) — tests deepEqual this exact object.
     return { errors: [], warnings: [], passed: 0, total: 0 };
@@ -113,7 +125,7 @@ export function validateDocsCoverage(projectDir, config) {
   findings.push(...readmeChecks.findings);
 
   // ── Check 6: IaC-aware Infrastructure documentation ──
-  const iacChecks = checkIaCDocumentation(projectDir, iac);
+  const iacChecks = checkIaCDocumentation(projectDir, iac, config);
   total += iacChecks.total;
   passed += iacChecks.passed;
   findings.push(...iacChecks.findings);
@@ -171,7 +183,7 @@ function checkConfigFiles(projectDir, allDocContent, config = {}) {
         code: 'DCV001',
         validator: 'docsCoverage',
         severity: 'warn',
-        message: `Config file "${entry}" exists but is not mentioned in any documentation. Document its purpose in ARCHITECTURE.md or README.md`,
+        message: `Config file "${entry}" exists but is not mentioned in scanned supported Markdown or extension YAML documentation. Document its purpose in ARCHITECTURE.md or README.md`,
         location: entry,
         suggestion: { kind: 'fix', text: 'Explain what this config file does in ARCHITECTURE.md or README.md' },
       }));
@@ -233,7 +245,7 @@ function checkSourceDirs(projectDir, allDocContent, config = {}, iac = { isIaC: 
   let passed = 0;
   let total = 0;
 
-  const archPath = resolve(projectDir, 'docs-canonical/ARCHITECTURE.md');
+  const archPath = resolveDocRole(projectDir, config, 'architecture');
   if (!existsSync(archPath)) return { findings, passed, total };
 
   let archContent;
@@ -252,7 +264,9 @@ function checkSourceDirs(projectDir, allDocContent, config = {}, iac = { isIaC: 
 
   // Monorepo-aware: honor config.sourceRoot + workspaces instead of a hardcoded list.
   for (const rootDir of resolveSourceRoots(projectDir, config)) {
-    const root = relative(projectDir, rootDir) || basename(rootDir);
+    // A source root that IS the project prints entries as `name/`, not
+    // `<project-folder>/name/` (docguard.generated-docs-consistency#FR-005).
+    const root = relative(projectDir, rootDir).replaceAll('\\', '/');
     let entries;
     try { entries = readdirSync(rootDir); } catch { continue; }
 
@@ -266,6 +280,8 @@ function checkSourceDirs(projectDir, allDocContent, config = {}, iac = { isIaC: 
       if (IGNORE_DIRS.has(entry) || entry.startsWith('.') || entry === '__tests__' || entry === '__test__') continue;
 
       const relPath = relative(projectDir, fullPath);
+      // DocGuard's own doc homes are documentation, not source directories.
+      if (isDocguardOwnedDir(projectDir, relPath)) continue;
 
       // Honor user-configured ignore patterns (FR-006 / IR-5).
       // Patterns like `**/cdk.out/**` are written to match files INSIDE the
@@ -283,14 +299,15 @@ function checkSourceDirs(projectDir, allDocContent, config = {}, iac = { isIaC: 
 
       total++;
       const searchName = entry.toLowerCase();
-      if (lowerArchContent.includes(searchName) || lowerArchContent.includes(root + '/' + entry)) {
+      const shown = root ? `${root}/${entry}` : entry;
+      if (lowerArchContent.includes(searchName) || lowerArchContent.includes(shown.toLowerCase())) {
         passed++;
       } else {
         findings.push(mkFinding({
           code: 'DCV003',
           validator: 'docsCoverage',
           severity: 'warn',
-          message: `Source directory "${root}/${entry}/" is not referenced in ARCHITECTURE.md`,
+          message: `Source directory "${shown}/" is not referenced in ARCHITECTURE.md`,
           location: relPath,
           suggestion: { kind: 'fix', text: 'Add this directory to the Component Map in docs-canonical/ARCHITECTURE.md' },
         }));
@@ -336,11 +353,11 @@ function isInsideIaCPackage(relPath, packageDirs) {
  * has no Infrastructure heading. Suppresses the generic per-directory
  * warnings that would otherwise fire for bin/, lib/, modules/, handlers/, etc.
  */
-function checkIaCDocumentation(projectDir, iac) {
+function checkIaCDocumentation(projectDir, iac, config = {}) {
   const findings = [];
   if (!iac || !iac.isIaC) return { findings, passed: 0, total: 0 };
 
-  const archPath = resolve(projectDir, 'docs-canonical/ARCHITECTURE.md');
+  const archPath = resolveDocRole(projectDir, config, 'architecture');
   if (!existsSync(archPath)) {
     // No ARCHITECTURE.md at all — structure validator will catch that.
     // Don't double-warn here.
@@ -363,7 +380,7 @@ function checkIaCDocumentation(projectDir, iac) {
       validator: 'docsCoverage',
       severity: 'warn',
       message: buildIaCWarning(tool),
-      location: 'docs-canonical/ARCHITECTURE.md',
+      location: docRolePath(config, 'architecture'),
       suggestion: { kind: 'fix', text: `Add an "Infrastructure" section to ARCHITECTURE.md covering the ${tool.label} layout` },
     }));
   }
@@ -371,42 +388,60 @@ function checkIaCDocumentation(projectDir, iac) {
 }
 
 /**
- * Check 4: Config files that code actually READS are documented.
- *
- * Scans source code for resolve(dir, '.configname') and existsSync('.configname')
- * patterns — these are configs the project USES. Avoids matching config names
- * sitting in arrays (scan patterns for detecting other projects' configs).
+ * Check 4: Distinguish direct file IO from config-like path expressions.
+ * Parsed calls exclude comments and example strings. Unparsed text supplies
+ * review candidates only; it cannot establish file IO or documentation need.
  */
 function checkCodeReferencedConfigs(projectDir, allDocContent, config = {}) {
   const findings = [];
   let passed = 0;
   let total = 0;
-
   const lowerDocContent = allDocContent.toLowerCase();
-  const foundConfigs = new Set();
-
-  // Only match config filenames inside function calls that actually USE the file:
-  // resolve(dir, '.docguardignore'), existsSync('.env.example'), readFileSync('vitest.config.ts')
-  const usageRegex = /(?:resolve|join|existsSync|readFileSync|accessSync|writeFileSync)\s*\([^)]*['"`]([^'"`\n]{2,})['"`]/g;
+  const foundConfigs = new Map();
+  const methods = new Set(['resolve', 'join', 'existsSync', 'accessSync', 'readFileSync', 'writeFileSync']);
+  const directIO = new Set(['readFileSync', 'writeFileSync']);
 
   const scanFile = (filePath) => {
-    const ext = extname(filePath);
-    if (!['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx'].includes(ext)) return;
+    if (!['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx'].includes(extname(filePath))) return;
     let content;
     try { content = readFileSync(filePath, 'utf-8'); } catch { return; }
-
-    usageRegex.lastIndex = 0;
-    let match;
-    while ((match = usageRegex.exec(content)) !== null) {
-      const name = match[1];
-      // Must be a dotfile (.something) or *.config.* — not a path
-      if (name.includes('/') || name.startsWith('..')) continue;
-      const isDotConfig = name.startsWith('.') && name.length > 2;
-      const isNamedConfig = /^[\w-]+\.config\.\w+$/.test(name);
-      if (!isDotConfig && !isNamedConfig) continue;
-      // Skip bare extensions
-      if (/^\.[a-z]{1,4}$/i.test(name)) continue;
-      foundConfigs.add(name);
+    if (!/(?:resolve|join|existsSync|accessSync|readFileSync|writeFileSync)\s*\(/.test(content)) return;
+    // Parsing cannot yield a config candidate without a matching literal prefix.
+    // Keep every escaped source conservatively: escapes may encode that prefix.
+    if (!/['"\x60](?:\.(?![./])|[\w-]+\.config\.)|\\/.test(content)) return;
+    const source = relative(projectDir, filePath).split('\\').join('/');
+    const record = (name, method, line, parsed) => {
+      if (typeof name !== 'string' || name.includes('/') || name.includes('\\') || name.startsWith('..')) return;
+      if (!(name.startsWith('.') && name.length > 2) && !/^[\w-]+\.config\.\w+$/.test(name)) return;
+      if (/^\.[a-z]{1,4}$/i.test(name) || COMMON_DOTFILES.has(name)) return;
+      const direct = parsed && directIO.has(method);
+      // Prefer concrete IO when the same name also occurs in a path expression.
+      if (!foundConfigs.has(name) || (direct && !foundConfigs.get(name).direct)) {
+        foundConfigs.set(name, { direct, parsed, method, source: source + ':' + line });
+      }
+    };
+    const { ast, ok } = parseJsTs(content, filePath);
+    if (ok && !ast.errors?.length) {
+      walk(ast, node => {
+        if (node.type !== 'CallExpression') return;
+        const callee = node.callee;
+        const method = callee.type === 'Identifier' ? callee.name
+          : callee.type === 'MemberExpression' && !callee.computed ? callee.property.name : null;
+        if (!methods.has(method)) return;
+        // IO and existence checks use argument one as the path; join/resolve
+        // may supply a filename in any segment. No dynamic-path evaluation.
+        const args = ['join', 'resolve'].includes(method) ? node.arguments : node.arguments.slice(0, 1);
+        for (const arg of args) {
+          const value = arg.type === 'StringLiteral' ? arg.value
+            : arg.type === 'TemplateLiteral' && arg.expressions.length === 0 ? arg.quasis[0].value.cooked : null;
+          record(value, method, node.loc.start.line, true);
+        }
+      });
+    } else {
+      const pattern = /\b(resolve|join|existsSync|accessSync|readFileSync|writeFileSync)\s*\([^)]*?['"\x60]([^'"\x60\n]{2,})['"\x60]/g;
+      for (const match of content.matchAll(pattern)) {
+        record(match[2], match[1], content.slice(0, match.index).split('\n').length, false);
+      }
     }
   };
 
@@ -414,19 +449,26 @@ function checkCodeReferencedConfigs(projectDir, allDocContent, config = {}) {
     walkFiles(rootDir, scanFile);
   }
 
-  for (const configName of foundConfigs) {
-    if (COMMON_DOTFILES.has(configName)) continue;
+  for (const [configName, evidence] of foundConfigs) {
     total++;
     if (lowerDocContent.includes(configName.toLowerCase())) {
       passed++;
     } else {
+      const scope = 'scanned supported Markdown or extension YAML documentation';
+      const context = evidence.parsed ? evidence.method + ' call' : 'unparsed source text (parser unavailable or failed)';
       findings.push(mkFinding({
         code: 'DCV004',
         validator: 'docsCoverage',
         severity: 'warn',
-        message: `Code references config file "${configName}" but no documentation mentions it. Add it to README.md or ARCHITECTURE.md`,
+        confidence: evidence.direct ? 'high' : 'low',
+        message: evidence.direct
+          ? 'Direct ' + context + ' references config file "' + configName + '" at ' + evidence.source + ', but it is not mentioned in ' + scope + '.'
+          : 'Config-like path "' + configName + '" appears in ' + context + ' at ' + evidence.source + '; file use and documentation need are unverified. No mention was found in ' + scope + '.',
+        // Preserve the published filename location; source context is in the message.
         location: configName,
-        suggestion: { kind: 'fix', text: 'Describe this config file (purpose and format) in README.md or ARCHITECTURE.md' },
+        suggestion: evidence.direct
+          ? { kind: 'fix', text: 'Describe this config file (purpose and format) in a supported documentation file' }
+          : { kind: 'review', text: 'Inspect this source reference: it may be a directory, generated output, or example. Document it only if appropriate.' },
       }));
     }
   }
@@ -499,36 +541,59 @@ function checkReadmeSections(projectDir) {
 /**
  * Collect all documentation content into a single searchable string.
  */
-function collectDocContent(projectDir) {
-  const docPaths = [];
+function collectDocContent(projectDir, config = {}) {
+  const docPaths = new Set();
+  const visited = new Set();
+  const isIgnored = buildIgnoreFilter(mergeIgnoreFile(projectDir, { ...config }).ignore);
 
-  const rootDocs = ['README.md', 'AGENTS.md', 'CLAUDE.md', 'CONTRIBUTING.md', 'STANDARD.md'];
-  for (const doc of rootDocs) {
-    const p = resolve(projectDir, doc);
-    if (existsSync(p)) docPaths.push(p);
-  }
-
-  for (const doc of listCanonicalDocs(projectDir)) docPaths.push(doc.abs); // recursive
-
-  const extDir = resolve(projectDir, 'extensions');
-  if (existsSync(extDir)) {
-    walkFiles(extDir, (f) => {
-      if (f.endsWith('.md') || f.endsWith('.yml') || f.endsWith('.yaml')) {
-        docPaths.push(f);
+  // Check every ancestor before traversal: the shared walker follows symlinks.
+  // Explicit homes must remain scoped inside the project, including private aliases.
+  const safePath = (path) => {
+    const normalized = path.replace(/\\/g, '/');
+    if (isAbsolute(normalized) || /^[A-Za-z]:/.test(normalized) || normalized.includes('\0')) return null;
+    const parts = normalized.split('/').filter(p => p && p !== '.');
+    if (!parts.length || parts.some(p => p === '..' || ['.local', '.git'].includes(p.toLowerCase())
+        || /^\.env(?:\.|$)/i.test(p) || DEFAULT_IGNORE_DIRS.has(p) || IGNORE_DIRS.has(p))) return null;
+    let current = resolve(projectDir);
+    let rel = '';
+    try {
+      for (const part of parts) {
+        rel = rel ? rel + '/' + part : part;
+        if (isIgnored(rel) || isIgnored(rel + '/')) return null;
+        current = join(current, part);
+        if (lstatSync(current).isSymbolicLink()) return null;
       }
-    });
-  }
-
-  for (const docsDir of ['docs', 'docs-implementation']) {
-    const d = resolve(projectDir, docsDir);
-    if (existsSync(d)) {
-      walkFiles(d, (f) => {
-        if (f.endsWith('.md')) docPaths.push(f);
-      });
+      return current;
+    } catch { return null; }
+  };
+  const addDoc = (rel) => {
+    const abs = safePath(rel);
+    if (abs && lstatSync(abs).isFile()) docPaths.add(abs);
+  };
+  const walkDocs = (rel) => {
+    const dir = safePath(rel);
+    if (!dir || visited.has(dir)) return;
+    visited.add(dir);
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const path = relative(projectDir, join(dir, entry.name)).split('\\').join('/');
+      if (entry.isDirectory() && !entry.name.startsWith('.')) walkDocs(path);
+      else if (entry.isFile() && (/\.md$/i.test(entry.name)
+          || (path.startsWith('extensions/') && /\.ya?ml$/i.test(entry.name)))) addDoc(path);
     }
+  };
+
+  for (const doc of ['README.md', 'AGENTS.md', 'CLAUDE.md', 'CONTRIBUTING.md', 'STANDARD.md']) addDoc(doc);
+  for (const dir of resolveDocDirs(projectDir, config)) walkDocs(dir);
+  // Resolve roles directly so raw callers get the same boundaries as loadConfig.
+  for (const role of Object.keys(config.docs?.roles || {})) {
+    const abs = resolveDocRole(projectDir, config, role);
+    addDoc(relative(projectDir, abs));
   }
 
-  if (docPaths.length === 0) return null;
+  if (docPaths.size === 0) return null;
   const parts = [];
   for (const p of docPaths) {
     try { parts.push(readFileSync(p, 'utf-8')); } catch { /* skip */ }

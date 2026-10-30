@@ -11,7 +11,7 @@
     },
     "version": {
       "type": "string",
-      "description": "Schema version (0.1, 0.2, ... 0.5). Bumped when fields are added or behavior changes. Migrate with `docguard upgrade --apply`.",
+      "description": "Schema version (0.1, 0.2, ... 0.6). Bumped when fields are added or behavior changes. Migrate with `docguard upgrade --apply`.",
       "pattern": "^\\d+\\.\\d+(\\.\\d+)?$"
     },
     "projectName": {
@@ -46,8 +46,11 @@
       "additionalProperties": true
     },
     "sourceRoot": {
-      "type": "string",
-      "description": "Subdirectory containing the project's source files (e.g. `backend/src`). Validators scope to this when set."
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string" } }
+      ],
+      "description": "Subdirectory, or list of subdirectories, containing the project's source files (e.g. `backend/src` or `[\"api/src\", \"web/src\"]`). Validators scope to these when set."
     },
     "ignore": {
       "type": "array",
@@ -63,6 +66,19 @@
       "type": "array",
       "items": { "type": "string" },
       "description": "Glob patterns the TODO-Tracking validator additionally skips."
+    },
+    "documentLifecycle": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Glob patterns the Document-Lifecycle validator additionally skips when it looks for terminal-status documents and completed specs."
+    },
+    "suppressions": {
+      "type": "object",
+      "description": "Policy for .docguardignore entries (`pattern  expires:YYYY-MM-DD  # reason`).",
+      "properties": {
+        "requireReason": { "type": "boolean", "default": false, "description": "Report IGN002 for every .docguardignore entry without a trailing `# reason`. The entry still applies." }
+      },
+      "additionalProperties": false
     },
     "requiredFiles": {
       "type": "object",
@@ -88,6 +104,7 @@
       "description": "Enable / disable individual validators. Set to false to skip.",
       "properties": {
         "structure":          { "type": "boolean" },
+        "docSections":        { "type": "boolean" },
         "docsSync":           { "type": "boolean" },
         "drift":              { "type": "boolean" },
         "changelog":          { "type": "boolean" },
@@ -105,10 +122,21 @@
         "todoTracking":       { "type": "boolean" },
         "schemaSync":         { "type": "boolean" },
         "specKit":            { "type": "boolean" },
+        "documentLifecycle":  { "type": "boolean" },
+        "suppressions":       { "type": "boolean" },
+        "specRegistry":       { "type": "boolean" },
+        "docDependency":      { "type": "boolean" },
+        "requirementAnchors": { "type": "boolean" },
+        "pathScopedRules":    { "type": "boolean" },
+        "docOwnership":       { "type": "boolean" },
+        "evidence":           { "type": "boolean" },
         "crossReference":    { "type": "boolean" },
         "generatedStaleness":{ "type": "boolean" },
         "canonicalSync":     { "type": "boolean" },
         "surfaceSync":       { "type": "boolean" },
+        "diffSuspicion":     { "type": "boolean" },
+        "referenceExistence":{ "type": "boolean" },
+        "apiDocSmells":      { "type": "boolean" },
         "metricsConsistency":{ "type": "boolean" }
       },
       "additionalProperties": false
@@ -120,6 +148,17 @@
         "type": "string",
         "enum": ["high", "medium", "low"]
       }
+    },
+    "findingSeverity": {
+      "type": "object",
+      "description": "Per-finding-code enforcement overrides. Exact codes take precedence over validator severity. high = blocking error, medium = warning, low = informational. Intrinsic errors can only be demoted with an explicit code entry.",
+      "patternProperties": {
+        "^[A-Z]{3}[0-9]{3}$": {
+          "type": "string",
+          "enum": ["high", "medium", "low"]
+        }
+      },
+      "additionalProperties": false
     },
     "draftStalenessDays": {
       "type": "integer",
@@ -185,13 +224,154 @@
       "type": "object",
       "description": "Documentation discovery (field report #6 follow-up).",
       "properties": {
+        "roles": {
+          "type": "object",
+          "description": "Explicit canonical document roles in an existing layout. Each mapping is required and remains subject to content checks; maps do not certify prose or change historical intent.",
+          "properties": {
+            "architecture": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\.[mM][dD]$"
+            },
+            "dataModel": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\.[mM][dD]$"
+            },
+            "security": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\.[mM][dD]$"
+            },
+            "testSpec": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\.[mM][dD]$"
+            },
+            "environment": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\.[mM][dD]$"
+            },
+            "apiReference": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\.[mM][dD]$"
+            },
+            "requirements": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\.[mM][dD]$"
+            }
+          },
+          "additionalProperties": false
+        },
         "dirs": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Additional documentation-home directories to claim-scan and count as 'tracked' (relative paths, e.g. [\"reference\", \"website/docs\"]). This EXTENDS the auto-detected conventional homes (docs/, doc/, documentation/, guides/, guide/, handbook/, manual/, wiki/, docs-canonical/, docs-implementation/, extensions/) — it never replaces them, since the goal is to track MORE clearly-documentation folders automatically. Only NAMED dirs are scanned; arbitrary subdirectories are never walked. To EXCLUDE a conventional dir, list it in .docguardignore."
+          "description": "Additional documentation inventory directories, extending conventional homes. Explicit directories also participate in freshness review. Inventory membership does not imply every detector scans every document; semantic extraction has its own declared scope. Use docs.roles to map existing Markdown documents to canonical roles, and .docguardignore to exclude paths."
         }
       },
       "additionalProperties": true
+    },
+    "agentInstructions": {
+      "type": "object",
+      "description": "Agent instruction budget (STR004/STR005). Each AGENTS.md chain (root down to a directory; AGENTS.override.md replaces AGENTS.md) is compared to a byte budget, because agents stop reading at their limit.",
+      "properties": {
+        "maxBytes": { "type": "integer", "minimum": 1, "description": "Budget per chain in bytes. Default 32768 (Codex project_doc_max_bytes)." },
+        "allowances": {
+          "type": "object",
+          "description": "Per-chain allowance for existing debt, keyed by the chain's deepest instruction file. The chain may shrink; growth past the allowance is reported.",
+          "additionalProperties": { "type": "integer", "minimum": 1 }
+        }
+      },
+      "additionalProperties": false
+    },
+    "anchors": {
+      "type": "object",
+      "description": "Requirement anchors (`docguard anchors`, specs/070-requirement-anchors): code→requirement tags anchored to the symbol, statement or route below them. Active when `.docguard-anchor-lock.jsonl` exists or `enabled` is true.",
+      "properties": {
+        "enabled": { "type": "boolean", "description": "Report requirement anchors in guard before the project has an anchor lock. Default false." },
+        "fanOutLimit": { "type": "integer", "minimum": 1, "description": "Most files a changed anchor's ripple lists before it collapses into one summary. Default 10." },
+        "failOn": { "enum": ["none", "reviewed-exact"], "description": "Which suspect or lost links fail guard. reviewed-exact (the measured default): reviewed, exact-tier links at symbol, statement or route scope. none: anchors only warn. A requirement-side change never fails." },
+        "import": {
+          "type": "array",
+          "items": { "enum": ["strictdoc", "openfasttrace"] },
+          "uniqueItems": true,
+          "description": "Read StrictDoc @relation(...) and OpenFastTrace [impl->...] tags as anchors, through importMap. Read-only: DocGuard never writes them."
+        },
+        "importMap": {
+          "type": "object",
+          "description": "Foreign ID → requirement. Keys are strictdoc:<ID> or oft:<type>~<name>; a value is \"<specId>#<REQ>\", or, for OpenFastTrace, { requirement, revision } so a tag behind that revision is reported outdated.",
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "string", "minLength": 1 },
+              {
+                "type": "object",
+                "required": ["requirement"],
+                "properties": {
+                  "requirement": { "type": "string", "minLength": 1 },
+                  "revision": { "type": "integer", "minimum": 0 }
+                },
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "orphanPaths": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Where `docguard anchors --orphans` looks for untagged symbols: globs, files or directories. Default: the scope.sourcePaths of current specs."
+        },
+        "treeSitter": {
+          "type": "object",
+          "description": "Opt-in tree-sitter tier: tree-sitter spans and exact fingerprints for symbols the pattern tier finds. Each named file must match a sha256 in schemas/docguard-anchor-treesitter.manifest.json; it is staged under .docguard/ts/ and never resolved through node_modules. Never auto-detected.",
+          "properties": {
+            "artifacts": {
+              "type": "object",
+              "required": ["runtime", "runtimeWasm", "grammars"],
+              "properties": {
+                "runtime": { "type": "string", "minLength": 1, "description": "web-tree-sitter.js from the pinned web-tree-sitter version" },
+                "runtimeWasm": { "type": "string", "minLength": 1, "description": "web-tree-sitter.wasm from the same version" },
+                "grammars": {
+                  "type": "object",
+                  "propertyNames": { "enum": ["go", "rust", "java", "csharp", "php", "ruby", "c", "cpp"] },
+                  "additionalProperties": { "type": "string", "minLength": 1 },
+                  "description": "Language → the grammar .wasm the manifest pins"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "testguard": {
+          "type": "object",
+          "description": "Where `docguard anchors` reads saved TestGuard output to mark the tests of a changed requirement re-verified. Read only; DocGuard never runs TestGuard or a test.",
+          "properties": {
+            "evidence": { "type": "string", "minLength": 1, "description": "Project-relative TestGuard evidence file. Default .testguard/evidence.json." },
+            "claims": { "type": "string", "minLength": 1, "description": "Project-relative TestGuard claims file. Default testguard.claims.json." }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "specFirst": {
+      "type": "object",
+      "description": "Spec-first change gate (`docguard specs require`). A change to a governed path must name its spec (a `specs/<dir>` path or Spec ID) or declare `Spec-Exempt: <kind> — <reason>`.",
+      "properties": {
+        "paths": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Glob patterns of governed paths. Default: every changed path except Markdown, `specs/**` and recognized test files."
+        },
+        "exemptKinds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Za-z-]+$" },
+          "description": "Allowed exemption kinds. Default: release, deps, typo, test-only."
+        }
+      },
+      "additionalProperties": false
     },
     "specKit": {
       "type": "object",
@@ -200,9 +380,83 @@
         "phantomCheck": {
           "type": "boolean",
           "description": "If false, disable phantom-completion detection (SPK008/SPK009) — checked tasks in tasks.md whose named deliverables don't exist and carry no implementation evidence. On by default."
+        },
+        "untouchedClaimCheck": {
+          "type": "boolean",
+          "description": "If false, disable the untouched-task check (SPK010/SPK011) — checked tasks in tasks.md naming an existing path that no commit since the feature began changed. On by default."
         }
       },
       "additionalProperties": true
+    },
+    "memory": {
+      "type": "object",
+      "description": "Context pack options.",
+      "properties": {
+        "symbolMap": {
+          "type": "object",
+          "properties": {
+            "maxBytes": { "type": "integer", "minimum": 256, "maximum": 16384, "default": 4096, "description": "Byte budget for the symbol map `memory --pack --symbols` adds (specs/036-symbol-map)." }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "ownership": {
+      "type": "object",
+      "description": "Doc ownership map (specs/034-doc-ownership-map): which doc section is responsible for which source paths. An exact file path beats any glob, a longer literal directory prefix beats a shorter one, and any other overlap is a tie (OWN002). DocGuard never writes this block; `docguard trace --owners --suggest` drafts one.",
+      "properties": {
+        "roots": { "type": "array", "items": { "type": "string" }, "description": "Directories whose source code must be owned (OWN001). Default: the top-level source modules, skipping test, fixture and example paths. A declared root is checked as declared." },
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "doc": { "type": "string", "pattern": "\\.md$", "description": "The responsible doc, project-relative." },
+              "section": { "type": "string", "description": "A docguard:section id or heading anchor in that doc." },
+              "purpose": { "type": "string", "description": "What the section explains about these paths. Written by people." },
+              "paths": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "Files, directories or globs, project-relative." }
+            },
+            "required": ["doc", "paths"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["entries"],
+      "additionalProperties": false
+    },
+    "devinWiki": {
+      "type": "object",
+      "description": "Linting of a committed .devin/wiki.json (OWN005, OWN006).",
+      "properties": {
+        "maxPages": { "type": "integer", "minimum": 1, "maximum": 80, "default": 30, "description": "Devin allows 30 pages, 80 on enterprise plans." }
+      },
+      "additionalProperties": false
+    },
+    "detection": {
+      "type": "object",
+      "description": "Surface detection (routes, env vars, frameworks). Test, fixture, example and mock directories are skipped by default; a package segment such as `src/main/java/com/example` or a Go `internal/example` package is product code and is always read.",
+      "properties": {
+        "includeNonProduct": { "type": "boolean", "default": false, "description": "Read test, fixture, example and mock directories as product code. When routes exist only there, the API-surface validator reports partial coverage and names this setting." }
+      },
+      "additionalProperties": false
+    },
+    "diagrams": {
+      "type": "object",
+      "description": "Code-derived diagrams (specs/035-code-derived-diagrams). A diagram is drawn only into a doc that has its section marker: `<!-- docguard:section id=module-graph source=code -->` in ARCHITECTURE, `<!-- docguard:section id=entity-diagram source=code -->` in DATA-MODEL. Generated-Staleness (GST002) reports drift and `docguard sync --write` redraws it.",
+      "properties": {
+        "moduleGraph": {
+          "type": "object",
+          "description": "The module graph: a mermaid `graph LR` of directory modules and the static imports between them.",
+          "properties": {
+            "depth": { "type": "integer", "minimum": 1, "maximum": 8, "default": 2, "description": "Directory depth that makes a module (`cli/commands/x.mjs` is `cli/commands` at depth 2). Reduced automatically when the modules exceed maxNodes." },
+            "maxNodes": { "type": "integer", "minimum": 2, "maximum": 60, "default": 30, "description": "Node limit. Over it, modules are grouped one level higher, then the least-connected are merged into one counted node. A caption states every reduction." },
+            "include": { "type": "array", "items": { "type": "string" }, "description": "Directories to draw (e.g. [\"src\"]). Default: every product source file; tests, fixtures, examples and ignored paths are never drawn." }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
     },
     "collections": {
       "type": "object",

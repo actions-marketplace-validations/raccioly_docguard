@@ -11,7 +11,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -19,8 +18,10 @@ import { validateApiDocSmells } from '../cli/validators/api-doc-smells.mjs';
 import { validateReferenceExistence } from '../cli/validators/reference-existence.mjs';
 import { validateTraceability } from '../cli/validators/traceability.mjs';
 import { validateGeneratedStaleness } from '../cli/validators/generated-staleness.mjs';
+import { fixtureGit } from './helpers/git.mjs';
+// @implements docguard.test-git-hermeticity#FR-001: this file's fixture git goes through the helper.
 
-function git(dir, ...args) { spawnSync('git', args, { cwd: dir, encoding: 'utf-8' }); }
+function git(dir, ...args) { fixtureGit(dir, args); }
 
 let tmpDir;
 beforeEach(() => { tmpDir = mkdtempSync(join(tmpdir(), 'docguard-nested-p2-')); });
@@ -49,7 +50,9 @@ describe('nested canonical docs — phase 2 consumer regressions', () => {
     const r = validateApiDocSmells(tmpDir, {});
 
     assert.match(r.findings[0].message, /^API\.md:/, 'flat-tree message must stay unprefixed, matching pre-fix format');
-    assert.equal(r.findings[0].location.file, 'API.md');
+    // location is a string ('file' or 'file:line') — calibrated-finding-channels#FR-009.
+    // It used to be an object here, which SARIF's parseLocation dropped entirely.
+    assert.equal(r.findings[0].location, 'API.md:1');
   });
 
   it('generated-staleness: the pre-flight scan must SEE a marker in a NESTED doc', () => {

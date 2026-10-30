@@ -7,6 +7,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -20,11 +23,17 @@ jobs:
         node-version: [18, 20, 22, 24]
 
     steps:
-      - uses: actions/checkout@v7
+      - name: Initialize report paths
+        shell: bash
+        run: |
+          echo "DOCGUARD_REPORT=$RUNNER_TEMP/docguard-report.json" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0 # Full git history for freshness validator
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node-version }}
 
@@ -44,18 +53,75 @@ jobs:
       - name: Python wrapper imports
         run: python3 -c "import docguard_cli.wrapper; print('docguard_cli.wrapper OK')"
 
+      # Tests build throwaway git repositories and delete them in after-hooks.
+      # A commit can leave a detached `git gc --auto` writing into .git, which
+      # made a cleanup fail with ENOTEMPTY (#486). No background maintenance here.
+      - name: Disable background git maintenance for test fixtures
+        run: |
+          git config --global gc.auto 0
+          git config --global maintenance.auto false
+
       # ── Automated Test Suite ──
-      - name: Run Tests
-        run: npm test
+      # Also enforces a RUNTIME BUDGET. A test that walks an unintended tree
+      # (e.g. passing '/' as a project dir) still PASSES — it just takes
+      # forever. PR #328 did exactly that: one test in tests/schemas.test.mjs
+      # went from 0.1s to 190s, green the entire time. Only a duration check
+      # catches that class, so auto-merge depends on this gate existing.
+      #
+      # The budget is per top-level test, at reference-runner speed
+      # (docguard.release-cut-green#FR-007, revised 2026-10-13). A fixed suite
+      # total was raised three times (120s → 240s → 360s → 465s): identical
+      # code ran 188-369s across one day's runners. Over 445 jobs that spread
+      # is one speed factor per runner (0.55-1.20); divided out, 0.5% of
+      # variation is left. The total also hid the class it is for: files run
+      # ~2.8 at a time, so a +165s test adds ~59s of wall time, and 465s
+      # caught 0 of 445 replayed runaways. The tool divides each test by this
+      # run's speed factor (median ratio to tools/suite-runtime-reference.json)
+      # and fails any test over the ceiling; the suite total is logged and
+      # summarized, not gated.
+      - name: Run Tests (with runtime budget)
+        shell: bash
+        env:
+          # 1.76x the slowest normal test over 445 CI jobs (56.9s at reference
+          # speed), and a raw 165s runaway still trips it on the slowest runner
+          # seen (x1.17).
+          TEST_CEILING_MS: 100000
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/*.test.mjs 2>&1 | tee /tmp/test-output.txt
+          node tools/suite-runtime-budget.mjs check --tap /tmp/test-output.txt --summary "${GITHUB_STEP_SUMMARY:-}"
+
+      # The TAP is the input for refreshing tools/suite-runtime-reference.json
+      # (see the header of tools/suite-runtime-budget.mjs).
+      - name: Upload test TAP
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-tap-node-${{ matrix.node-version }}
+          path: /tmp/test-output.txt
+          if-no-files-found: warn
+          retention-days: 30
 
       # ── Self-validation (dogfooding) ──
       - name: CLI Version
         run: node cli/docguard.mjs --version
 
       - name: Guard (self-check)
+        shell: bash
         run: |
           # Exit 0 = pass, Exit 1 = errors (fail CI), Exit 2 = warnings only (allow)
-          node cli/docguard.mjs guard || [ $? -eq 2 ]
+          status=0
+          node cli/docguard.mjs guard --format json > "$DOCGUARD_REPORT" || status=$?
+          cat "$DOCGUARD_REPORT"
+          [ "$status" -eq 0 ] || [ "$status" -eq 2 ]
+
+      - name: Upload guard findings
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docguard-report-node-${{ matrix.node-version }}
+          path: ${{ env.DOCGUARD_REPORT }}
+          if-no-files-found: warn
 
       - name: Score
         run: node cli/docguard.mjs score
@@ -85,19 +151,31 @@ jobs:
           head -5 /tmp/report.md
           node cli/docguard.mjs report --format json | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['integrity'].startswith('sha256:'), d; print('report json OK', d['integrity'][:20])"
 
+      - name: Precision benchmark (network-free corpus vs reviewed baseline)
+        run: |
+          node benchmarks/run.mjs --baseline benchmarks/baseline.json > /tmp/benchmark.json
+          node -e "const r=require('/tmp/benchmark.json'); console.log('benchmark', r.comparison.core.status, 'measures:', r.provenance.measures, '| out of selection:', r.comparison.core.outOfSelection.length); if (r.comparison.core.status !== 'PASS') process.exit(1)"
+
       - name: Guard JUnit output is valid XML
         run: |
           node cli/docguard.mjs guard --format junit > /tmp/guard-junit.xml || [ $? -eq 2 ]
           python3 -c "import xml.etree.ElementTree as ET; r=ET.parse('/tmp/guard-junit.xml').getroot(); print('junit OK:', r.attrib)"
 
       - name: Baseline roundtrip (freeze → pass → restore)
+        shell: bash
         run: |
           mkdir -p /tmp/docguard-baseline && cd /tmp/docguard-baseline
           printf '{"projectName":"bl-ci","profile":"standard"}' > .docguard.json
           mkdir -p docs-canonical && echo "# Architecture" > docs-canonical/ARCHITECTURE.md
-          node $GITHUB_WORKSPACE/cli/docguard.mjs guard --update-baseline
-          node $GITHUB_WORKSPACE/cli/docguard.mjs guard   # must exit 0 now
-          node $GITHUB_WORKSPACE/cli/docguard.mjs guard --no-baseline || [ $? -ne 0 ]
+          node "$GITHUB_WORKSPACE/cli/docguard.mjs" guard --update-baseline
+          node "$GITHUB_WORKSPACE/cli/docguard.mjs" guard   # must exit 0 now
+          status=0
+          node "$GITHUB_WORKSPACE/cli/docguard.mjs" guard --no-baseline || status=$?
+          # This incomplete standard-profile fixture has errors, not just warnings.
+          if [ "$status" -ne 1 ]; then
+            echo "::error::Expected guard --no-baseline to exit 1, got $status"
+            exit 1
+          fi
 
       # ── Cross-project tests ──
       - name: Init in temp dir
@@ -123,14 +201,182 @@ jobs:
       - name: Hooks --list
         run: node cli/docguard.mjs hooks --list
 
+  # ── Hermeticity (specs/066-test-git-hermeticity) ──
+  # The suite must not depend on the machine's git config. Runners carry none,
+  # so the test job above cannot see a dependency on it; a contributor machine
+  # or agent sandbox with a global core.hooksPath or mandatory signing turned
+  # 189 tests red. This job runs the suite on such a machine: every hook fails,
+  # signing is mandatory through a gpg that always fails, and the default
+  # branch is `trunk`. Fixture git passes its own options (tests/helpers/git.mjs)
+  # per call; product code still meets this config.
+  # @implements docguard.test-git-hermeticity#FR-006
+  hermeticity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # Full git history for freshness validator
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci
+
+      # gc.auto/maintenance.auto match the test job (#486): they keep fixture
+      # cleanup reliable and make nothing pass that would otherwise fail.
+      - name: Manufacture a hostile global git config
+        shell: bash
+        run: |
+          H="$RUNNER_TEMP/hostile"
+          mkdir -p "$H/hooks"
+          for hook in pre-commit prepare-commit-msg commit-msg post-commit pre-push post-checkout; do
+            printf '#!/bin/sh\necho "hostile %s hook fired" >&2\nexit 1\n' "$hook" > "$H/hooks/$hook"
+            chmod +x "$H/hooks/$hook"
+          done
+          printf '[core]\n\thooksPath = %s\n[commit]\n\tgpgsign = true\n[tag]\n\tgpgsign = true\n[gpg]\n\tprogram = /usr/bin/false\n[init]\n\tdefaultBranch = trunk\n[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n' "$H/hooks" > "$H/gitconfig"
+          echo "GIT_CONFIG_GLOBAL=$H/gitconfig" >> "$GITHUB_ENV"
+
+      # A hostile config that git ignores proves nothing: fail before the suite
+      # if an unpinned commit still succeeds, or a fresh repository is not on trunk.
+      - name: Prove the config is hostile
+        shell: bash
+        run: |
+          R="$(mktemp -d)"
+          git -C "$R" init -q
+          if [ "$(git -C "$R" symbolic-ref --short HEAD)" != trunk ]; then
+            echo "::error::init.defaultBranch is not in effect"
+            exit 1
+          fi
+          if git -C "$R" -c user.name=probe -c user.email=probe@example.invalid commit -q --allow-empty -m probe 2>/dev/null; then
+            echo "::error::an unpinned commit succeeded; the hostile config is not in effect"
+            exit 1
+          fi
+
+      - name: Run tests under the hostile config
+        run: npm test
+
+  # ── Spec-first gate (Constitution X, specs/015-spec-first-gate) ──
+  # A change to cli/ must name its governing spec or declare
+  # `Spec-Exempt: <kind> — <reason>` in the PR description or a commit message.
+  # Uncovered (exit 1) and inconclusive (exit 2) both fail: an unprovable
+  # change is not a covered one.
+  spec-first:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # merge-base needs the base branch history
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      - name: Require a governing spec
+        shell: bash
+        env:
+          # SECURITY: the PR body and base branch are fork-controlled data.
+          # They reach the script only through env and are written to a file /
+          # expanded quoted — never spliced into the script text.
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.txt"
+          node cli/docguard.mjs specs require --since "origin/$BASE_REF" --message-file "$RUNNER_TEMP/pr-body.txt"
+
+  # ── Non-regression budgets (specs/031-non-regression-budgets) ──
+  # Base and head run in THIS job on THIS runner, guard samples interleaved,
+  # so the comparison measures the change and not the machine. A breach fails
+  # unless the PR body declares `Budget-Exempt: <metric> — <reason>`; the
+  # table lands in the job summary either way.
+  # @implements docguard.non-regression-budgets#FR-004
+  # @implements docguard.requirement-anchors#SC-003 (guard wall time within x1.15 of base, lock baselined)
+  budget:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # the base commit must be available for a worktree
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      - name: Check out the base tree beside the head
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
+          ln -s "$GITHUB_WORKSPACE/node_modules" "$RUNNER_TEMP/base/node_modules"
+
+      - name: Compare base and head
+        shell: bash
+        env:
+          # SECURITY: the PR body is fork-controlled data; it reaches the tool
+          # only through a file, never through the script text.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.txt"
+          node tools/budget.mjs ab --base "$RUNNER_TEMP/base" --head . \
+            --message-file "$RUNNER_TEMP/pr-body.txt" \
+            --summary "$GITHUB_STEP_SUMMARY" --out "$RUNNER_TEMP/budget.json"
+
+  # ── Anchor oracle (specs/070-requirement-anchors FR-040, SC-007) ──
+  # tree-sitter is the independent parser the pattern tier is measured
+  # against. It is CI-only: tools/anchor-oracle has its own lockfile with
+  # integrity hashes, every package is vetted in VETTING.md, and no install
+  # script runs. Fails only when a high-confidence language disagrees on more
+  # than 1% of declarations; C, C++, Kotlin and Swift are reported.
+  # @implements docguard.requirement-anchors#FR-040
+  anchor-oracle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Install DocGuard and the oracle (lockfiles, no scripts)
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm ci --ignore-scripts --no-audit --no-fund --prefix tools/anchor-oracle
+
+      - name: Compare pattern-tier spans with tree-sitter
+        run: node tools/anchor-oracle/run.mjs --json "$RUNNER_TEMP/anchor-oracle.json"
+
+      # The opt-in tier with the real vetted artifacts: hashes, staging,
+      # golden spans and formatting stability (FR-009), and volatile lines
+      # (docguard.volatile-anchor-lines).
+      - name: Tree-sitter tier with the vetted artifacts
+        run: node --test tests/requirement-anchors-treesitter.test.mjs tests/anchor-oracle.test.mjs tests/volatile-anchor-lines.test.mjs
+
   # ── npm publish dry-run on tags ──
   publish-check:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     needs: test
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
           registry-url: 'https://registry.npmjs.org'

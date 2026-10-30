@@ -20,6 +20,8 @@
  * Pure string transforms — idempotent, no disk I/O. Zero NPM dependencies.
  */
 
+import { findSectionHeading } from '../shared.mjs';
+
 const OPEN_RE = /^[ \t]*<!--\s*docguard:section\b([^>]*?)-->[ \t]*$/;
 const CLOSE_RE = /^[ \t]*<!--\s*\/docguard:section\s*-->[ \t]*$/;
 
@@ -53,8 +55,14 @@ function parseAttrs(attrStr) {
  * @returns {Array<{ id, source, attrs, openLine, closeLine, body }>}
  */
 export function parseSections(content) {
+  return inspectSections(content).sections;
+}
+
+/** Parse sections and retain malformed-marker evidence for write authorization. */
+export function inspectSections(content) {
   const lines = String(content).split('\n');
   const sections = [];
+  const issues = [];
   let open = null;
 
   for (let i = 0; i < lines.length; i++) {
@@ -70,17 +78,39 @@ export function parseSections(content) {
           body: lines.slice(open.openLine + 1, i).join('\n'),
         });
         open = null;
-      }
-      // A close with no matching open is ignored.
+      } else issues.push({ code: 'unmatched-close', line: i + 1 });
       continue;
     }
     const om = line.match(OPEN_RE);
     if (om) {
       // Abandon any still-open (malformed) section; start fresh here.
+      if (open !== null) issues.push({ code: 'nested-or-unclosed', line: open.openLine + 1 });
       open = { attrs: parseAttrs(om[1] || ''), openLine: i };
     }
   }
-  return sections;
+  if (open !== null) issues.push({ code: 'unclosed', line: open.openLine + 1 });
+  const counts = new Map();
+  for (const section of sections) {
+    if (!section.id) issues.push({ code: 'missing-id', line: section.openLine + 1 });
+    counts.set(section.id, (counts.get(section.id) || 0) + 1);
+  }
+  for (const [id, count] of counts) if (id && count > 1) issues.push({ code: 'duplicate-id', id, count });
+  return { sections, issues };
+}
+
+/**
+ * Return the unique code-owned section or throw before a mapped write.
+ * @implements docguard.language-repository-coverage#FR-009
+ */
+export function assertOwnedCodeSection(content, id, path = 'document') {
+  const inspected = inspectSections(content);
+  if (inspected.issues.length) {
+    throw new Error(`${path}: malformed or duplicate docguard:section markers; no write was applied.`);
+  }
+  const matches = inspected.sections.filter(section => section.id === id);
+  if (matches.length !== 1) throw new Error(`${path}: section ${id} must exist exactly once before a bounded write.`);
+  if (matches[0].source !== 'code') throw new Error(`${path}: section ${id} is source=${matches[0].source}; only source=code is writable.`);
+  return matches[0];
 }
 
 /** Get a single section by id, or null. */
@@ -123,16 +153,34 @@ export function replaceSection(content, id, newBody) {
  * Replace a section's body if it exists; otherwise INSERT a new section.
  * Insert position: `after:<id>` (after another section), 'top' (after the H1 /
  * first heading), or 'end' (default, appended).
+ *
+ * With `heading`, a new section is titled: when the document already has a
+ * heading that satisfies it (same text or a known synonym — the init
+ * template's `## Tech Stack`), the section goes directly under that heading;
+ * otherwise `## <heading>` is written above the marker. The heading sits
+ * outside the marker, so regeneration never rewrites it
+ * (docguard.generated-docs-consistency#FR-003).
  * @returns {{ content: string, action: 'replaced'|'inserted'|'unchanged' }}
  */
-export function upsertSection(content, id, newBody, { source = 'code', position = 'end' } = {}) {
+export function upsertSection(content, id, newBody, { source = 'code', position = 'end', heading = null } = {}) {
   if (getSection(content, id)) {
     const r = replaceSection(content, id, newBody);
     return { content: r.content, action: r.replaced ? 'replaced' : 'unchanged' };
   }
 
-  const block = renderSection(id, newBody, { source });
+  let block = renderSection(id, newBody, { source });
   const lines = String(content).split('\n');
+
+  if (heading) {
+    const host = findSectionHeading(content, heading);
+    if (host >= 0) {
+      const before = lines.slice(0, host + 1);
+      const after = lines.slice(host + 1);
+      while (after.length && after[0].trim() === '') after.shift();
+      return { content: [...before, '', block, '', ...after].join('\n'), action: 'inserted' };
+    }
+    block = `## ${heading}\n\n${block}`;
+  }
 
   // Insert after a named section.
   const afterMatch = /^after:(.+)$/.exec(position);

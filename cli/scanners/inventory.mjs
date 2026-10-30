@@ -10,12 +10,14 @@
  *   - scanTestInventory: test files + per-file case counts → TEST-SPEC inventory
  *
  * Language-agnostic, best-effort, zero NPM deps.
+ *
+ * @implements docguard.coverage-followups#FR-002
  */
 
 import { existsSync, readdirSync } from 'node:fs';
 import { resolve, join, relative, extname } from 'node:path';
 import { resolveSourceRoots, readScannable } from '../shared-source.mjs';
-import { DEFAULT_IGNORE_DIRS as IGNORE_DIRS, isNonProductDir } from '../shared-ignore.mjs';
+import { isIgnoredDirEntry, isNonProductDir, isDocguardOwnedDir } from '../shared-ignore.mjs';
 
 const CODE_EXT = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.go', '.rs', '.rb', '.php', '.java', '.kt']);
 const toPosix = (p) => p.split(/[\\/]/).join('/');
@@ -25,13 +27,14 @@ const toPosix = (p) => p.split(/[\\/]/).join('/');
 // Descend through single-package wrappers (src/ → src/<pkg>/) so we list the
 // REAL modules, not just the wrapper folder. A wrapper is a dir whose only
 // non-ignored child is another dir (e.g. a Python `src/<pkg>/` layout).
-function componentRoot(root, config) {
+function componentRoot(root, config, projectDir = root) {
   let cur = root;
   for (let depth = 0; depth < 3; depth++) {
     let entries;
     try { entries = readdirSync(cur, { withFileTypes: true }); } catch { break; }
+    const parentRel = toPosix(relative(projectDir, cur));
     const dirs = entries.filter(e => e.isDirectory() && !e.name.startsWith('.')
-      && !IGNORE_DIRS.has(e.name) && !isNonProductDir(e.name, config));
+      && !isIgnoredDirEntry(e.name, entries) && !isNonProductDir(e.name, config, parentRel));
     const codeFiles = entries.filter(e => e.isFile() && CODE_EXT.has(extname(e.name))
       && !/^(index|main|mod|lib|__init__|__main__)\./.test(e.name));
     if (dirs.length === 1 && codeFiles.length === 0) { cur = join(cur, dirs[0].name); continue; }
@@ -51,20 +54,24 @@ export function scanComponents(projectDir, config = {}, limit = 30) {
   const out = [];
   const seen = new Set();
   for (const root of resolveSourceRoots(projectDir, config)) {
-    const croot = componentRoot(root, config);
+    const croot = componentRoot(root, config, projectDir);
     let entries;
     try { entries = readdirSync(croot, { withFileTypes: true }); } catch { continue; }
     for (const e of entries) {
       if (e.name.startsWith('.')) continue;
       let kind;
       if (e.isDirectory()) {
-        if (IGNORE_DIRS.has(e.name) || isNonProductDir(e.name, config)) continue;
+        if (isIgnoredDirEntry(e.name, entries) || isNonProductDir(e.name, config, toPosix(relative(projectDir, croot)))) continue;
         kind = 'module';
       } else if (e.isFile() && CODE_EXT.has(extname(e.name))) {
         if (/^(index|__init__)\./.test(e.name)) continue; // barrels/entry-init aren't components
+        if (TEST_FILE_RE.test(e.name)) continue; // a test file is not a component
         kind = 'file';
       } else continue;
       const rel = toPosix(relative(projectDir, join(croot, e.name)));
+      // DocGuard's own doc homes are not modules (docguard.generated-docs-consistency#FR-005):
+      // listing them made the component map stale the moment generate created them.
+      if (kind === 'module' && isDocguardOwnedDir(projectDir, rel)) continue;
       if (seen.has(rel)) continue;
       seen.add(rel);
       out.push({ name: e.name, kind, path: rel });
@@ -78,7 +85,8 @@ export function scanComponents(projectDir, config = {}, limit = 30) {
 
 // Test FILE conventions across ecosystems: JS *.test/*.spec, Python test_*.py /
 // *_test.py, Go *_test.go, Ruby *_spec.rb / *_test.rb.
-const TEST_FILE_RE = /(?:\.(?:test|spec)\.[cm]?[jt]sx?|(?:^|\/)test_[^/]*\.py|_test\.(?:py|go)|_spec\.rb|(?:^|\/)[^/]*_test\.rb)$/i;
+// Django's per-app `tests.py` is a test module too (docguard.generated-docs-consistency#FR-010).
+const TEST_FILE_RE = /(?:\.(?:test|spec)\.[cm]?[jt]sx?|(?:^|\/)test_[^/]*\.py|(?:^|\/)tests\.py|_test\.(?:py|go)|_spec\.rb|(?:^|\/)[^/]*_test\.rb)$/i;
 // Fixture/mock subdirs that sit INSIDE a test dir but aren't themselves tests.
 const FIXTURE_DIRS = new Set(['fixtures', '__fixtures__', 'testdata', 'test-fixtures', 'testfixtures', 'mocks', '__mocks__', 'snapshots', '__snapshots__']);
 const TEST_DIRS = ['tests', 'test', '__tests__', 'spec', 'e2e'];
@@ -100,7 +108,7 @@ function walkTestFiles(dir, projectDir, acc) {
   let entries;
   try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
   for (const e of entries) {
-    if (e.name.startsWith('.') || IGNORE_DIRS.has(e.name)) continue;
+    if (e.name.startsWith('.') || isIgnoredDirEntry(e.name, entries)) continue;
     if (e.isDirectory()) {
       if (FIXTURE_DIRS.has(e.name)) continue; // fixtures/mocks inside a test dir aren't tests
       walkTestFiles(join(dir, e.name), projectDir, acc);

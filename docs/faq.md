@@ -1,3 +1,8 @@
+---
+title: FAQ
+nav_order: 6
+---
+
 # Frequently Asked Questions
 
 ## General
@@ -156,6 +161,30 @@ baseline down at your own pace; `--no-baseline` shows the full picture anytime.
 
 ---
 
+## Document locations
+
+### DocGuard adopted the wrong directory as my canonical docs
+
+A Spec Kit feature folder (`specs/003-my-feature/`) is never adopted: one
+feature's spec and data model are not the project's documentation. If another
+directory was adopted and you did not want it, state the mapping yourself:
+
+```json
+{ "docs": { "roles": { "architecture": "docs/canonical/ARCHITECTURE.md" } } }
+```
+
+An explicit `docs.roles` is treated as your answer and is never second-guessed.
+To use DocGuard's own layout instead, remove `docs.roles` and create
+`docs-canonical/` before re-running `init`.
+
+### Why will DocGuard not generate into my mapped documents?
+
+On a mapped layout `init` configures the project and scaffolds only the roles
+your mapping has not placed, so it never writes into a document you maintain and
+never creates a duplicate beside it. Generating or repairing a mapped document is
+a separate matter: `setup`, `init --wizard` and `diagnose --auto` name the mapped
+roles and stop, because that prose is yours to edit.
+
 ## Technical
 
 ### Does DocGuard have dependencies?
@@ -195,7 +224,10 @@ feeds GitHub Code Scanning. See [AI Integration](./ai-integration.md).
 
 ### Guard flagged something that isn't wrong. What do I do?
 
-Suppress it **at the finding site** with its code — `// docguard:ignore SEC001`
-on (or above) the flagged line — and report it with `docguard feedback` (a
-local-first record plus a one-click prefilled GitHub issue). Don't disable the
-whole validator for one false positive.
+Run `docguard explain <CODE>` first: it says what the finding means and which
+marker, if any, silences it. Inline `// docguard:ignore <CODE> — reason` on (or
+above) the flagged line works for the security codes, REF001, REF002 and SPK010;
+other codes have their own markers, listed in [Finding Codes](reference/findings.md),
+and some have none. Report it with `docguard feedback` (a local-first record
+plus a one-click prefilled GitHub issue). Don't disable the whole validator for
+one false positive; see [Troubleshooting](guides/troubleshooting.md).

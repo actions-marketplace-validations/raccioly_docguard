@@ -1,4 +1,9 @@
 /**
+ * @implements docguard.language-repository-coverage#FR-010
+ * @implements docguard.language-repository-coverage#FR-011
+ * @implements docguard.output-ux#FR-001
+ */
+/**
  * Fix Command — The AI Orchestrator
  * 
  * The CLI does NOT write documentation content.
@@ -13,72 +18,45 @@
  *   --auto          Create skeleton files (NOT content) via init
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync } from 'node:fs';
 import { resolve, basename, dirname } from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { c } from '../shared.mjs';
 import { computeApiSurfaceDrift } from '../validators/api-surface.mjs';
-import { removeEndpoints, hasGeneratedMarker } from '../writers/api-reference.mjs';
 import { applyMechanicalFixes } from '../writers/mechanical.mjs';
 import { loadFixMemory } from '../writers/fix-memory.mjs';
+import { safeWrite } from '../writers/generate-io.mjs';
 import { runGuardInternal } from './guard.mjs';
-
-const API_DOC = 'docs-canonical/API-REFERENCE.md';
+import { readAgentSurface, commandHint } from '../agent-surface.mjs';
 
 /**
- * Apply DETERMINISTIC, no-LLM API-surface fixes: remove endpoints documented in
- * API-REFERENCE.md that the OpenAPI spec confirms no longer exist. Removes the
- * summary-table row and the detail block. Never rewrites prose.
+ * Compatibility entry point for the former API deletion writer.
  *
- * Safety: only edits a doc carrying the `<!-- docguard:generated true -->`
- * marker, unless `force` is set. Idempotent.
+ * OpenAPI can prove a contract omission, while bounded route discovery cannot
+ * prove runtime absence and canonical documentation may represent intended
+ * behavior. Contract mismatches therefore require review and this entry point
+ * is deliberately read-only, including under `--force`.
  *
  * @returns {{ applied: boolean, removed: Array<{method,path}>, skipped?: string }}
  */
-export function applyApiSurfaceWrites(projectDir, config, { force = false } = {}) {
+export function applyApiSurfaceWrites(projectDir, config) {
   const drift = computeApiSurfaceDrift(projectDir, config);
-  // Only spec-confirmed absences are safe to delete deterministically.
-  const removable = drift.confidence === 'spec' ? drift.documentedButAbsent : [];
-  if (removable.length === 0) return { applied: false, removed: [] };
-
-  const apiDocPath = resolve(projectDir, API_DOC);
-  if (!existsSync(apiDocPath)) return { applied: false, removed: [] };
-
-  const content = readFileSync(apiDocPath, 'utf-8');
-  if (!hasGeneratedMarker(content) && !force) {
-    return {
-      applied: false,
-      removed: [],
-      skipped: `${API_DOC} is not marked '<!-- docguard:generated true -->'. ` +
-        `Re-run with --force to edit it, or fix it via an AI agent (/docguard.fix --doc api-reference).`,
-    };
-  }
-
-  const { content: newContent, removed } = removeEndpoints(content, removable);
-  if (removed.length === 0 || newContent === content) {
-    return { applied: false, removed: [] }; // idempotent no-op
-  }
-
-  writeFileSync(apiDocPath, newContent, 'utf-8');
-  // Map removed keys back to {method,path} for reporting.
-  const removedEndpoints = removable.filter(e => removed.includes(`${e.method.toUpperCase()} ${normalizeForKey(e.path)}`));
-  return { applied: true, removed: removedEndpoints.length ? removedEndpoints : removable };
-}
-
-// Local mirror of api-doc normalizePath for matching removed keys (avoids an
-// extra import cycle); only used for display reconciliation.
-function normalizeForKey(p) {
-  let s = String(p).trim().replace(/^[|`'"\s]+/, '').replace(/[|`'"\s]+$/, '').split(/[?#]/)[0];
-  s = s.replace(/\{[^}/]+\}/g, '{}').replace(/:[^/]+/g, '{}');
-  if (s.length > 1) s = s.replace(/\/+$/, '');
-  return s;
+  const reviewCount = drift.confidence === 'spec' ? drift.contractMismatches.length : 0;
+  return {
+    applied: false,
+    removed: [],
+    ...(reviewCount > 0 ? {
+      skipped: `${reviewCount} endpoint contract mismatch(es) require review; negative route-scan evidence cannot authorize documentation deletion.`,
+    } : {}),
+  };
 }
 
 // ── Document Quality Definitions ───────────────────────────────────────────
 // What each doc SHOULD contain, and what to look for in the codebase
 
 const DOC_EXPECTATIONS = {
+  __proto__: null,
   'docs-canonical/ARCHITECTURE.md': {
     label: 'Architecture',
     purpose: 'Define the system design: layers, components, boundaries, and data flow',
@@ -281,7 +259,7 @@ export function applyAllMechanicalFixes(projectDir, config, opts = {}) {
   }
   // v0.14-P1: forwarding forceRedo so users with `--force-redo` can override
   // ping-pong suppression for a specific fix they actually want re-applied.
-  const { applied, skipped } = applyMechanicalFixes(projectDir, fixes, { force, forceRedo });
+  const { applied, skipped } = applyMechanicalFixes(projectDir, fixes, { force, forceRedo, config });
   return { applied, skipped, total: fixes.length };
 }
 
@@ -366,7 +344,7 @@ function runWriteMode(projectDir, config, flags) {
   if (skipped.length) {
     for (const s of skipped) console.log(`     ${c.yellow}⚠ ${s.type}: ${s.reason}${c.reset}`);
   }
-  console.log(`\n  ${c.dim}Verify with ${c.cyan}docguard guard${c.dim}, then commit. Prose rewrites still need an AI agent (${c.cyan}/docguard.fix${c.dim}).${c.reset}\n`);
+  console.log(`\n  ${c.dim}Verify with ${c.cyan}docguard guard${c.dim}, then commit. Prose rewrites still need an AI agent (${c.cyan}${commandHint(projectDir, readAgentSurface(projectDir), 'fix', '--doc <name>')}${c.dim}).${c.reset}\n`);
 }
 
 // ── Main Entry ─────────────────────────────────────────────────────────────
@@ -390,7 +368,7 @@ export function runFix(projectDir, config, flags) {
 
   // If --doc flag is provided, generate a deep prompt for that specific document
   if (specificDoc) {
-    return generateDocPrompt(projectDir, config, specificDoc);
+    return generateDocPrompt(projectDir, config, specificDoc, { json: isJson });
   }
 
   if (!isJson && !isPrompt) {
@@ -608,7 +586,7 @@ function assessDocQuality(content, expectations) {
 
 // ── Deep Document Prompt Generator ─────────────────────────────────────────
 
-function generateDocPrompt(projectDir, config, docName) {
+function generateDocPrompt(projectDir, config, docName, { json = false } = {}) {
   // Normalize doc name: "architecture" → "docs-canonical/ARCHITECTURE.md"
   const normalized = docName.toLowerCase().replace(/\.md$/, '');
   const mapping = {
@@ -628,7 +606,7 @@ function generateDocPrompt(projectDir, config, docName) {
   const filePath = mapping[normalized];
   if (!filePath) {
     console.error(`${c.red}Unknown document: ${docName}${c.reset}`);
-    console.log(`${c.dim}Available: architecture, data-model, security, test-spec, environment, api-reference${c.reset}`);
+    console.error(`${c.dim}Available: architecture, data-model, security, test-spec, environment, api-reference${c.reset}`);
     process.exit(1);
   }
 
@@ -650,21 +628,27 @@ function generateDocPrompt(projectDir, config, docName) {
 
   const action = !exists ? 'CREATE' : quality?.score === 'empty' ? 'REWRITE (current file is just a template)' : 'IMPROVE';
 
-  console.log(`\nYou are documenting the project "${projectName}" (a ${projectType} project).`);
-  console.log(`Project directory: ${projectDir}\n`);
-  console.log(`TASK: ${action} the file ${filePath}`);
-  console.log(`PURPOSE: ${expectations.purpose}\n`);
-
+  // docguard.output-ux#FR-001: build the prompt once; JSON mode wraps it so
+  // stdout stays parseable.
+  const lines = [
+    `\nYou are documenting the project "${projectName}" (a ${projectType} project).`,
+    `Project directory: ${projectDir}\n`,
+    `TASK: ${action} the file ${filePath}`,
+    `PURPOSE: ${expectations.purpose}\n`,
+  ];
   if (exists && quality?.score !== 'good') {
-    console.log(`CURRENT STATE: The document ${quality?.score === 'empty' ? 'is just a skeleton template with TODO placeholders — it needs to be completely rewritten with REAL project content' : `has ${quality?.placeholders} placeholder(s) that need to be replaced with real content`}.`);
-    console.log('');
+    lines.push(`CURRENT STATE: The document ${quality?.score === 'empty' ? 'is just a skeleton template with TODO placeholders — it needs to be completely rewritten with REAL project content' : `has ${quality?.placeholders} placeholder(s) that need to be replaced with real content`}.`);
+    lines.push('');
   }
-
-  console.log(expectations.aiResearchInstructions.trim());
-
-  console.log(`\nVALIDATION: After writing, run \`npx docguard-cli guard\` to verify the document passes all checks.`);
-  console.log(`The document should have NO <!-- TODO --> or <!-- e.g. --> placeholders.`);
-  console.log(`Set the docguard:status header to 'active' (not 'draft').`);
+  lines.push(expectations.aiResearchInstructions.trim());
+  lines.push(`\nVALIDATION: After writing, run \`npx docguard-cli guard\` to verify the document passes all checks.`);
+  lines.push(`The document should have NO <!-- TODO --> or <!-- e.g. --> placeholders.`);
+  lines.push(`Set the docguard:status header to 'active' (not 'draft').`);
+  if (json) {
+    console.log(JSON.stringify({ doc: filePath, action, projectType, prompt: lines.join('\n').trim() }, null, 2));
+    return;
+  }
+  for (const line of lines) console.log(line);
 }
 
 // ── Auto-Fix (skeleton creation only) ──────────────────────────────────────

@@ -121,8 +121,8 @@ export function validateApiDocSmells(projectDir, config = {}) {
           severity: 'warn',
           confidence: 'low',
           message: `${f}: "${u.heading.slice(0, 60)}" is documented in name only (${prose} words of explanation) — Lazy API doc.`,
-          location: { file: f, line: u.line },
-          suggestion: { summary: `Describe what "${u.heading.slice(0, 40)}" does, its params, return, and errors — not just its signature.` },
+          location: `${f}:${u.line}`,
+          suggestion: { kind: 'review', text: `Describe what "${u.heading.slice(0, 40)}" does, its params, return, and errors — not just its signature.` },
         }));
       } else if (total >= bloatedMin) {
         findings.push(mkFinding({
@@ -131,8 +131,8 @@ export function validateApiDocSmells(projectDir, config = {}) {
           severity: 'warn',
           confidence: 'low',
           message: `${f}: "${u.heading.slice(0, 60)}" is ${total} words for one unit — Bloated API doc; trim to the essential contract.`,
-          location: { file: f, line: u.line },
-          suggestion: { summary: `Split or trim "${u.heading.slice(0, 40)}" — move examples/edge-cases elsewhere and keep the core contract.` },
+          location: `${f}:${u.line}`,
+          suggestion: { kind: 'review', text: `Split or trim "${u.heading.slice(0, 40)}" — move examples/edge-cases elsewhere and keep the core contract.` },
         }));
       }
     }

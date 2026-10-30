@@ -1,17 +1,60 @@
 /**
  * Deep Route Scanner
+ * @req docguard.adoption-workflow-integrity#FR-013
  * Parses actual route definitions from source code across frameworks.
- * Supports: Next.js (App Router + Pages), Express, Fastify, Hono, Django, FastAPI
- * 
+ * Supports: Next.js (App Router + Pages), Express, Fastify, Hono, Koa, NestJS,
+ * Cloudflare Workers (fetch dispatch, itty-router), Cloudflare Pages Functions,
+ * Hono OpenAPI routes, Django, FastAPI, Flask,
+ * Starlette, Spring Boot, Rails, Sinatra, Gin/Echo/Chi/Fiber/net/http,
+ * Axum/Actix/Rocket/Warp/Tide, Laravel, Symfony, ASP.NET Core
+ *
  * Priority: OpenAPI spec > Code scanning
+ *
+ * Spring, Rails, Go and Rust have no syntax tree in DocGuard: their routes are
+ * matched by pattern, and each carries `tier: 'fallback-language'` so a finding
+ * drawn from them says so (docguard.fallback-language-coverage#FR-002).
+ *
+ * @implements docguard.fallback-language-coverage#FR-002
+ * @implements docguard.fallback-language-coverage#FR-007
+ * @implements docguard.fallback-language-coverage#FR-008
+ * @implements docguard.more-route-frameworks#FR-005
+ * @implements docguard.more-route-frameworks#FR-007
+ * @implements docguard.js-framework-routes#FR-006
+ * @implements docguard.coverage-followups#FR-002
+ * @implements docguard.coverage-followups#FR-003
+ * @implements docguard.coverage-followups#FR-004
+ * @implements docguard.coverage-followups#FR-009
  */
+
+/** Mark a route its framework matches ignoring case (docguard.coverage-followups#FR-003/FR-009). */
+const withCase = (route, insensitive) => (insensitive ? { ...route, caseInsensitive: true } : route);
+
+/** Collect a scanner's case notes into the scan record. */
+function takeCaseNotes(scan, found) {
+  for (const n of found.caseNotes || []) scan.caseNotes.push(n);
+  return found;
+}
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { resolve, join, relative, basename, extname, dirname } from 'node:path';
-import { resolveSourceRoots, readScannable } from '../shared-source.mjs';
-import { DEFAULT_IGNORE_DIRS as IGNORE_DIRS, shouldIgnore, relPosix, isNonProductPath } from '../shared-ignore.mjs';
-import { extractJsRouteCalls, extractJsRouteObjects, extractJsMountsAndImports } from './js-ast.mjs';
-import { extractPythonFiles } from './py-ast.mjs';
+import { resolveSourceRoots, readScannable, tierFor, summarizeTiers, collectPackageJsons, pagesOutputDir } from '../shared-source.mjs';
+import { shouldIgnore, relPosix, isNonProductPath, isIgnoredDirEntry } from '../shared-ignore.mjs';
+import { extractJsRouteCalls, extractJsRouteObjects, extractJsMountsAndImports, importedStaticStrings, nextRouteHandlers, isAuthMiddlewareName, AUTH_CHECK_RE, matchingBracket } from './js-ast.mjs';
+import { createAliasResolver } from './ts-paths.mjs';
+import { scanPythonWebRoutes } from './python-routes.mjs';
+import { extractGoRoutes } from './go-routes.mjs';
+import { extractSpringRoutes } from './spring-routes.mjs';
+import { extractRailsRoutes } from './rails-routes.mjs';
+import { extractSinatraRoutes } from './sinatra-routes.mjs';
+import { extractWarpRoutes, extractTideRoutes, extractRustBuilderRoutes } from './rust-routes.mjs';
+import { extractLaravelRoutes, extractSymfonyRoutes } from './php-routes.mjs';
+import { extractAspNetRoutes } from './dotnet-routes.mjs';
+import { extractNestRoutes } from './nest-routes.mjs';
+import { extractWorkerRoutes } from './worker-routes.mjs';
+import { extractRouterRoutes } from './router-routes.mjs';
+import { extractPagesRoutes, functionsLocation, isAdvancedWorkerFile, parseRoutesJson, servedByRoutesJson } from './pages-routes.mjs';
+import { createImportResolver } from './js-route-support.mjs';
+import { expressCaseModel, koaCaseModel, fastifyCaseMode, nestCaseMode } from './route-case.mjs';
 
 /**
  * Scan routes from source code with framework-aware parsing.
@@ -37,45 +80,118 @@ export function scanRoutesDeep(dir, stack, docTools, opts = {}) {
   const framework = stack?.framework || '';
   const routes = [];
   const roots = opts.config ? resolveSourceRoots(dir, opts.config) : null;
+  // What the scan READ, kept apart from what it found: an empty result from a
+  // pattern-only scanner, a truncated walk, or routes that exist only in
+  // fixtures are exactly the cases a caller must be able to tell apart from
+  // "this project registers no routes".
+  const maxFiles = Number.isInteger(opts.maxFiles) && opts.maxFiles > 0 ? opts.maxFiles : ROUTE_SCAN_MAX_FILES;
+  const scan = { tierItems: [], truncated: false, cap: maxFiles, patternFrameworks: [], excludedNonProduct: 0, unresolved: [], caseNotes: [] };
+  const ctx = { dir, maxFiles, scan, config: opts.config || {} };
+  const named = (...names) => names.find(n => framework.includes(n));
+  const patternScan = (name, sources, fn) => {
+    const before = scan.tierItems.length;
+    const found = fn(dir, ctx);
+    // Routes a reader saw but could not place (a path that is not literal
+    // text) are counted and located, so coverage says the surface is short,
+    // by how much and where (docguard.php-dotnet-routes#FR-007,
+    // docguard.more-route-frameworks#FR-005). Like kept routes, those in
+    // test/fixture/example or ignored paths do not count.
+    const omitted = (found.omitted || []).filter(o => {
+      const rel = relPosix(dir, resolve(dir, o.file || ''));
+      return !isNonProductPath(rel, opts.config || {}) && !shouldIgnore(rel, opts.config || {});
+    });
+    scan.patternFrameworks.push({ name, sources, files: scan.tierItems.length - before, routes: found.length, omitted: omitted.length, omittedAt: omitted.slice(0, 3).map(o => `${o.file}:${o.line}`) });
+    routes.push(...found);
+  };
 
   if (framework.includes('Next.js') || framework.includes('Next')) {
     routes.push(...scanNextJsRoutes(dir));
   }
 
+  // A path these scanners cannot read is recorded with the scan, never
+  // reported at a `:param` placeholder (docguard.js-route-shapes#FR-007).
   if (framework.includes('Express') || !framework) {
-    routes.push(...scanExpressRoutes(dir, roots));
+    routes.push(...takeCaseNotes(scan, scanExpressRoutes(dir, roots, scan.unresolved)));
   }
 
   if (framework.includes('Fastify')) {
-    routes.push(...scanFastifyRoutes(dir, roots));
+    routes.push(...takeCaseNotes(scan, scanFastifyRoutes(dir, roots, scan.unresolved)));
   }
 
-  if (framework.includes('Hono')) {
-    routes.push(...scanHonoRoutes(dir, roots));
+  // NestJS decorators, Cloudflare Worker dispatch and Hono/itty-router
+  // routers: syntax-tree readers whose routes carry their tier
+  // (docguard.js-framework-routes#FR-001..FR-006). The Workers scan includes
+  // the router reader, so Hono on Workers is read once.
+  if (framework.includes('NestJS')) {
+    patternScan('NestJS', ['nestjs'], scanNestRoutes);
+  }
+  if (framework.includes('Cloudflare Workers')) {
+    patternScan('Cloudflare Workers', ['cloudflare-workers', 'hono', 'itty-router'], scanWorkerRoutes);
+  } else if (framework.includes('Hono')) {
+    patternScan('Hono', ['hono', 'itty-router'], scanHonoRouterRoutes);
+  }
+  // Cloudflare Pages Functions are routed by file; a Pages project may also
+  // serve a Hono or itty-router app from one Function
+  // (docguard.js-route-shapes#FR-003).
+  if (framework.includes('Cloudflare Pages')) {
+    patternScan('Cloudflare Pages', ['cloudflare-pages', 'hono', 'itty-router'], scanPagesRoutes);
+  }
+  // Koa routers compose prefixes across files like Hono's, so the router
+  // reader reads them (docguard.js-route-shapes#FR-001; labelled Koa since
+  // docguard.docs-verification-findings#FR-001).
+  if (framework.includes('Koa')) {
+    patternScan('Koa', ['koa'], scanKoaRouterRoutes);
   }
 
-  if (framework.includes('Django')) {
-    routes.push(...scanDjangoRoutes(dir));
+  if (named('Spring', 'Java')) {
+    patternScan(named('Spring Boot', 'Spring', 'Java'), ['spring-boot'], scanSpringBootRoutes);
   }
 
-  if (framework.includes('Spring') || framework.includes('Java')) {
-    routes.push(...scanSpringBootRoutes(dir));
+  if (named('Rails', 'Ruby')) {
+    patternScan(named('Rails', 'Ruby'), ['rails'], scanRailsRoutes);
   }
 
-  if (framework.includes('Rails') || framework.includes('Ruby')) {
-    routes.push(...scanRailsRoutes(dir));
+  if (framework.includes('Sinatra')) {
+    patternScan('Sinatra', ['sinatra'], scanSinatraRoutes);
   }
 
-  if (framework.includes('Gin') || framework.includes('Echo') || framework.includes('Chi') || framework.includes('Fiber') || framework.includes('Go')) {
-    routes.push(...scanGoWebRoutes(dir));
+  if (named('Gin', 'Echo', 'Chi', 'Fiber', 'net/http', 'Go')) {
+    patternScan(named('Gin', 'Echo', 'Chi', 'Fiber', 'net/http', 'Go'), ['go-web'], scanGoWebRoutes);
   }
 
-  if (framework.includes('Axum') || framework.includes('Actix') || framework.includes('Rocket') || framework.includes('Warp') || framework.includes('Rust')) {
-    routes.push(...scanRustWebRoutes(dir));
+  if (named('Axum', 'Actix', 'Rocket', 'Warp', 'Tide', 'Rust')) {
+    patternScan(named('Axum', 'Actix', 'Rocket', 'Warp', 'Tide', 'Rust'), ['axum', 'actix', 'rocket', 'warp', 'tide'], scanRustWebRoutes);
   }
 
-  if (framework.includes('FastAPI') || framework.includes('Flask')) {
-    routes.push(...scanFastAPIRoutes(dir));
+  // docguard.php-dotnet-routes#FR-008: PHP and .NET frameworks, read by pattern.
+  if (named('Laravel')) patternScan('Laravel', ['laravel'], scanLaravelRoutes);
+  if (named('Symfony')) patternScan('Symfony', ['symfony'], scanSymfonyRoutes);
+  if (named('ASP.NET')) patternScan('ASP.NET Core', ['aspnet-core'], scanAspNetRoutes);
+
+  // Python: one scan resolves FastAPI/Flask routers and Django URL
+  // configurations from the same module outlines (python-routes.mjs), and
+  // records each file's parser tier with the scan.
+  let limitations = null;
+  const django = framework.includes('Django');
+  const asgi = framework.includes('FastAPI') || framework.includes('Flask') || framework.includes('Starlette');
+  if (django || asgi) {
+    const pyFiles = findRouteFiles(dir, /\.py$/, { maxFiles });
+    if (pyFiles.truncated) scan.truncated = true;
+    const py = scanPythonWebRoutes(dir, { django, asgi }, { files: pyFiles });
+    scan.tierItems.push(...py.fileTiers);
+    limitations = py.limitations || null;
+    // A route the Python reader could not read (a path that does not
+    // evaluate, an include it cannot follow) is a coverage gap like any
+    // other reader's: it joins `unresolved`, labelled with its framework, so
+    // the API-surface check counts and locates it
+    // (docguard.coverage-followups#FR-004).
+    const asgiName = named('FastAPI', 'Flask', 'Starlette') || 'Python';
+    for (const l of limitations || []) {
+      if (!l.framework) l.framework = String(l.code || '').startsWith('django-') ? 'Django' : asgiName;
+      if (l.file) l.file = String(l.file).replace(/\\/g, '/');
+      scan.unresolved.push(l);
+    }
+    routes.push(...py);
   }
 
   // Deduplicate by method+path, and drop routes that live in non-product dirs
@@ -85,23 +201,77 @@ export function scanRoutesDeep(dir, stack, docTools, opts = {}) {
   // DEFAULT (no .docguardignore needed); shouldIgnore honors explicit config.
   const cfg = opts.config || {};
   const seen = new Set();
-  return routes.filter(r => {
+  const kept = routes.filter(r => {
     const key = `${r.method}:${r.path}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
     if (r.file) {
       const rel = relPosix(dir, resolve(dir, r.file));
-      if (isNonProductPath(rel, cfg)) return false;
+      if (isNonProductPath(rel, cfg)) { scan.excludedNonProduct++; return false; }
       if (shouldIgnore(rel, cfg)) return false;
     }
+    // Filter non-product and ignored evidence before deduplication. Otherwise a
+    // test request can reserve the same method/path key as a real route, get
+    // filtered out, and silently remove the product route that appears later.
+    if (seen.has(key)) return false;
+    seen.add(key);
     return true;
   });
+  // Carry the scan's analyzer tier past the filter. It describes the SCAN, not
+  // any single route, so it must survive even when the filter empties the list
+  // — an empty result from a degraded tier is precisely the case a caller has
+  // to know about. (calibrated-finding-channels#FR-011)
+  const scanTier = scan.tierItems.length ? summarizeTiers(scan.tierItems) : null;
+  if (scanTier) Object.defineProperty(kept, 'scanTier', { value: scanTier, enumerable: false });
+  // What a reader could not resolve (a dynamic path, a prefix dispatch) is a
+  // coverage gap; one in a test or ignored file is not the product's.
+  const unresolved = scan.unresolved.filter(u => !u.file || (!isNonProductPath(u.file, cfg) && !shouldIgnore(u.file, cfg)));
+  const allLimitations = [...new Set([...(limitations || []), ...unresolved])];
+  if (allLimitations.length) Object.defineProperty(kept, 'limitations', { value: allLimitations, enumerable: false });
+  for (const pf of scan.patternFrameworks) pf.kept = kept.filter(r => pf.sources.includes(r.source)).length;
+  Object.defineProperty(kept, 'scan', {
+    enumerable: false,
+    value: {
+      tier: scanTier,
+      files: scan.tierItems.length,
+      truncated: scan.truncated,
+      cap: scan.cap,
+      patternFrameworks: scan.patternFrameworks,
+      excludedNonProduct: scan.excludedNonProduct,
+      unresolved,
+      // Case settings this reader could not read: those routes compare
+      // exactly (docguard.coverage-followups#FR-009).
+      caseNotes: scan.caseNotes,
+    },
+  });
+  return kept;
 }
 
 // ── Next.js App Router ──────────────────────────────────────────────────────
 
+/**
+ * The URL path a Next.js App Router directory serves, from its path below the
+ * directory that holds `api/`: `api/(admin)/users/[id]` → `/api/users/:id`.
+ * Shared with Docs-Sync, which names a route handler by this path.
+ * @implements docguard.docs-sync-specific-evidence#FR-003
+ * @param {string} relDir
+ * @returns {string}
+ */
+export function appRouterPath(relDir) {
+  return '/' + relDir
+    .replace(/\\/g, '/')
+    // Strip route-group segments like `(admin)` — they organize files but
+    // do NOT appear in the URL. The frontend scanner already does this; the
+    // route scanner used to leak them, e.g. `/api/(admin)/users`.
+    .split('/')
+    .filter(seg => seg && !/^\(.*\)$/.test(seg))
+    .join('/')
+    .replace(/\[\[\.\.\.(\w+)\]\]/g, ':$1*')  // Optional catch-all [[...slug]] — before [...slug]
+    .replace(/\[\.\.\.(\w+)\]/g, ':$1*')        // Catch-all [...slug]
+    .replace(/\[(\w+)\]/g, ':$1');               // Dynamic [id]
+}
+
 function scanNextJsRoutes(dir) {
   const routes = [];
+  const middlewareAuth = nextMiddlewareAuth(dir);
 
   // App Router: app/api/**/route.{ts,js}
   const appDirs = ['app/api', 'src/app/api'];
@@ -123,20 +293,13 @@ function scanNextJsRoutes(dir) {
       // produce `/api/<segments>`. Previously `appDir.split('/')[0]` stripped
       // only `src/` for the src layout, leaking `app/` into the emitted path.
       const apiBase = appDir.slice(0, appDir.lastIndexOf('/'));
-      const relDir = relative(resolve(dir, apiBase), dirname(filePath));
-      const apiPath = '/' + relDir
-        .replace(/\\/g, '/')
-        // Strip route-group segments like `(admin)` — they organize files but
-        // do NOT appear in the URL. The frontend scanner already does this; the
-        // route scanner used to leak them, e.g. `/api/(admin)/users`.
-        .split('/')
-        .filter(seg => seg && !/^\(.*\)$/.test(seg))
-        .join('/')
-        .replace(/\[\[\.\.\.(\w+)\]\]/g, ':$1*')  // Optional catch-all [[...slug]] — before [...slug]
-        .replace(/\[\.\.\.(\w+)\]/g, ':$1*')        // Catch-all [...slug]
-        .replace(/\[(\w+)\]/g, ':$1');               // Dynamic [id]
+      const apiPath = appRouterPath(relative(resolve(dir, apiBase), dirname(filePath)));
 
-      // Extract exported HTTP methods
+      // Extract exported HTTP methods. Each handler is judged by its own body
+      // (AST), or by its own export's text when the file does not parse, plus
+      // a `middleware` file whose matcher covers the path
+      // (docguard.js-ts-extraction#FR-002).
+      const handlers = nextRouteHandlers(content, filePath);
       const methods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'];
       for (const method of methods) {
         // Match: export async function GET, export function GET, export const GET
@@ -145,14 +308,17 @@ function scanNextJsRoutes(dir) {
           new RegExp(`export\\s+(?:const|let)\\s+${method}\\s*=`),
         ];
         for (const pattern of patterns) {
-          if (pattern.test(content)) {
+          const match = pattern.exec(content);
+          const viaAst = handlers?.get(method);
+          if (match || viaAst) {
             routes.push({
               method,
               path: apiPath,
               handler: method,
               file: relative(dir, filePath),
+              line: viaAst?.line ?? (match ? lineAt(content, match.index) : null),
               source: 'nextjs-app-router',
-              auth: hasAuthCheck(content),
+              auth: (viaAst ? viaAst.auth : exportSegmentAuth(content, match.index)) || middlewareAuth(apiPath),
               description: extractJSDocDescription(content, method),
             });
             break;
@@ -190,14 +356,16 @@ function scanNextJsRoutes(dir) {
       // Detect methods from req.method checks
       const detectedMethods = detectMethodsFromHandler(content);
 
+      const defaultExport = /export\s+default\b/.exec(content);
       for (const method of detectedMethods) {
         routes.push({
           method,
           path: apiPath || '/api',
           handler: `${name}Handler`,
           file: relative(dir, filePath),
+          line: defaultExport ? lineAt(content, defaultExport.index) : null,
           source: 'nextjs-pages-router',
-          auth: hasAuthCheck(content),
+          auth: hasAuthCheck(content) || middlewareAuth(apiPath || '/api'),
           description: extractJSDocDescription(content),
         });
       }
@@ -209,7 +377,20 @@ function scanNextJsRoutes(dir) {
 
 // ── Express / Generic Node.js ───────────────────────────────────────────────
 
-function scanExpressRoutes(dir, roots = null) {
+/** A pattern-tier path still holding a `${…}` substitution: not literal. */
+const TEMPLATE_SUBSTITUTION = /\$\{/;
+
+/**
+ * Record a route registration whose path is not literal (from the syntax
+ * tree's `unresolved`, or a pattern-tier `${…}` path) in the scan's sink.
+ * @implements docguard.js-route-shapes#FR-007
+ */
+function recordUnresolvedPaths(sink, framework, file, items) {
+  if (!sink) return;
+  for (const u of items || []) sink.push({ framework, code: 'route-unresolved-path', file, line: u.line, target: u.target || '' });
+}
+
+function scanExpressRoutes(dir, roots = null, unresolved = null) {
   // Regex is the FALLBACK (used only when @babel/parser can't parse a file).
   // It hardcodes app/router/server receivers; the AST path matches any receiver.
   const routePattern = /(?:app|router|server)\s*\.\s*(get|post|put|delete|patch|head|options)\s*\(\s*['"`]([^'"`]+)['"`]/gi;
@@ -248,40 +429,206 @@ function scanExpressRoutes(dir, roots = null) {
   // non-null receiver means it applies only to routes whose receiver matches
   // (a same-file `const r = Router(); app.use('/api', r)` — so a sibling
   // `app.get('/health')` in the same file is NOT wrongly prefixed).
-  const mountMap = buildExpressMountMap(files);
+  // Whether each router matches ignoring case (docguard.coverage-followups#FR-009).
+  const caseModel = expressCaseModel(files);
+  const mountMap = buildExpressMountMap(files, createAliasResolver(dir), caseModel.modeOf, unresolved);
 
   // ── Phase 2: emit routes, prefixing by mount where known ────────────────────
+  // Auth is per route (docguard.js-ts-extraction#FR-002): the route's own
+  // evidence, or auth middleware on a mount above it.
   const routes = [];
   for (const { content, filePath, fileLabel } of files) {
     const mounts = mountMap.get(filePath) || [];
-    const emit = (method, path, index, receiver) => {
-      const prefixes = mounts
-        .filter(m => m.receiver === null || m.receiver === receiver)
-        .map(m => m.prefix);
-      const finalPaths = prefixes.length ? prefixes.map(p => joinRoutePath(p, path)) : [path];
-      for (const fullPath of finalPaths) {
-        routes.push({
-          method: method.toUpperCase(),
-          path: fullPath,
-          handler: extractHandlerName(content, index),
+    const emit = (r) => {
+      const matching = mounts.filter(m => m.receiver === null || m.receiver === r.receiver);
+      const applicable = matching.filter(m => !m.omitted);
+      // Mounted only under prefixes that cannot be read: the served path is
+      // unknown, so the route is omitted (docguard.js-route-shapes#FR-010).
+      if (matching.length && !applicable.length) return;
+      // Case-insensitive only when the route's own router is, and every router
+      // that matched a mount prefix above it is.
+      const own = caseModel.modeOf(filePath, r.receiver) === 'insensitive';
+      const targets = applicable.length
+        ? applicable.map(m => ({ path: joinRoutePath(m.prefix, r.path), auth: m.auth, insensitive: own && m.insensitive }))
+        : [{ path: r.path, auth: false, insensitive: own }];
+      for (const target of targets) {
+        routes.push(withCase({
+          method: r.method.toUpperCase(),
+          path: target.path,
+          handler: r.handler ?? extractHandlerName(content, r.start),
           file: fileLabel,
+          line: r.line ?? lineAt(content, r.start),
           source: 'express',
-          auth: hasAuthMiddleware(content, path),
-          description: extractNearbyComment(content, index),
-        });
+          auth: Boolean(r.auth || target.auth),
+          description: extractNearbyComment(content, r.start),
+        }, target.insensitive));
       }
     };
-    const ast = extractJsRouteCalls(content, filePath);
+    const ast = extractJsRouteCalls(content, filePath, mountMap.importedConstants?.get(filePath));
     if (ast) {
-      for (const r of ast) emit(r.method, r.path, r.start, r.receiver ?? null);
+      for (const r of ast) emit({ ...r, receiver: r.receiver ?? null });
+      recordUnresolvedPaths(unresolved, 'Express', fileLabel, ast.unresolved);
     } else {
+      const found = [];
       const regex = new RegExp(routePattern.source, 'gi');
       let match;
-      while ((match = regex.exec(content)) !== null) emit(match[1], match[2], match.index, null);
+      while ((match = regex.exec(content)) !== null) {
+        found.push({ method: match[1], path: match[2], start: match.index, receiver: null, auth: statementAuth(content, match.index) });
+      }
+      found.push(...routeChainsByPattern(content));
+      for (const r of found) {
+        if (TEMPLATE_SUBSTITUTION.test(r.path)) recordUnresolvedPaths(unresolved, 'Express', fileLabel, [{ line: r.line ?? lineAt(content, r.start), target: r.path }]);
+        else emit(r);
+      }
     }
   }
 
+  Object.defineProperty(routes, 'caseNotes', { value: caseModel.notes, enumerable: false });
   return routes;
+}
+
+// ── Pattern-tier route chains and auth (docguard.js-ts-extraction#FR-001/002) ─
+
+/** Top-level comma-separated argument texts of the call whose `(` is at `open`. */
+function callArgs(content, open) {
+  const close = matchingBracket(content, open);
+  if (close < 0) return null;
+  const args = [];
+  let depth = 0, start = open + 1;
+  for (let i = open + 1; i < close; i++) {
+    const ch = content[i];
+    if (ch === '"' || ch === "'" || ch === '`') { for (i++; i < close && content[i] !== ch; i++) if (content[i] === '\\') i++; continue; }
+    if ('([{'.includes(ch)) depth++;
+    else if (')]}'.includes(ch)) depth--;
+    else if (ch === ',' && depth === 0) { args.push(content.slice(start, i).trim()); start = i + 1; }
+  }
+  const last = content.slice(start, close).trim();
+  if (last) args.push(last);
+  return { args, close };
+}
+
+/** Pattern-tier auth of one call's arguments (middleware + handler), text only. */
+function argsAuth(content, middleware, handler) {
+  const isAuthArg = (text) => {
+    const m = /^([A-Za-z_$][\w$]*)(?:\s*\.\s*([A-Za-z_$][\w$]*))?/.exec(text || '');
+    return Boolean(m) && (isAuthMiddlewareName(m[1]) || isAuthMiddlewareName(m[2]));
+  };
+  if (middleware.some(text => text.startsWith('[') ? text.slice(1, -1).split(',').some(t => isAuthArg(t.trim())) : isAuthArg(text))) return true;
+  if (!handler) return false;
+  if (/^[A-Za-z_$][\w$]*$/.test(handler)) {
+    const decl = new RegExp(`(?:function\\s+${handler}\\s*\\(|(?:const|let|var)\\s+${handler}\\s*=\\s*(?:async\\s*)?(?:function\\b|\\([^)]*\\)\\s*=>|[A-Za-z_$][\\w$]*\\s*=>))`).exec(content);
+    if (!decl) return false;
+    const brace = content.indexOf('{', decl.index + decl[0].length);
+    const end = brace < 0 ? -1 : matchingBracket(content, brace);
+    return end > 0 && AUTH_CHECK_RE.test(content.slice(decl.index, end + 1));
+  }
+  return AUTH_CHECK_RE.test(handler);
+}
+
+/**
+ * Auth of the `<receiver>.<method>('/path', …)` call starting at `index` (pattern tier).
+ * @implements docguard.js-ts-extraction#FR-002
+ */
+function statementAuth(content, index) {
+  const open = content.indexOf('(', index);
+  const call = open < 0 ? null : callArgs(content, open);
+  if (!call || call.args.length < 2) return false;
+  return argsAuth(content, call.args.slice(1, -1), call.args[call.args.length - 1]);
+}
+
+/**
+ * `<x>.route('/p').get(…).post(…)` chains read by pattern when the file does not parse.
+ * @implements docguard.js-ts-extraction#FR-001
+ */
+function routeChainsByPattern(content) {
+  const out = [];
+  const re = /\b([A-Za-z_$][\w$]*)\s*\.\s*route\s*\(\s*(['"`])([^'"`]+)\2\s*\)/g;
+  let m;
+  while ((m = re.exec(content)) !== null) {
+    if (!/(?:app|server|router|routes)$/i.test(m[1])) continue;
+    const path = m[3];
+    if (!(path.startsWith('/') || path === '*')) continue;
+    let i = m.index + m[0].length;
+    for (;;) {
+      const next = /^\s*\.\s*(get|post|put|delete|patch|head|options|all)\s*\(/i.exec(content.slice(i));
+      if (!next) break;
+      const open = i + next[0].length - 1;
+      const call = callArgs(content, open);
+      if (!call) break;
+      const handler = call.args[call.args.length - 1];
+      out.push({
+        method: next[1], path, start: m.index, receiver: null,
+        line: lineAt(content, i + next[0].indexOf(next[1])),
+        handler: /^[A-Za-z_$][\w$]*$/.test(handler || '') ? handler : 'inline',
+        auth: argsAuth(content, call.args.slice(0, -1), handler),
+      });
+      i = call.close + 1;
+    }
+  }
+  return out;
+}
+
+/** 1-based line of a character offset. */
+function lineAt(content, index) {
+  if (typeof index !== 'number' || index < 0) return null;
+  let line = 1;
+  for (let i = 0; i < index && i < content.length; i++) if (content[i] === '\n') line++;
+  return line;
+}
+
+/** Pattern-tier auth of one Next.js export: its text up to the next export. */
+function exportSegmentAuth(content, index) {
+  const rest = content.slice(index + 6);
+  const next = rest.search(/\nexport\s/);
+  return AUTH_CHECK_RE.test(content.slice(index, next < 0 ? content.length : index + 6 + next));
+}
+
+const NEXT_MIDDLEWARE_FILES = ['middleware.ts', 'middleware.js', 'src/middleware.ts', 'src/middleware.js'];
+const MIDDLEWARE_AUTH_RE = /next-auth\/middleware|\bwithAuth\b|\bclerkMiddleware\b|\bauthMiddleware\b|\bgetToken\s*\(|\bauth\s*\(|\bauth\s+as\s+middleware\b|\bjwtVerify\s*\(|\bjwt\s*\.\s*verify\s*\(|\bverifyToken\s*\(|\bgetServerSession\s*\(|\bgetSession\s*\(/;
+
+/**
+ * A predicate for "a Next.js `middleware` file with auth covers this path"
+ * (docguard.js-ts-extraction#FR-002). No auth in the middleware → never. Auth
+ * with no literal matcher → every path. Matchers use Next's path syntax
+ * (`/api/admin/:path*`); only string literals are read.
+ * @implements docguard.js-ts-extraction#FR-002
+ */
+function nextMiddlewareAuth(dir) {
+  for (const rel of NEXT_MIDDLEWARE_FILES) {
+    const abs = resolve(dir, rel);
+    if (!existsSync(abs)) continue;
+    const content = readFileSafe(abs);
+    if (!content || !MIDDLEWARE_AUTH_RE.test(content)) return () => false;
+    const matcher = /\bmatcher\s*:\s*(\[[^\]]*\]|'[^']*'|"[^"]*"|`[^`]*`)/.exec(content);
+    if (!matcher) return () => true;
+    const patterns = [...matcher[1].matchAll(/(['"`])([^'"`]+)\1/g)].map(m => matcherRegex(m[2])).filter(Boolean);
+    return (path) => patterns.some(re => re.test(path));
+  }
+  return () => false;
+}
+
+function matcherRegex(pattern) {
+  let source = '';
+  for (let i = 0; i < pattern.length;) {
+    const param = /^\/:(\w+)([*+?]?)/.exec(pattern.slice(i));
+    if (param) {
+      source += param[2] === '*' ? '(?:/.*)?' : param[2] === '+' ? '/.+' : param[2] === '?' ? '(?:/[^/]+)?' : '/[^/]+';
+      i += param[0].length;
+      continue;
+    }
+    const ch = pattern[i];
+    // A regex group such as `((?!_next).*)` is passed through as written.
+    if (ch === '(') {
+      const end = matchingBracket(pattern, i);
+      if (end < 0) return null;
+      source += pattern.slice(i, end + 1);
+      i = end + 1;
+      continue;
+    }
+    source += /[.+?^${}|[\]\\]/.test(ch) ? `\\${ch}` : ch === '*' ? '.*' : ch;
+    i++;
+  }
+  try { return new RegExp(`^${source}/?$`); } catch { return null; }
 }
 
 /**
@@ -292,36 +639,182 @@ function scanExpressRoutes(dir, roots = null) {
  *   - router is a LOCAL identifier    → the prefix applies only to that file's
  *     routes whose receiver matches (receiver: ident).
  *
- * Known limitations (documented, not silently wrong): transitive composition
- * (`app.use('/api', api)` then `api.use('/x', x)` does NOT yield `/api/x`), and
- * dynamic mount paths (non-string-literal prefixes) are skipped. Unmounted
- * files keep their bare paths — exactly the pre-mount-map behavior.
+ * Imported-router mounts are composed transitively, so
+ * `app.use('/api', api)` plus `api.use('/x', x)` yields `/api/x`. A prefix
+ * built from same-file or imported `const` strings is resolved; any other
+ * prefix that is not literal is recorded once in `unresolved`, and a router
+ * reachable only through such mounts is marked `omitted`, so its routes are not
+ * reported at the root (docguard.js-route-shapes#FR-010). Unmounted files keep their
+ * bare paths — exactly the pre-mount-map behavior. Each prefix carries whether
+ * auth middleware guards every mount chain to it, and imports resolve through
+ * tsconfig/jsconfig aliases.
+ * @implements docguard.js-ts-extraction#FR-002
+ * @implements docguard.js-ts-extraction#FR-005
+ * @implements docguard.js-route-shapes#FR-010
  */
-function buildExpressMountMap(files) {
+function buildExpressMountMap(files, resolveAlias = null, modeOf = null, unresolved = null) {
   const map = new Map();
-  const add = (absFile, receiver, prefix) => {
+  const add = (absFile, receiver, prefix, auth, insensitive, omitted = false) => {
     if (!map.has(absFile)) map.set(absFile, []);
-    map.get(absFile).push({ receiver, prefix });
+    map.get(absFile).push({ receiver, prefix, auth, insensitive, omitted });
   };
+  // The router that matches a mount prefix is the mount's receiver
+  // (docguard.coverage-followups#FR-009).
+  const parentInsensitive = node => (modeOf ? modeOf(node.file, node.receiver) === 'insensitive' : false);
+  const metadata = new Map();
   for (const { content, filePath } of files) {
     const mi = extractJsMountsAndImports(content, filePath);
+    if (mi) metadata.set(filePath, mi);
+  }
+  // A file that imports `const` strings is read again with them, so its
+  // prefixes, paths and route receivers see their values
+  // (docguard.js-route-shapes#FR-010, FR-011).
+  const importedConstants = importedConstantsByFile(files, metadata, resolveAlias);
+  for (const { content, filePath } of files) {
+    const imported = importedConstants.get(filePath);
+    if (imported) metadata.set(filePath, extractJsMountsAndImports(content, filePath, imported) || metadata.get(filePath));
+  }
+  const labels = new Map(files.map(f => [f.filePath, f.fileLabel]));
+  const recorded = new Set();
+  const recordPrefix = (filePath, mount) => {
+    const at = `${filePath}:${mount.line}`;
+    if (!unresolved || recorded.has(at)) return;
+    recorded.add(at);
+    unresolved.push({ framework: 'Express', code: 'route-unresolved-prefix', file: labels.get(filePath) || filePath, line: mount.line, target: mount.target || '' });
+  };
+
+  const edges = [];
+  for (const { filePath } of files) {
+    const mi = metadata.get(filePath);
     if (!mi) continue;
-    for (const { prefix, ident } of mi.mounts) {
+    for (const mount of mi.mounts) {
+      const { prefix, ident, receiver, auth } = mount;
       const spec = mi.imports[ident];
       if (spec) {
-        const target = resolveLocalImport(filePath, spec);
-        if (target) add(target, null, prefix);
+        const target = resolveLocalImport(filePath, spec, resolveAlias);
+        const targetMeta = target ? metadata.get(target) : null;
+        if (!targetMeta) continue;
+        const importedSymbol = mi.importSymbols?.[ident];
+        const targetReceiver = importedSymbol === 'default'
+          ? (targetMeta.exports?.default ?? null)
+          : importedSymbol && importedSymbol !== '*'
+            ? (targetMeta.exports?.[importedSymbol] ?? importedSymbol)
+            : null;
+        const targetRouteReceivers = new Set(targetMeta.routeReceivers || []);
+        const targetMountReceivers = new Set((targetMeta.mounts || []).map(mount => mount.receiver));
+        if (targetReceiver !== null &&
+            !targetRouteReceivers.has(targetReceiver) &&
+            !targetMountReceivers.has(targetReceiver)) continue;
+        if (targetReceiver === null && targetRouteReceivers.size === 0 && targetMountReceivers.size === 0) continue;
+        if (prefix === null) recordPrefix(filePath, mount);
+        edges.push({
+          from: { file: filePath, receiver },
+          to: { file: target, receiver: targetReceiver },
+          prefix,
+          auth: Boolean(auth),
+        });
       } else {
-        add(filePath, ident, prefix);
+        const routeReceivers = new Set(mi.routeReceivers || []);
+        const mountReceivers = new Set((mi.mounts || []).map(mount => mount.receiver));
+        if (!routeReceivers.has(ident) && !mountReceivers.has(ident)) continue;
+        if (prefix === null) recordPrefix(filePath, mount);
+        edges.push({
+          from: { file: filePath, receiver },
+          to: { file: filePath, receiver: ident },
+          prefix,
+          auth: Boolean(auth),
+        });
       }
     }
   }
+
+  const nodeKey = node => `${node.file}\0${node.receiver ?? '*'}`;
+  const incoming = new Map();
+  const nodes = new Map();
+  for (const edge of edges) {
+    const key = nodeKey(edge.to);
+    nodes.set(key, edge.to);
+    if (!incoming.has(key)) incoming.set(key, []);
+    incoming.get(key).push(edge);
+  }
+  // Each effective prefix carries whether auth middleware sits on EVERY mount
+  // chain that reaches it: a router reachable at the same prefix without auth
+  // is reachable without auth (docguard.js-ts-extraction#FR-002).
+  const memo = new Map();
+  const effectivePrefixes = (node, visiting = new Set(), depth = 0) => {
+    const key = nodeKey(node);
+    if (memo.has(key)) return memo.get(key);
+    if (visiting.has(key) || depth > 32) return [];
+    const nodeEdges = incoming.get(key) || [];
+    if (nodeEdges.length === 0) return [];
+    const nextVisiting = new Set(visiting).add(key);
+    const prefixes = new Map(); // prefix -> { auth, insensitive }
+    for (const edge of nodeEdges) {
+      if (edge.prefix === null) continue; // an unreadable prefix serves nothing we can name
+      const parentKey = nodeKey(edge.from);
+      const parentHasIncoming = (incoming.get(parentKey) || []).length > 0;
+      const parentPrefixes = parentHasIncoming
+        ? effectivePrefixes(edge.from, nextVisiting, depth + 1)
+        : [{ prefix: '', auth: false, insensitive: true }];
+      const edgeInsensitive = parentInsensitive(edge.from);
+      for (const parent of parentPrefixes) {
+        const prefix = joinRoutePath(parent.prefix, edge.prefix);
+        const auth = parent.auth || edge.auth;
+        const insensitive = parent.insensitive && edgeInsensitive;
+        const prior = prefixes.get(prefix);
+        prefixes.set(prefix, prior ? { auth: prior.auth && auth, insensitive: prior.insensitive && insensitive } : { auth, insensitive });
+        if (prefixes.size >= 256) break;
+      }
+      if (prefixes.size >= 256) break;
+    }
+    const resolved = [...prefixes].map(([prefix, v]) => ({ prefix, auth: v.auth, insensitive: v.insensitive }));
+    memo.set(key, resolved);
+    return resolved;
+  };
+
+  // Is every mount chain to this router cut by a prefix that cannot be read?
+  const blocked = (node, seen = new Set()) => {
+    const key = nodeKey(node);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return (incoming.get(key) || []).some(edge => edge.prefix === null || blocked(edge.from, seen));
+  };
+  for (const node of nodes.values()) {
+    const found = effectivePrefixes(node);
+    for (const { prefix, auth, insensitive } of found) add(node.file, node.receiver, prefix, auth, insensitive);
+    if (!found.length && blocked(node)) add(node.file, node.receiver, null, false, false, true);
+  }
+  Object.defineProperty(map, 'importedConstants', { value: importedConstants, enumerable: false });
   return map;
 }
 
-/** Resolve a RELATIVE import specifier to an absolute file path (best effort). */
-function resolveLocalImport(fromFile, spec) {
-  if (!spec.startsWith('.')) return null; // bare/node_modules specifiers aren't our routers
+/**
+ * For each file, the `const` strings it imports from other project files
+ * (named, namespace, `require()` and destructured `require()`), read from the
+ * targets' exports; files that import none are absent.
+ * @implements docguard.js-route-shapes#FR-011
+ */
+function importedConstantsByFile(files, metadata, resolveAlias = null) {
+  const out = new Map();
+  for (const { filePath } of files) {
+    const mi = metadata.get(filePath);
+    if (!mi?.constantBindings?.length) continue;
+    const bindings = mi.constantBindings.map(b => {
+      const target = resolveLocalImport(filePath, b.spec, resolveAlias);
+      return { ...b, exported: target ? metadata.get(target)?.exportedConstants : null };
+    });
+    const map = importedStaticStrings(bindings);
+    if (map.size) out.set(filePath, map);
+  }
+  return out;
+}
+
+/**
+ * Resolve a relative, or tsconfig/jsconfig-aliased, import specifier to an
+ * absolute file path (best effort). Bare package specifiers are not our routers.
+ */
+function resolveLocalImport(fromFile, spec, resolveAlias = null) {
+  if (!spec.startsWith('.')) return resolveAlias ? resolveAlias(fromFile, spec) : null;
   const base = resolve(dirname(fromFile), spec);
   for (const ext of ['', '.ts', '.js', '.mjs', '.cjs', '.tsx', '.jsx']) {
     const cand = base + ext;
@@ -345,302 +838,323 @@ function joinRoutePath(prefix, p) {
 
 // ── Fastify ─────────────────────────────────────────────────────────────────
 
-function scanFastifyRoutes(dir, roots = null) {
+function scanFastifyRoutes(dir, roots = null, unresolved = null) {
   const routes = [];
   const pattern = /(?:fastify|server|app)\s*\.\s*(get|post|put|delete|patch)\s*\(\s*['"`]([^'"`]+)['"`]/gi;
 
   const searchTargets = roots && roots.length ? roots : [resolve(dir, 'src')];
+  const found = []; // { filePath, fileLabel, content }
   for (const fullDir of searchTargets) {
     if (!existsSync(fullDir)) continue;
     walkRouteDirs(fullDir, (filePath) => {
       if (!isJSFile(filePath)) return;
       const content = readFileSafe(filePath);
-      if (!content) return;
-
-      const emit = (method, path, index) => routes.push({
-        method: method.toUpperCase(),
-        path,
-        handler: extractHandlerName(content, index),
-        file: relative(dir, filePath),
-        source: 'fastify',
-        auth: hasAuthCheck(content),
-        description: extractNearbyComment(content, index),
-      });
-
-      // AST-first: method shorthand (fastify.get('/x')) AND the declarative
-      // object form (fastify.route({ method, url })) the regex never matched.
-      // Both return null only on parse failure → regex fallback.
-      const calls = extractJsRouteCalls(content, filePath);
-      const objs = extractJsRouteObjects(content, filePath);
-      if (calls || objs) {
-        for (const r of calls || []) emit(r.method, r.path, r.start);
-        for (const r of objs || []) emit(r.method, r.path, r.start);
-      } else {
-        let match;
-        const regex = new RegExp(pattern.source, 'gi');
-        while ((match = regex.exec(content)) !== null) emit(match[1], match[2], match.index);
-      }
+      if (content) found.push({ filePath, fileLabel: relative(dir, filePath), content });
     });
   }
-
-  return routes;
-}
-
-// ── Hono ────────────────────────────────────────────────────────────────────
-
-function scanHonoRoutes(dir, roots = null) {
-  const routes = [];
-  const pattern = /(?:app|router)\s*\.\s*(get|post|put|delete|patch)\s*\(\s*['"`]([^'"`]+)['"`]/gi;
-
-  const searchTargets = roots && roots.length
-    ? roots
-    : ['src', '.'].map(d => resolve(dir, d));
-  for (const fullDir of searchTargets) {
-    if (!existsSync(fullDir)) continue;
-
-    walkRouteDirs(fullDir, (filePath) => {
-      if (!isJSFile(filePath)) return;
-      const content = readFileSafe(filePath);
-      if (!content) return;
-
-      const emit = (method, path, index) => routes.push({
-        method: method.toUpperCase(),
-        path,
-        handler: '',
-        file: relative(dir, filePath),
-        source: 'hono',
-        auth: hasAuthCheck(content),
-        description: extractNearbyComment(content, index),
-      });
-
-      // AST-first (any receiver, multi-line, template paths — Hono/Koa method
-      // shorthand `app.get('/x')` / `router.get('/x')`); regex fallback.
-      const calls = extractJsRouteCalls(content, filePath);
-      if (calls) {
-        for (const r of calls) emit(r.method, r.path, r.start);
-      } else {
-        let match;
-        const regex = new RegExp(pattern.source, 'gi');
-        while ((match = regex.exec(content)) !== null) emit(match[1], match[2], match.index);
-      }
+  // `const` strings imported from other project files (docguard.js-route-shapes#FR-011).
+  const metadata = new Map();
+  for (const { filePath, content } of found) {
+    const mi = extractJsMountsAndImports(content, filePath);
+    if (mi) metadata.set(filePath, mi);
+  }
+  const importedConstants = importedConstantsByFile(found, metadata, createAliasResolver(dir));
+  for (const { filePath, fileLabel, content } of found) {
+    const emit = (method, path, index, auth, line) => routes.push({
+      method: method.toUpperCase(),
+      path,
+      handler: extractHandlerName(content, index),
+      file: fileLabel,
+      line: line ?? lineAt(content, index),
+      source: 'fastify',
+      auth: Boolean(auth),
+      description: extractNearbyComment(content, index),
     });
-  }
 
-  return routes;
-}
-
-// ── Django ───────────────────────────────────────────────────────────────────
-
-function scanDjangoRoutes(dir) {
-  const routes = [];
-  const urlsFiles = findFiles(dir, /urls\.py$/);
-
-  for (const filePath of urlsFiles) {
-    const content = readFileSafe(filePath);
-    if (!content) continue;
-
-    // Match: path('api/users/', views.user_list, name='user-list')
-    const pathPattern = /path\s*\(\s*['"]([^'"]+)['"]\s*,\s*(\w+[\w.]*)/g;
-    let match;
-    while ((match = pathPattern.exec(content)) !== null) {
-      routes.push({
-        method: 'ALL',
-        path: '/' + match[1],
-        handler: match[2],
-        file: relative(dir, filePath),
-        source: 'django',
-        auth: false,
-        description: '',
-      });
-    }
-  }
-
-  return routes;
-}
-
-// ── FastAPI / Flask ─────────────────────────────────────────────────────────
-
-function scanFastAPIRoutes(dir) {
-  const routes = [];
-  const pattern = /@(?:app|router)\s*\.\s*(get|post|put|delete|patch)\s*\(\s*['"]([^'"]+)['"]/gi;
-
-  const pyFiles = findFiles(dir, /\.py$/);
-  // AST-first: ONE python3 subprocess parses every file. `null` means Python is
-  // unavailable or the subprocess failed → regex fallback for all files. A
-  // per-file `ok:false` falls back for just that file. The AST form also reads
-  // multi-line decorators and Flask `methods=[...]` arrays the regex misses.
-  const astByFile = extractPythonFiles(pyFiles);
-
-  for (const filePath of pyFiles) {
-    const content = readFileSafe(filePath);
-    if (!content) continue;
-
-    const parsed = astByFile && astByFile[filePath];
-    const fileAuth = content.includes('Depends(') && content.includes('auth');
-    if (parsed && parsed.ok) {
-      for (const r of parsed.routes || []) {
-        routes.push({
-          method: r.method,
-          path: r.path,
-          handler: r.func || '',
-          file: relative(dir, filePath),
-          source: 'fastapi',
-          auth: fileAuth,
-          description: r.desc || '',
-        });
+    // AST-first: method shorthand (fastify.get('/x')) AND the declarative
+    // object form (fastify.route({ method, url })) the regex never matched.
+    // Both return null only on parse failure → regex fallback. Auth is the
+    // route's own evidence (docguard.js-ts-extraction#FR-002).
+    const calls = extractJsRouteCalls(content, filePath, importedConstants.get(filePath));
+    const objs = extractJsRouteObjects(content, filePath);
+    if (calls || objs) {
+      for (const r of calls || []) emit(r.method, r.path, r.start, r.auth, r.line);
+      for (const r of objs || []) emit(r.method, r.path, r.start, r.auth, r.line);
+      recordUnresolvedPaths(unresolved, 'Fastify', fileLabel, [...(calls?.unresolved || []), ...(objs?.unresolved || [])]);
+    } else {
+      let match;
+      const regex = new RegExp(pattern.source, 'gi');
+      while ((match = regex.exec(content)) !== null) {
+        if (TEMPLATE_SUBSTITUTION.test(match[2])) recordUnresolvedPaths(unresolved, 'Fastify', fileLabel, [{ line: lineAt(content, match.index), target: match[2] }]);
+        else emit(match[1], match[2], match.index, statementAuth(content, match.index));
       }
-      continue;
-    }
-
-    let match;
-    const regex = new RegExp(pattern.source, 'gi');
-    while ((match = regex.exec(content)) !== null) {
-      routes.push({
-        method: match[1].toUpperCase(),
-        path: match[2],
-        handler: extractPythonFunctionName(content, match.index),
-        file: relative(dir, filePath),
-        source: 'fastapi',
-        auth: fileAuth,
-        description: extractPythonDocstring(content, match.index),
-      });
     }
   }
 
-  return routes;
+  // find-my-way is case-sensitive unless every server sets a literal
+  // `caseSensitive: false` (docguard.coverage-followups#FR-009).
+  const fastifyCase = fastifyCaseMode(found);
+  const marked = routes.map(r => withCase(r, fastifyCase.mode === 'insensitive'));
+  Object.defineProperty(marked, 'caseNotes', { value: fastifyCase.notes, enumerable: false });
+  return marked;
+}
+
+// ── NestJS, Cloudflare Workers, Hono/itty-router (docguard.js-framework-routes) ─
+// The readers are pure functions of file contents (nest-routes.mjs,
+// worker-routes.mjs, router-routes.mjs); here they get their files, and the scan
+// gets each file's tier and every path a reader could not resolve.
+
+const JS_SOURCE_RE = /\.(?:[cm]?[jt]s|[jt]sx)$/;
+
+function readJsSources(ctx, marker = null) {
+  const files = findRouteFiles(ctx.dir, JS_SOURCE_RE, { maxFiles: ctx.maxFiles });
+  if (files.truncated) ctx.scan.truncated = true;
+  const sources = [];
+  for (const abs of files) {
+    if (/\.d\.[cm]?ts$/.test(abs)) continue;
+    const content = readFileSafe(abs);
+    if (!content || (marker && !marker.test(content))) continue;
+    sources.push({ file: relPosix(ctx.dir, abs), abs, content });
+  }
+  return sources;
+}
+
+function recordReader(ctx, found) {
+  for (const t of found.fileTiers || []) ctx.scan.tierItems.push(t);
+  for (const l of found.limitations || []) ctx.scan.unresolved.push(l);
+  return found;
+}
+
+const NEST_MARKER = /@Controller\b|@Module\s*\(|setGlobalPrefix|enableVersioning|useGlobalGuards|APP_GUARD|RouterModule/;
+// Router calls, plus zod-openapi route definitions (`createRoute`) that may
+// sit in a file with no router call (docguard.js-route-shapes#FR-004).
+const ROUTER_MARKER = /\.\s*(?:get|post|put|delete|del|patch|head|options|all|on|route|use|basePath|prefix|openapi|doc|doc31)\s*\(|\bcreateRoute\s*\(/;
+
+function scanNestRoutes(dir, ctx) {
+  const all = readJsSources(ctx);
+  const found = recordReader(ctx, extractNestRoutes(all.filter(s => NEST_MARKER.test(s.content)), { config: ctx.config }));
+  // NestJS matches like its HTTP adapter: the Express app's setting by
+  // default, case-sensitive on Fastify (docguard.coverage-followups#FR-009).
+  const deps = {};
+  for (const { pkg } of collectPackageJsons(dir, ctx.config)) Object.assign(deps, pkg.dependencies || {}, pkg.devDependencies || {});
+  const nestCase = nestCaseMode(all, deps);
+  for (const n of nestCase.notes) ctx.scan.caseNotes.push(n);
+  if (nestCase.mode === 'insensitive') for (const r of found) r.caseInsensitive = true;
+  return found;
+}
+
+function scanHonoRouterRoutes(dir, ctx) {
+  return recordReader(ctx, extractRouterRoutes(readJsSources(ctx, ROUTER_MARKER), createImportResolver(dir), { framework: 'Hono', defaultSource: 'hono', loadSource: readFileSafe }));
+}
+
+function scanKoaRouterRoutes(dir, ctx) {
+  const all = readJsSources(ctx);
+  // A Koa router matches ignoring case unless created with `sensitive: true`
+  // (docguard.coverage-followups#FR-009), read per router across the project.
+  const koaCase = koaCaseModel(all.map(s => ({ filePath: s.abs, fileLabel: s.file, content: s.content })));
+  for (const n of koaCase.notes) ctx.scan.caseNotes.push(n);
+  return recordReader(ctx, extractRouterRoutes(all.filter(s => ROUTER_MARKER.test(s.content)), createImportResolver(dir), {
+    framework: 'Koa', defaultSource: 'koa', loadSource: readFileSafe, caseModeOf: koaCase.modeOf,
+  }));
+}
+
+/**
+ * A Pages project's routes: its Functions (filtered by `_routes.json`), or,
+ * in advanced mode, its `_worker.js` read as a Worker fetch entry, which
+ * replaces Functions; plus the router-library routes served through them
+ * (docguard.js-route-shapes#FR-003, FR-008).
+ */
+function scanPagesRoutes(dir, ctx) {
+  const sources = readJsSources(ctx);
+  const resolveImport = createImportResolver(dir);
+  const outDir = pagesOutputDir(dir);
+  // The output directory is often a build directory the walk skips; its
+  // `_worker.js` (a file or a directory) is what Pages deploys.
+  const known = new Set(sources.map(s => s.abs));
+  if (outDir) {
+    const worker = resolve(dir, outDir, '_worker.js');
+    const files = existsSync(worker) && statSync(worker).isDirectory()
+      ? findRouteFiles(worker, JS_SOURCE_RE, { maxFiles: ctx.maxFiles })
+      : existsSync(worker) ? [worker] : [];
+    for (const abs of files) {
+      const content = known.has(abs) ? null : readFileSafe(abs);
+      if (content) { sources.push({ file: relPosix(dir, abs), abs, content }); known.add(abs); }
+    }
+  }
+  const isWorker = s => isAdvancedWorkerFile(s.file) && !isNonProductPath(s.file, ctx.config);
+  const advanced = sources.some(isWorker);
+  const limitations = [];
+  let found;
+  let tiers;
+  if (advanced) {
+    const worker = extractWorkerRoutes(sources, resolveImport, { isEntry: isWorker, framework: 'Cloudflare Pages', source: 'cloudflare-pages' });
+    // Pages ignores `functions/` in advanced mode; routers there are not served.
+    const routers = extractRouterRoutes(sources.filter(s => ROUTER_MARKER.test(s.content) && !functionsLocation(s.file)), resolveImport, { framework: 'Cloudflare Pages', defaultSource: 'cloudflare-pages', loadSource: readFileSafe });
+    found = [...worker, ...routers];
+    tiers = [...worker.fileTiers, ...routers.fileTiers];
+    limitations.push(...worker.limitations, ...routers.limitations);
+  } else {
+    const functions = extractPagesRoutes(sources);
+    const routers = extractRouterRoutes(sources.filter(s => ROUTER_MARKER.test(s.content)), resolveImport, { framework: 'Cloudflare Pages', defaultSource: 'cloudflare-pages', loadSource: readFileSafe });
+    found = [...functions, ...routers];
+    tiers = [...functions.fileTiers, ...routers.fileTiers];
+    limitations.push(...functions.limitations, ...routers.limitations);
+    // `_routes.json` decides which requests invoke Functions at all.
+    const routesJson = [outDir && join(outDir, '_routes.json'), '_routes.json', 'public/_routes.json', 'static/_routes.json']
+      .filter(Boolean).map(rel => resolve(dir, rel)).find(abs => existsSync(abs));
+    if (routesJson) {
+      const rules = parseRoutesJson(readFileSafe(routesJson) || '');
+      if (rules) found = found.filter(r => servedByRoutesJson(r.path, rules));
+      else limitations.push({ framework: 'Cloudflare Pages', code: 'pages-unresolved-routes-json', file: relPosix(dir, routesJson), line: 1, target: '_routes.json' });
+    }
+  }
+  const byFile = new Map();
+  for (const t of tiers) byFile.set(t.file, t);
+  recordReader(ctx, { fileTiers: [...byFile.values()], limitations });
+  return found;
+}
+
+function scanWorkerRoutes(dir, ctx) {
+  const sources = readJsSources(ctx);
+  const resolveImport = createImportResolver(dir);
+  const dispatch = extractWorkerRoutes(sources, resolveImport);
+  const routers = extractRouterRoutes(sources.filter(s => ROUTER_MARKER.test(s.content)), resolveImport, { framework: 'Cloudflare Workers', defaultSource: 'cloudflare-workers', loadSource: readFileSafe });
+  // One tier record per file, whichever reader read it.
+  const tiers = new Map();
+  for (const t of [...dispatch.fileTiers, ...routers.fileTiers]) tiers.set(t.file, t);
+  recordReader(ctx, { fileTiers: [...tiers.values()], limitations: [...dispatch.limitations, ...routers.limitations] });
+  return [...dispatch, ...routers];
 }
 
 // ── Spring Boot (Java/Kotlin) ────────────────────────────────────────────────
+// What a Java/Kotlin file routes is read by spring-routes.mjs: class-level
+// @RequestMapping bases in every form, method-level mappings and
+// @RequestMapping(method = …), constants, Feign clients skipped
+// (docguard.go-spring-rails-routes#FR-003/004). Constants may live in files
+// without a mapping, so every file is handed over.
 
-function scanSpringBootRoutes(dir) {
-  const routes = [];
-  // Method-level verb annotations (NOT @RequestMapping — that's class-level base).
-  // Optional path; bare `@PostMapping` means "base path only".
-  const verbMap = /@(Get|Post|Put|Delete|Patch)Mapping(?:\s*\(\s*(?:value\s*=\s*)?["']([^"']*)["'])?/g;
-  const classBase = /@RequestMapping\s*\(\s*(?:value\s*=\s*)?["']([^"']+)["'][^)]*\)\s*[\r\n][\s\S]*?(?:public\s+)?class\s+\w+/;
-
-  const javaFiles = findFiles(dir, /\.(java|kt)$/);
-  for (const filePath of javaFiles) {
-    const content = readFileSafe(filePath);
-    if (!content || !content.includes('Mapping')) continue;
-
-    // Class-level base path, if any.
-    const cb = classBase.exec(content);
-    const basePath = cb ? cb[1] : '';
-    const authPresent = /@PreAuthorize|@Secured|SecurityContext/.test(content);
-
-    let match;
-    const re = new RegExp(verbMap.source, 'g');
-    while ((match = re.exec(content)) !== null) {
-      const method = match[1].toUpperCase();
-      const sub = match[2] || '';
-      const path = (basePath + sub).replace(/\/+/g, '/') || '/';
-      routes.push({
-        method, path,
-        handler: '', file: relative(dir, filePath), source: 'spring-boot',
-        auth: authPresent, description: '',
-      });
-    }
-  }
-  return routes;
+function scanSpringBootRoutes(dir, ctx) {
+  // docguard.fallback-language-coverage: files are listed (and counted for
+  // coverage) by readPatternFiles; each route carries its pattern tier.
+  const files = readPatternFiles(ctx, /\.(java|kt)$/);
+  const sources = files.map(f => ({ file: relative(dir, f), content: readFileSafe(f) }));
+  return extractSpringRoutes(sources).map(r => ({ ...r, source: 'spring-boot', description: '', ...tierFor(resolve(dir, r.file), null) }));
 }
 
 // ── Rails (Ruby) — config/routes.rb ──────────────────────────────────────────
+// rails-routes.mjs reads namespace/scope prefixes, resources/resource with
+// only/except, nesting, member/collection, verbs, match, root, concerns and
+// `draw` files (docguard.go-spring-rails-routes#FR-005).
 
-function scanRailsRoutes(dir) {
-  const routes = [];
+function scanRailsRoutes(dir, ctx) {
   const routesFile = resolve(dir, 'config/routes.rb');
-  if (!existsSync(routesFile)) return routes;
-  const content = readFileSafe(routesFile);
-  if (!content) return routes;
+  if (!existsSync(routesFile)) return [];
+  recordPatternFiles(ctx, [routesFile]);
+  const { tier, tierReason } = tierFor(routesFile, null);
+  // `draw :admin` loads config/routes/admin.rb; a name is never a path.
+  const readDraw = name => {
+    if (!/^[\w-]+$/.test(name)) return null;
+    const drawFile = resolve(dir, 'config/routes', `${name}.rb`);
+    if (existsSync(drawFile)) recordPatternFiles(ctx, [drawFile]);
+    return readFileSafe(drawFile);
+  };
+  return extractRailsRoutes(readFileSafe(routesFile), { file: 'config/routes.rb', readDraw })
+    .map(r => ({ ...r, source: 'rails', description: '', tier, tierReason }));
+}
 
-  // Verb DSL: get '/x', post '/x', etc.  AND  resources :things (RESTful 7 actions)
-  const verbDsl = /^\s*(get|post|put|patch|delete)\s+['"]([^'"]+)['"]/gm;
-  let m;
-  while ((m = verbDsl.exec(content)) !== null) {
-    routes.push({
-      method: m[1].toUpperCase(),
-      path: m[2].startsWith('/') ? m[2] : '/' + m[2],
-      handler: '', file: 'config/routes.rb', source: 'rails', auth: false, description: '',
-    });
-  }
-  // resources :users → 7 standard RESTful routes.
-  const resourcesRe = /^\s*resources\s+:([a-z_]+)/gm;
-  while ((m = resourcesRe.exec(content)) !== null) {
-    const r = m[1];
-    const base = `/${r}`;
-    const seven = [
-      ['GET', base], ['GET', `${base}/new`], ['POST', base],
-      ['GET', `${base}/:id`], ['GET', `${base}/:id/edit`],
-      ['PATCH', `${base}/:id`], ['DELETE', `${base}/:id`],
-    ];
-    for (const [method, path] of seven) {
-      routes.push({ method, path, handler: '', file: 'config/routes.rb', source: 'rails', auth: false, description: '' });
-    }
-  }
+// ── Sinatra (Ruby) ───────────────────────────────────────────────────────────
+// sinatra-routes.mjs reads classic and modular apps, namespaces, extensions
+// and config.ru mounts across files (docguard.more-route-frameworks#FR-001).
+
+function scanSinatraRoutes(dir, ctx) {
+  const files = readPatternFiles(ctx, /(?:\.rb|^config\.ru)$/);
+  const sources = files.map(f => ({ file: relative(dir, f), content: readFileSafe(f) }));
+  const found = extractSinatraRoutes(sources);
+  const routes = found.map(r => ({ ...r, source: 'sinatra', description: '', ...tierFor(resolve(dir, r.file), null) }));
+  Object.defineProperty(routes, 'omitted', { value: found.omitted, enumerable: false });
   return routes;
 }
 
-// ── Go web frameworks (Gin / Echo / Chi / Fiber / std mux) ───────────────────
+// ── Go web frameworks (Gin / Echo / Chi / Fiber / gorilla/mux / net/http) ────
+// go-routes.mjs composes group, sub-router and mount prefixes across blocks,
+// functions and files, and reads every registration form of those routers
+// (docguard.go-spring-rails-routes#FR-001/002).
 
-function scanGoWebRoutes(dir) {
-  const routes = [];
-  // Generic: <recv>.<METHOD>("/path", handler)  for Gin/Echo/Chi/Fiber/mux.Router
-  const pattern = /\.(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|HandleFunc|Handle)\s*\(\s*["']([^"']+)["']/g;
-  const goFiles = findFiles(dir, /\.go$/);
-  for (const filePath of goFiles) {
-    const content = readFileSafe(filePath);
-    if (!content) continue;
-    let m;
-    const re = new RegExp(pattern.source, 'g');
-    while ((m = re.exec(content)) !== null) {
-      const verb = m[1];
-      // HandleFunc / Handle are method-agnostic.
-      const method = ['HandleFunc', 'Handle'].includes(verb) ? 'ANY' : verb;
-      const path = m[2];
-      if (!path.startsWith('/')) continue;
-      routes.push({
-        method, path,
-        handler: '', file: relative(dir, filePath), source: 'go-web',
-        auth: /Authorization|jwt\.|middleware\.Auth/.test(content),
-        description: '',
-      });
-    }
-  }
-  return routes;
+function scanGoWebRoutes(dir, ctx) {
+  const files = readPatternFiles(ctx, /\.go$/);
+  const sources = files.map(f => ({ file: relative(dir, f), content: readFileSafe(f) }));
+  return extractGoRoutes(sources).map(r => ({ ...r, source: 'go-web', description: '', ...tierFor(resolve(dir, r.file), null) }));
 }
 
-// ── Rust web frameworks (Axum / Actix / Rocket / Warp) ───────────────────────
+// ── Rust web frameworks (Axum / Actix / Rocket / Warp / Tide) ────────────────
+// Warp filter chains, Tide `at()` trees (docguard.more-route-frameworks#FR-003/004)
+// and Actix, Axum and Rocket builders (docguard.real-project-route-gaps#FR-001/002)
+// are composed across functions and files by rust-routes.mjs.
 
-function scanRustWebRoutes(dir) {
+function scanRustWebRoutes(dir, ctx) {
   const routes = [];
-  const rsFiles = findFiles(dir, /\.rs$/);
+  const rsFiles = readPatternFiles(ctx, /\.rs$/);
+  const sources = [];
   for (const filePath of rsFiles) {
     const content = readFileSafe(filePath);
-    if (!content) continue;
-
-    // Axum: .route("/x", get(handler)) / .route("/x", post(handler).get(handler))
-    const axum = /\.route\s*\(\s*"([^"]+)"\s*,\s*([a-z]+)\s*\(/g;
-    let m;
-    while ((m = axum.exec(content)) !== null) {
-      const method = m[2].toUpperCase();
-      if (!['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].includes(method)) continue;
-      routes.push({ method, path: m[1], handler: '', file: relative(dir, filePath), source: 'axum', auth: false, description: '' });
-    }
-
-    // Actix-web: .route("/x", web::get().to(handler))
-    const actix = /\.route\s*\(\s*"([^"]+)"\s*,\s*web::(get|post|put|delete|patch)\(\)/g;
-    while ((m = actix.exec(content)) !== null) {
-      routes.push({ method: m[2].toUpperCase(), path: m[1], handler: '', file: relative(dir, filePath), source: 'actix', auth: false, description: '' });
-    }
-
-    // Rocket: #[get("/x")] etc.
-    const rocket = /#\[(get|post|put|delete|patch)\(\s*"([^"]+)"/g;
-    while ((m = rocket.exec(content)) !== null) {
-      routes.push({ method: m[1].toUpperCase(), path: m[2], handler: '', file: relative(dir, filePath), source: 'rocket', auth: false, description: '' });
-    }
+    if (content) sources.push({ file: relPosix(dir, filePath), content });
   }
+  // Actix, Axum and Rocket builders (docguard.real-project-route-gaps#FR-001,
+  // FR-002): what the reader recognised but could not place joins
+  // `scan.unresolved` (FR-005).
+  const builder = extractRustBuilderRoutes(sources);
+  for (const r of builder) routes.push({ ...r, description: '', ...tierFor(resolve(dir, r.file), null) });
+  for (const u of builder.unresolved) ctx.scan.unresolved.push(u);
+  const omitted = [];
+  for (const [source, extract] of [['warp', extractWarpRoutes], ['tide', extractTideRoutes]]) {
+    const found = extract(sources);
+    omitted.push(...found.omitted);
+    for (const r of found) routes.push({ ...r, source, description: '', ...tierFor(resolve(dir, r.file), null) });
+  }
+  Object.defineProperty(routes, 'omitted', { value: omitted, enumerable: false });
   return routes;
+}
+
+// ── Laravel, Symfony (PHP) and ASP.NET Core (C#) ────────────────────────────
+// php-routes.mjs and dotnet-routes.mjs read the routes; these wrappers list the
+// files, record the tier of each file read and attach the omitted routes
+// (docguard.php-dotnet-routes#FR-001/003/004/005/007).
+
+function withOmitted(routes, omitted) {
+  Object.defineProperty(routes, 'omitted', { value: omitted || [], enumerable: false });
+  return routes;
+}
+
+function scanLaravelRoutes(dir, ctx) {
+  const files = findRouteFiles(dir, /\.php$/, { maxFiles: ctx.maxFiles });
+  if (files.truncated) ctx.scan.truncated = true;
+  const found = extractLaravelRoutes(files.map(f => relPosix(dir, f)), rel => readFileSafe(resolve(dir, rel)));
+  recordPatternFiles(ctx, found.read.map(rel => resolve(dir, rel)));
+  for (const u of found.unresolved) ctx.scan.unresolved.push({ framework: 'Laravel', ...u });
+  return withOmitted(found.map(r => ({ ...r, source: 'laravel', description: '', ...tierFor(resolve(dir, r.file), null) })), found.omitted);
+}
+
+function scanSymfonyRoutes(dir, ctx) {
+  const files = readPatternFiles(ctx, /\.(php|ya?ml)$/);
+  const rels = files.map(f => relPosix(dir, f));
+  const known = new Set(rels);
+  const read = rel => (known.has(rel) ? readFileSafe(resolve(dir, rel)) : null);
+  const php = rels.filter(r => r.endsWith('.php')).map(file => ({ file, content: read(file) }));
+  const yaml = rels.filter(r => /(^|\/)config\/routes(\.ya?ml|\/[^/]+\.ya?ml)$/.test(r)).map(file => ({ file, content: read(file) }));
+  const found = extractSymfonyRoutes(php, { yaml, readFile: read });
+  // A route declaration that yields no route (docguard.real-project-route-gaps#FR-005).
+  for (const u of found.unresolved) ctx.scan.unresolved.push({ framework: 'Symfony', ...u });
+  return withOmitted(found.map(r => ({ ...r, source: 'symfony', description: '', ...tierFor(resolve(dir, r.file), null) })), found.omitted);
+}
+
+function scanAspNetRoutes(dir, ctx) {
+  const files = readPatternFiles(ctx, /\.cs$/);
+  const sources = files.map(f => ({ file: relPosix(dir, f), content: readFileSafe(f) }));
+  const found = extractAspNetRoutes(sources);
+  // ASP.NET Core matches routes case-insensitively, and `[controller]` keeps
+  // the class's case (`/api/Users`), so a comparison must ignore case for these
+  // routes only (docguard.coverage-followups#FR-003).
+  return withOmitted(found.map(r => ({ ...r, source: 'aspnet-core', description: '', caseInsensitive: true, ...tierFor(resolve(dir, r.file), null) })), found.omitted);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -658,7 +1172,7 @@ function walkRouteDirs(dir, callback) {
   try {
     const entries = readdirSync(dir, { withFileTypes: true });
     for (const entry of entries) {
-      if (IGNORE_DIRS.has(entry.name) || entry.name.startsWith('.')) continue;
+      if (isIgnoredDirEntry(entry.name, entries) || entry.name.startsWith('.')) continue;
       const fullPath = join(dir, entry.name);
       if (entry.isDirectory()) {
         walkRouteDirs(fullPath, callback);
@@ -669,22 +1183,60 @@ function walkRouteDirs(dir, callback) {
   } catch { /* skip */ }
 }
 
-function findFiles(dir, pattern, maxDepth = 5) {
+/** Files one route scan may read; reaching it is disclosed, never silent. */
+export const ROUTE_SCAN_MAX_FILES = 20000;
+/** Directory depth bound for route discovery; far below any real limit, far above Maven's. */
+export const ROUTE_SCAN_MAX_DEPTH = 32;
+
+/**
+ * Files under `dir` whose name matches `pattern`, for route scanning.
+ *
+ * This walk stopped at depth 5, and a Spring controller in a standard Maven
+ * layout (`src/main/java/com/acme/shop/web/X.java`) sits at depth 7 or more, so
+ * a Spring service had zero routes and its API surface read as empty. The
+ * bounds now are the ignore rules (node_modules, vendor, target, build, …), a
+ * depth of 32 and a file cap. `withFileTypes` never follows a symlinked
+ * directory, so the walk cannot loop. The returned array carries `truncated`
+ * when the cap stopped it, so the caller can report partial coverage.
+ *
+ * @implements docguard.fallback-language-coverage#FR-008
+ * @returns {string[] & { truncated: boolean }}
+ */
+export function findRouteFiles(dir, pattern, { maxFiles = ROUTE_SCAN_MAX_FILES, maxDepth = ROUTE_SCAN_MAX_DEPTH } = {}) {
   const results = [];
+  let truncated = false;
   function walk(d, depth) {
-    if (depth > maxDepth || !existsSync(d)) return;
-    try {
-      const entries = readdirSync(d, { withFileTypes: true });
-      for (const entry of entries) {
-        if (IGNORE_DIRS.has(entry.name) || entry.name.startsWith('.')) continue;
-        const fullPath = join(d, entry.name);
-        if (entry.isDirectory()) walk(fullPath, depth + 1);
-        else if (pattern.test(entry.name)) results.push(fullPath);
+    if (truncated || depth > maxDepth || !existsSync(d)) return;
+    let entries;
+    try { entries = readdirSync(d, { withFileTypes: true }); } catch { return; }
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const entry of entries) {
+      // Build output, including a .NET `bin/` (docguard.coverage-followups#FR-002).
+      if (isIgnoredDirEntry(entry.name, entries) || entry.name.startsWith('.')) continue;
+      const fullPath = join(d, entry.name);
+      if (entry.isDirectory()) walk(fullPath, depth + 1);
+      else if (entry.isFile() && pattern.test(entry.name)) {
+        if (results.length >= maxFiles) { truncated = true; return; }
+        results.push(fullPath);
       }
-    } catch { /* skip */ }
+      if (truncated) return;
+    }
   }
   walk(dir, 0);
+  Object.defineProperty(results, 'truncated', { value: truncated, enumerable: false });
   return results;
+}
+
+/** Read a pattern-only language's files and record each one's tier with the scan. */
+function readPatternFiles(ctx, pattern) {
+  const files = findRouteFiles(ctx.dir, pattern, { maxFiles: ctx.maxFiles });
+  if (files.truncated) ctx.scan.truncated = true;
+  recordPatternFiles(ctx, files);
+  return files;
+}
+
+function recordPatternFiles(ctx, files) {
+  for (const f of files) ctx.scan.tierItems.push({ ...tierFor(f, null), file: relative(ctx.dir, f) });
 }
 
 function hasAuthCheck(content) {
@@ -698,15 +1250,6 @@ function hasAuthCheck(content) {
   return authPatterns.some(p => p.test(content));
 }
 
-function hasAuthMiddleware(content, routePath) {
-  // Check if route has auth middleware before handler
-  const pattern = new RegExp(
-    `['"\`]${routePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"\`]\\s*,\\s*(auth|protect|requireAuth|isAuthenticated|authenticate)`,
-    'i'
-  );
-  return pattern.test(content) || hasAuthCheck(content);
-}
-
 function detectMethodsFromHandler(content) {
   const methods = new Set();
   if (/req\.method\s*===?\s*['"]GET['"]/i.test(content) || /case\s+['"]GET['"]/i.test(content)) methods.add('GET');
@@ -718,11 +1261,47 @@ function detectMethodsFromHandler(content) {
   return [...methods];
 }
 
-function extractHandlerName(content, matchIndex) {
-  // Look for function name after the route path
-  const after = content.substring(matchIndex, matchIndex + 200);
-  const fnMatch = after.match(/,\s*(?:async\s+)?(\w+)/);
-  return fnMatch ? fnMatch[1] : '';
+/**
+ * The handler a route registration names: the last plain argument after the
+ * path (`router.get('/', auth, listUsers)` → `listUsers`), a named function
+ * expression's name, or `inline` for an anonymous function/arrow. The old
+ * pattern took the first word after the first comma, so `(req, res) => …`
+ * yielded `res` and `async (req, res) => …` yielded `async`
+ * (docguard.generated-docs-consistency#FR-007).
+ */
+export function extractHandlerName(content, matchIndex) {
+  const after = content.substring(matchIndex, matchIndex + 400);
+  const path = after.match(/^[^'"`]*(['"`])(?:\\.|(?!\1)[^\\])*\1/);
+  if (!path) return '';
+  let rest = after.slice(path[0].length);
+  let last = '';
+  for (;;) {
+    const comma = rest.match(/^\s*,\s*/);
+    if (!comma) break;
+    rest = rest.slice(comma[0].length);
+    const named = rest.match(/^(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(/);
+    if (named) return named[1];
+    if (/^(?:async\s*)?(?:\(|function\b|func\s*\(|[A-Za-z_$][\w$]*\s*=>)/.test(rest)) return 'inline';
+    const ident = rest.match(/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*/);
+    if (!ident) break;
+    last = ident[0];
+    rest = rest.slice(ident[0].length);
+    const call = rest.match(/^\s*\(/);
+    if (call) {
+      // A call (a middleware factory such as `rateLimit({})`) is not the
+      // handler: skip its balanced argument list and keep reading.
+      let depth = 0;
+      let i = call[0].length - 1;
+      for (; i < rest.length; i++) {
+        if (rest[i] === '(') depth++;
+        else if (rest[i] === ')' && --depth === 0) break;
+      }
+      if (depth !== 0) return '';
+      rest = rest.slice(i + 1);
+      last = '';
+    }
+  }
+  return last;
 }
 
 function extractJSDocDescription(content, methodName) {
@@ -745,16 +1324,4 @@ function extractNearbyComment(content, index) {
     if (line.startsWith('*') && !line.startsWith('*/')) return line.replace(/^\*\s*/, '');
   }
   return '';
-}
-
-function extractPythonFunctionName(content, index) {
-  const after = content.substring(index, index + 300);
-  const match = after.match(/def\s+(\w+)/);
-  return match ? match[1] : '';
-}
-
-function extractPythonDocstring(content, index) {
-  const after = content.substring(index, index + 500);
-  const match = after.match(/"""([^"]+)"""/);
-  return match ? match[1].trim().split('\n')[0] : '';
 }

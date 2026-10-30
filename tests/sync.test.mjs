@@ -1,10 +1,11 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { runSync } from '../cli/commands/sync.mjs';
+import { discoverTestPairs, runSyncTests } from '../cli/commands/sync-tests.mjs';
 
 // Silence command console output during tests.
 function quiet(fn) {
@@ -116,5 +117,100 @@ describe('docguard sync', () => {
     assert.ok(j.updates.some(u => u.section === 'endpoints'));
     assert.ok(j.reviews.some(r => r.section === 'overview'));
     assert.equal(j.applied, false);
+  });
+
+  /**
+   * @req docguard.language-repository-coverage#FR-009
+   * @req docguard.language-repository-coverage#SC-003
+   */
+  it('updates only an owned section in a mapped human document and creates a backup', () => {
+    const mapped = 'handbook/http.md';
+    write(mapped, read('docs-canonical/API-REFERENCE.md')
+      .replace('<!-- docguard:generated true -->\n\n', '')
+      .replace('Hand-written overview — must survive.', 'Enterprise prose before and after must survive.'));
+    rmSync(join(dir, 'docs-canonical/API-REFERENCE.md'));
+    const before = read(mapped);
+    quiet(() => runSync(dir, { ...config, docs: { roles: { apiReference: mapped } } }, { write: true }));
+    const after = read(mapped);
+    assert.ok(after.includes('/api/orders'));
+    assert.ok(after.includes('Enterprise prose before and after must survive.'));
+    assert.equal(after.slice(0, after.indexOf('<!-- docguard:section id=endpoints')), before.slice(0, before.indexOf('<!-- docguard:section id=endpoints')));
+    assert.equal(after.slice(after.indexOf('<!-- /docguard:section -->') + 26), before.slice(before.indexOf('<!-- /docguard:section -->') + 26));
+    assert.equal(existsSync(join(dir, mapped + '.bak')), true);
+  });
+
+  it('rejects malformed or human-source mapped ownership even with force', () => {
+    const mapped = 'handbook/http.md';
+    const base = read('docs-canonical/API-REFERENCE.md').replace('<!-- docguard:generated true -->\n\n', '');
+    rmSync(join(dir, 'docs-canonical/API-REFERENCE.md'));
+    const mappedConfig = { ...config, docs: { roles: { apiReference: mapped } } };
+    for (const content of [
+      base.replace('<!-- /docguard:section -->', '<!-- docguard:section id=broken source=code -->'),
+      base.replace('id=endpoints source=code', 'id=endpoints source=human'),
+    ]) {
+      write(mapped, content);
+      const before = read(mapped);
+      assert.throws(() => quiet(() => runSync(dir, mappedConfig, { write: true, force: true })), /malformed|source=human/);
+      assert.equal(read(mapped), before);
+      assert.equal(existsSync(join(dir, mapped + '.bak')), false, 'failed sync creates no backup side effect');
+    }
+  });
+});
+
+describe('sync-tests cli commands', () => {
+  // runSyncTests is the `sync --tests` command around reconcileTestMap: a dry
+  // run reports and writes nothing; --write applies the same reconciliation.
+  it('runSyncTests reports a ghost-source row on a dry run and removes it only with --write', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'docguard-sync-tests-'));
+    const doc = join(tmp, 'docs-canonical', 'TEST-SPEC.md');
+    const capture = flags => {
+      const out = [];
+      const log = console.log;
+      console.log = (...args) => { out.push(args.join(' ')); };
+      try { runSyncTests(tmp, { projectName: 'svc' }, flags); } finally { console.log = log; }
+      return out.join('\n');
+    };
+    try {
+      mkdirSync(join(tmp, 'docs-canonical'), { recursive: true });
+      mkdirSync(join(tmp, 'src'), { recursive: true });
+      writeFileSync(join(tmp, 'src', 'keep.ts'), 'export const k = 1;\n');
+      writeFileSync(join(tmp, 'src', 'keep.test.ts'), 'test();\n');
+      const before = [
+        '# Test Specification', '', '## Source-to-Test Map', '',
+        '| Source File | Unit Test | Status |', '|---|---|---|',
+        '| `src/keep.ts` | `src/keep.test.ts` | ✅ |',
+        '| `src/gone.ts` | `src/gone.test.ts` | ✅ |',
+        '',
+      ].join('\n');
+      writeFileSync(doc, before);
+
+      const dry = JSON.parse(capture({ format: 'json' }));
+      assert.equal(dry.applicable, true);
+      assert.equal(dry.applied, false);
+      assert.deepEqual(dry.removed.map(r => r.source), ['src/gone.ts']);
+      assert.equal(readFileSync(doc, 'utf-8'), before, 'a dry run writes nothing');
+
+      const applied = JSON.parse(capture({ format: 'json', write: true }));
+      assert.equal(applied.applied, true);
+      const after = readFileSync(doc, 'utf-8');
+      assert.doesNotMatch(after, /src\/gone\.ts/);
+      assert.match(after, /src\/keep\.ts/, 'rows whose source exists are kept');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('discoverTestPairs should find basic pairs', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'docguard-test-'));
+    try {
+      writeFileSync(join(tmp, 'index.js'), 'export const a = 1;');
+      writeFileSync(join(tmp, 'index.test.js'), 'import { a } from "./index.js";');
+      const pairs = discoverTestPairs(tmp, {});
+      assert.equal(pairs.length, 1);
+      assert.equal(pairs[0].source, 'index.js');
+      assert.equal(pairs[0].test, 'index.test.js');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });

@@ -22,7 +22,10 @@ import { resolve, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { c, CURRENT_SCHEMA_VERSION } from '../shared.mjs';
+import { autoDetectProjectType } from '../config.mjs';
 import { ensureSkills, detectAgentMode, isSpecKitInitialized, getDetectedAgent } from '../ensure-skills.mjs';
+import { readAgentSurface, agentCommand, commandHint } from '../agent-surface.mjs';
+import { resolveHooksTarget } from '../shared-git.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -51,23 +54,7 @@ async function askYesNo(prompt, defaultYes = true) {
 
 // ── Project Type Detection ──────────────────────────────────────────────
 
-function detectProjectType(dir) {
-  const pkgPath = resolve(dir, 'package.json');
-  if (existsSync(pkgPath)) {
-    try {
-      const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-      const allDeps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-      if (pkg.bin) return 'cli';
-      if (allDeps.next || allDeps.react || allDeps.vue || allDeps['@angular/core'] ||
-          allDeps.svelte || allDeps.nuxt) return 'webapp';
-      if (allDeps.express || allDeps.fastify || allDeps.hono || allDeps.koa) return 'api';
-      if (pkg.main || pkg.exports || pkg.module) return 'library';
-    } catch { /* fall through */ }
-  }
-  if (existsSync(resolve(dir, 'manage.py'))) return 'webapp';
-  if (existsSync(resolve(dir, 'setup.py')) || existsSync(resolve(dir, 'pyproject.toml'))) return 'library';
-  return 'unknown';
-}
+// Project-type detection lives in config.mjs; this file used to carry a stale copy.
 
 function detectAgentDirs(projectDir) {
   const agentDirs = [
@@ -95,7 +82,7 @@ export async function runSetup(projectDir, config, flags) {
 
   console.log(`  ${c.bold}Step 1/7: Project Detection${c.reset}`);
 
-  const detectedType = detectProjectType(projectDir);
+  const detectedType = autoDetectProjectType(projectDir);
   console.log(`  ${c.green}✅${c.reset} Project type: ${c.cyan}${detectedType}${c.reset}`);
 
   const configPath = resolve(projectDir, '.docguard.json');
@@ -403,11 +390,16 @@ export async function runSetup(projectDir, config, flags) {
 
   console.log(`  ${c.bold}Step 7/7: Git Hooks${c.reset}`);
 
-  const gitDir = resolve(projectDir, '.git');
-  if (!existsSync(gitDir)) {
+  // The folder Git actually runs hooks from (linked worktrees, core.hooksPath),
+  // and never a folder shared with other repositories.
+  // @implements docguard.hooks-repo-scope#FR-004 {scope=statement}
+  const hooksTarget = resolveHooksTarget(projectDir);
+  if (!hooksTarget.dir) {
     console.log(`  ${c.dim}──${c.reset}  No .git directory ${c.dim}(not a git repo)${c.reset}`);
+  } else if (!hooksTarget.owned) {
+    console.log(`  ${c.yellow}⚠${c.reset}   pre-commit hook ${c.dim}(core.hooksPath is a shared folder: ${hooksTarget.dir} — DocGuard will not install there; run ${c.cyan}docguard hooks${c.dim} for the options)${c.reset}`);
   } else {
-    const preCommitHook = resolve(gitDir, 'hooks', 'pre-commit');
+    const preCommitHook = resolve(hooksTarget.dir, 'pre-commit');
     let hasDocguardHook = false;
 
     if (existsSync(preCommitHook)) {
@@ -424,7 +416,7 @@ export async function runSetup(projectDir, config, flags) {
         const install = await askYesNo(`     → Install docguard guard as pre-commit hook?`, false);
         if (install) {
           try {
-            const hooksDir = resolve(gitDir, 'hooks');
+            const hooksDir = hooksTarget.dir;
             if (!existsSync(hooksDir)) mkdirSync(hooksDir, { recursive: true });
 
             const hookContent = existsSync(preCommitHook)
@@ -457,12 +449,15 @@ export async function runSetup(projectDir, config, flags) {
   const agentMode = detectAgentMode(projectDir);
   console.log(`\n  ${c.bold}Next steps:${c.reset} ${c.dim}(${agentMode === 'llm' ? 'LLM mode' : 'CLI mode'})${c.reset}`);
   if (agentMode === 'llm') {
-    if (!isSpecKitInitialized(projectDir)) {
-      console.log(`  ${c.dim}Bootstrap:${c.reset}      ${c.cyan}/speckit.constitution${c.reset}`);
+    // Only commands whose files exist for this agent (docguard.spec-kit-integration-honesty#FR-006).
+    const surface = readAgentSurface(projectDir);
+    const constitution = agentCommand(projectDir, surface, 'constitution', '', { speckit: true });
+    if (constitution) {
+      console.log(`  ${c.dim}Bootstrap:${c.reset}      ${c.cyan}${constitution}${c.reset}`);
     }
-    console.log(`  ${c.dim}Fill docs:${c.reset}      ${c.cyan}/docguard.guard${c.reset}`);
-    console.log(`  ${c.dim}Fix issues:${c.reset}     ${c.cyan}/docguard.fix${c.reset}`);
-    console.log(`  ${c.dim}Review:${c.reset}         ${c.cyan}/docguard.review${c.reset}`);
+    console.log(`  ${c.dim}Fill docs:${c.reset}      ${c.cyan}${commandHint(projectDir, surface, 'guard')}${c.reset}`);
+    console.log(`  ${c.dim}Fix issues:${c.reset}     ${c.cyan}${commandHint(projectDir, surface, 'fix')}${c.reset}`);
+    console.log(`  ${c.dim}Review:${c.reset}         ${c.cyan}${commandHint(projectDir, surface, 'review')}${c.reset}`);
   } else {
     console.log(`  ${c.dim}Fill docs:${c.reset}      ${c.cyan}docguard diagnose${c.reset}`);
     console.log(`  ${c.dim}Validate:${c.reset}       ${c.cyan}docguard guard${c.reset}`);

@@ -1,3 +1,4 @@
+import { docRolePath, resolveDocRole } from '../shared-doc-roles.mjs';
 /**
  * API-Surface Validator — Detects drift between the documented API surface
  * (docs-canonical/API-REFERENCE.md) and the project's actual API surface.
@@ -9,91 +10,53 @@
  *   1. OpenAPI spec (sourceRoot/workspace-aware)  → high confidence
  *   2. Monorepo-aware code route scan             → lower confidence (warn only)
  *
- * Severity policy:
- *   - documented-but-absent  → ERROR when confirmed by an OpenAPI spec
- *                              (docs lie about a real endpoint → fail the build);
- *                              downgraded to WARNING on heuristic code-scan only.
- *   - present-but-undocumented → WARNING (a real route missing from the docs).
+ * OpenAPI remains the contract authority, not proof of runtime absence.
+ * Contract omissions are errors with independent code evidence. Removal needs
+ * both a contract omission and a nonempty code scan without the endpoint;
+ * code-present and unknown-coverage omissions stay review-only.
  *
  * Also flags MULTIPLE OpenAPI specs in the repo that disagree on their endpoint
  * set (e.g. a served spec and a generated spec that have diverged).
  *
  * Returns { errors, warnings, passed, total, fixes, authoritativeSpec } — the
- * `fixes` array lists deterministic remove-endpoint actions that
- * `docguard fix --write` can apply without an LLM.
+ * `fixes` array contains only omissions corroborated by a nonempty code scan.
+ *
+ * OpenAPI discovery lives in cli/shared-openapi.mjs so no validator imports
+ * another (Constitution IV).
+ * @implements docguard.spec-kit-artifact-coverage#FR-007 {scope=file}
+ * @implements docguard.fallback-language-coverage#FR-001 {scope=file}
+ * @implements docguard.fallback-language-coverage#FR-007 {scope=file}
+ * @implements docguard.fallback-language-coverage#FR-009 {scope=file}
+ * @implements docguard.coverage-followups#FR-003 {scope=file}
+ * @implements docguard.coverage-followups#FR-004 {scope=file}
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { resolve, dirname, join } from 'node:path';
+import { resolve } from 'node:path';
 import { detectOpenAPI } from '../scanners/doc-tools.mjs';
 import { scanRoutesDeep } from '../scanners/routes.mjs';
+import { detectEcosystems } from '../scanners/project-type.mjs';
+import { summarizeTiers, tierApplicability } from '../shared-source.mjs';
 import { parseApiReferenceDoc, compareEndpoints, endpointKey } from '../scanners/api-doc.mjs';
-import { collectPackageJsons, getWorkspaceDirs } from '../shared-source.mjs';
+import { collectPackageJsons } from '../shared-source.mjs';
 import { relPosix } from '../shared-ignore.mjs';
+// Shared with docs-sync: a validator never imports another validator
+// (Constitution IV), so OpenAPI discovery lives in a shared module.
+import { findAllOpenApiSpecs, orderedSpecDirs } from '../shared-openapi.mjs';
 import { mkFinding, resultFromFindings } from '../findings.mjs';
 
 const MAX_REPORTED = 15;
-const API_DOC = 'docs-canonical/API-REFERENCE.md';
-
-/** Walk up from a dir to the nearest enclosing package.json directory. */
-function nearestPackageDir(projectDir, startDir) {
-  let cur = startDir;
-  const root = resolve(projectDir);
-  while (cur && cur.startsWith(root)) {
-    if (existsSync(join(cur, 'package.json'))) return cur;
-    const parent = dirname(cur);
-    if (parent === cur) break;
-    cur = parent;
-  }
-  return null;
-}
 
 /**
- * Build an ordered list of directories to search for an OpenAPI spec.
- * The spec under the configured sourceRoot's package takes precedence over a
- * (possibly stale) copy at the repo root — monorepos frequently keep a
- * divergent root copy. Only CANONICAL bases are searched (sourceRoot package,
- * workspaces, repo root) — never worktrees / vendor / scan-tool dirs.
+ * A route as the comparison sees it: method and path, plus the reader's
+ * `caseInsensitive` flag when its framework matches routes ignoring case
+ * (docguard.coverage-followups#FR-003).
  */
-function orderedSpecDirs(projectDir, config) {
-  const ordered = [];
-  const seen = new Set();
-  const add = (d) => { if (d && !seen.has(d)) { seen.add(d); ordered.push(d); } };
+const comparable = r => ({ method: r.method, path: r.path, ...(r.caseInsensitive ? { caseInsensitive: true } : {}) });
 
-  const srList = config?.sourceRoot
-    ? (Array.isArray(config.sourceRoot) ? config.sourceRoot : [config.sourceRoot])
-    : [];
-  for (const sr of srList) {
-    const abs = resolve(projectDir, sr);
-    add(nearestPackageDir(projectDir, abs));
-    add(abs);
-  }
-  for (const d of getWorkspaceDirs(projectDir)) add(d);
-  add(resolve(projectDir)); // root copy last — lowest priority
-  return ordered;
-}
+export { findAllOpenApiSpecs };
 
-/**
- * Enumerate every OpenAPI spec found in a canonical location, in priority order.
- * @returns {Array<{ absPath: string, relPath: string, endpoints: object[] }>}
- */
-export function findAllOpenApiSpecs(projectDir, config) {
-  const specs = [];
-  const seenAbs = new Set();
-  for (const dir of orderedSpecDirs(projectDir, config)) {
-    const oa = detectOpenAPI(dir);
-    if (!oa.found || !oa.endpoints?.length) continue;
-    const absPath = resolve(dir, oa.path);
-    if (seenAbs.has(absPath)) continue;
-    seenAbs.add(absPath);
-    specs.push({
-      absPath,
-      relPath: relPosix(projectDir, absPath),
-      endpoints: oa.endpoints.filter(e => e && e.method && e.path),
-    });
-  }
-  return specs;
-}
+
 
 /**
  * OpenAPI specs that exist and declare a `paths:` section but parsed to ZERO
@@ -135,16 +98,51 @@ export function detectSpecDivergence(projectDir, config) {
   return { specs, divergent, authoritative: specs[0].relPath };
 }
 
+/**
+ * Which framework's routes should the scanner look for?
+ *
+ * This read used to consider `package.json` alone, so it returned '' for every
+ * Python, Go, Rust, Java and Ruby project. `scanRoutesDeep` gates its Flask,
+ * FastAPI, Django, Gin, Axum, Spring and Rails walkers on the framework name,
+ * so none of them could ever run from here: a Flask service with undocumented
+ * endpoints reported `no-matches` — "no checkable inputs matched this
+ * detector" — and the API surface went silently unchecked. The scanners
+ * themselves worked; nothing reached them.
+ *
+ * `detectEcosystems` already reads pyproject/requirements/Cargo/go.mod/pom and
+ * classifies the framework, honours `.docguardignore`, and skips fixture and
+ * test directories, so the whole polyglot surface comes from one place. The
+ * package.json read stays as the fallback for a JS project whose manifest sits
+ * outside the ecosystem walk (a workspace member reached through config).
+ */
 function detectFramework(projectDir, config) {
+  const names = [];
+  try {
+    for (const eco of detectEcosystems(projectDir, config)) {
+      if (eco.framework) names.push(eco.framework);
+    }
+  } catch { /* fall through to the package.json read */ }
+  if (names.length > 0) return [...new Set(names)].join(' ');
+
   const deps = {};
   for (const { pkg } of collectPackageJsons(projectDir, config)) {
     Object.assign(deps, pkg.dependencies || {}, pkg.devDependencies || {});
   }
   if (deps.next) return 'Next.js';
+  if (deps['@nestjs/core']) return 'NestJS'; // docguard.js-framework-routes#FR-007
   if (deps.express) return 'Express';
   if (deps.fastify) return 'Fastify';
   if (deps.hono) return 'Hono';
+  if (deps.koa) return 'Koa';
   return '';
+}
+
+/**
+ * The framework name guard's route scan uses, so `generate` documents the
+ * routes guard will check (docguard.generated-docs-consistency#FR-010).
+ */
+export function detectRouteFramework(projectDir, config) {
+  return detectFramework(projectDir, config);
 }
 
 /**
@@ -165,25 +163,96 @@ export function resolveApiSurface(projectDir, config) {
   // Fallback: monorepo-aware code route scan
   const framework = detectFramework(projectDir, config);
   const routes = scanRoutesDeep(projectDir, { framework }, { openapi: { found: false } }, { config });
+  // The scan's analyzer tier travels with the surface, INCLUDING when the scan
+  // found nothing. A Flask project read without a `python3` interpreter yields
+  // zero routes — the pattern fallback cannot match `@app.route(...)` at all —
+  // and an empty surface is indistinguishable from a project with no routes
+  // unless the tier says which one this is.
+  //
+  // Coverage comes from every file the scan READ (routes.scanTier), not only
+  // from the files that yielded a route: a Go file with no match is as unseen
+  // as one with a route the patterns got wrong. Scanners with no tier
+  // (Express, Next.js) fall back to the routes' own tiers, as before.
+  const scanTier = routes.scanTier || null;
+  const scan = routes.scan || null;
   if (routes.length) {
     return {
-      endpoints: routes.map(r => ({ method: r.method, path: r.path })),
+      endpoints: routes.map(comparable),
       confidence: 'code',
       source: 'code-scan',
+      tier: scanTier || summarizeTiers(routes),
+      scan,
     };
   }
 
-  return { endpoints: [], confidence: 'none', source: null };
+  return { endpoints: [], confidence: 'none', source: null, tier: scanTier, scan };
+}
+
+/**
+ * What a route scan could not establish, as coverage reasons
+ * (docguard.fallback-language-coverage#FR-007/008/009):
+ * - a detected pattern-only framework whose patterns matched nothing — the
+ *   surface is unknown, not empty;
+ * - route registrations a reader omitted because their path is not literal
+ *   (docguard.php-dotnet-routes#FR-007);
+ * - routes found only in test/fixture/example paths, when none remain;
+ * - a walk stopped by the file cap;
+ * - routes a pattern reader saw but omitted because their path is not literal
+ *   text (docguard.more-route-frameworks#FR-005).
+ * - routes whose path a reader could not resolve statically (a dynamic
+ *   NestJS path, a Worker's prefix dispatch), counted per framework
+ *   (docguard.js-framework-routes#FR-006).
+ *
+ * @param {object|null} scan  the non-enumerable `scan` record of scanRoutesDeep
+ * @param {number} kept       product routes the scan kept
+ * @returns {string[]}
+ */
+export function routeScanGaps(scan, kept = 0) {
+  if (!scan) return [];
+  const out = [];
+  const n = (count, noun) => `${count} ${noun}${count === 1 ? '' : 's'}`;
+  for (const pf of scan.patternFrameworks || []) {
+    if (pf.routes === 0 && !pf.omitted) {
+      out.push(`Detected ${pf.name}, but its route patterns matched no route in ${n(pf.files, 'file')}; a route registered in a form the patterns do not match is not seen, so the API surface was not compared with code.`);
+    }
+    // docguard.php-dotnet-routes#FR-007: a registration whose path is not
+    // literal is omitted, never guessed; say how many and where.
+    if (pf.omitted > 0) {
+      const one = pf.omitted === 1;
+      const where = (pf.omittedAt || []).join(', ');
+      out.push(`${pf.name}: ${n(pf.omitted, 'route registration')} had a path or prefix that is not literal text and ${one ? 'was' : 'were'} omitted, not guessed${where ? ` (${where}${pf.omitted > (pf.omittedAt || []).length ? ', …' : ''})` : ''}.`);
+    }
+  }
+  if (scan.excludedNonProduct > 0 && kept === 0) {
+    const one = scan.excludedNonProduct === 1;
+    out.push(`${n(scan.excludedNonProduct, 'route')} ${one ? 'was' : 'were'} found only under test, fixture or example paths and ${one ? 'was' : 'were'} excluded; if ${one ? 'it is' : 'they are'} product code, set detection.includeNonProduct to true in .docguard.json.`);
+  }
+  if (scan.truncated) {
+    out.push(`Route discovery stopped at the ${Number(scan.cap).toLocaleString('en-US')}-file cap; files beyond it were not read.`);
+  }
+  // A route whose path a reader could not resolve is omitted, never guessed
+  // (docguard.js-framework-routes#FR-006).
+  const byFramework = new Map();
+  for (const u of scan.unresolved || []) {
+    if (!byFramework.has(u.framework)) byFramework.set(u.framework, []);
+    byFramework.get(u.framework).push(u);
+  }
+  for (const [framework, list] of byFramework) {
+    const first = list[0];
+    out.push(`${n(list.length, `${framework} route`)} could not be read statically (first: ${first.file}:${first.line}, ${first.code}); ${list.length === 1 ? 'it is' : 'they are'} not in the API surface.`);
+  }
+  return out;
 }
 
 /**
  * Compute API-surface drift in a structured, reusable form.
  * Used by the validator AND by `docguard fix --write`.
  * @returns {{ applicable, confidence, source, documented, documentedButAbsent,
- *             presentButUndocumented, matched }}
+ *             contractMismatches, presentButUndocumented, matched }}
  */
 export function computeApiSurfaceDrift(projectDir, config) {
-  const apiDocPath = resolve(projectDir, API_DOC);
+  const API_DOC = docRolePath(config, 'apiReference');
+  const apiDocPath = resolveDocRole(projectDir, config, 'apiReference');
   if (!existsSync(apiDocPath)) {
     return { applicable: false, confidence: 'none', source: null,
       documented: [], documentedButAbsent: [], presentButUndocumented: [], matched: [] };
@@ -194,18 +263,46 @@ export function computeApiSurfaceDrift(projectDir, config) {
 
   if (surface.confidence === 'none' || documented.length === 0) {
     return { applicable: false, confidence: surface.confidence, source: surface.source,
-      documented, documentedButAbsent: [], presentButUndocumented: [], matched: [] };
+      documented, documentedButAbsent: [], presentButUndocumented: [], matched: [], tier: surface.tier || null,
+      scan: surface.scan || null, routeCount: surface.confidence === 'code' ? surface.endpoints.length : 0 };
   }
 
+  const tier = surface.tier || null;
   const cmp = compareEndpoints(documented, surface.endpoints);
+  // The legacy writer treats spec-confidence documentedButAbsent as deletable.
+  // Keep contract omissions separate from their removable subset. An omission
+  // alone cannot authorize removal; code-present and unknown results are excluded.
+  let contractMismatches = [];
+  if (surface.confidence === 'spec' && cmp.documentedButAbsent.length) {
+    const framework = detectFramework(projectDir, config);
+    const routes = scanRoutesDeep(projectDir, { framework }, {}, { config });
+    const actual = routes.map(comparable);
+    const present = endpoint => compareEndpoints([endpoint], actual).matched.length > 0;
+    contractMismatches = cmp.documentedButAbsent.map(endpoint => ({
+      ...endpoint,
+      authority: { kind: 'openapi', source: surface.source, status: 'not-declared', confidence: 'high' },
+      codeEvidence: {
+        status: present(endpoint)
+          ? 'present' : routes.length ? 'not-found' : 'unknown',
+        confidence: 'low',
+      },
+    }));
+  }
   return {
     applicable: true,
     confidence: surface.confidence,
     source: surface.source,
     documented,
-    documentedButAbsent: cmp.documentedButAbsent,
+    documentedButAbsent: surface.confidence === 'spec'
+      ? contractMismatches.filter(e => e.codeEvidence.status === 'not-found')
+        .map(({ method, path }) => ({ method, path }))
+      : cmp.documentedButAbsent,
+    contractMismatches,
     presentButUndocumented: cmp.presentButUndocumented,
     matched: cmp.matched,
+    tier,
+    scan: surface.scan || null,
+    routeCount: surface.confidence === 'code' ? surface.endpoints.length : 0,
   };
 }
 
@@ -240,7 +337,7 @@ export function computeSpecVsRouteDrift(projectDir, config) {
   // (second arg) = spec-declares-but-no-route.
   const cmp = compareEndpoints(
     spec.endpoints.map(e => ({ method: e.method, path: e.path })),
-    routes.map(r => ({ method: r.method, path: r.path }))
+    routes.map(comparable)
   );
   return {
     applicable: true,
@@ -251,11 +348,10 @@ export function computeSpecVsRouteDrift(projectDir, config) {
   };
 }
 
-// v0.29: migrated to structured findings (API001–API005). Messages are
-// byte-identical to the legacy strings — resultFromFindings derives the
-// errors/warnings arrays from the same findings; `fixes` and
-// `authoritativeSpec` are preserved.
+// Findings retain the authority behind each mismatch; contract authority
+// must never be presented as proof that no implementation exists.
 export function validateApiSurface(projectDir, config) {
+  const API_DOC = docRolePath(config, 'apiReference');
   const findings = [];
   const fixes = [];
   const trim = (arr) => {
@@ -266,7 +362,8 @@ export function validateApiSurface(projectDir, config) {
   // v0.14-P2: when --changed-only scoping is active and NONE of the changed
   // files look like route/spec/controller files, this validator has nothing
   // to add — return N/A so the lite-mode total reflects only what was actually
-  // checked. Route patterns mirror the SECTION_FILE_MATCHERS in sync.mjs.
+  // checked. This lite-mode filter is narrower than sync's `endpoints` matcher
+  // (cli/shared-sync-scope.mjs), which refreshes on any code change.
   if (Array.isArray(config.changedFiles)) {
     const ROUTE_RE = /(^|\/)(routes|controllers|handlers|app\/api)\/|openapi|swagger/i;
     const anyRouteFile = config.changedFiles.some(f => ROUTE_RE.test(f));
@@ -298,6 +395,21 @@ export function validateApiSurface(projectDir, config) {
   }
 
   const drift = computeApiSurfaceDrift(projectDir, config);
+  // Disclose a degraded analyzer tier as reduced COVERAGE, never as a reduced
+  // finding. What the pattern tier did find is real; what it could not see is
+  // the part a reader has to know about — and an empty surface from a degraded
+  // tier is exactly the case that used to look like a clean "no routes".
+  // (calibrated-finding-channels#FR-012)
+  const tierGap = tierApplicability(drift.tier, 'source file');
+  // What the scan itself could not establish: a detected framework whose
+  // patterns matched nothing, routes that exist only in fixtures, a capped
+  // walk. Any of these makes an empty or thin surface a gap, never a pass.
+  const gapReasons = [tierGap?.reason, ...routeScanGaps(drift.scan, drift.routeCount || 0)].filter(Boolean);
+  const coverage = gapReasons.length ? { status: 'partial', reason: gapReasons.join(' ') } : null;
+  // Findings drawn from the code scan carry the tier that produced them, so a
+  // reader can tell a conclusion built on a syntax tree from one built on a
+  // pattern match without going back to the validator's coverage line.
+  const codeTier = (drift.tier && drift.tier.tier) || 'not-applicable';
 
   // ── Multi-spec divergence (independent of the API-REFERENCE doc) ──
   const divergence = detectSpecDivergence(projectDir, config);
@@ -358,73 +470,79 @@ export function validateApiSurface(projectDir, config) {
   if (!drift.applicable) {
     // Nothing to validate against the API-REFERENCE doc — but the spec-vs-route
     // check above may still have produced findings.
+    //
+    // This is the branch that most needed the tier. "No surface found" and
+    // "no surface VISIBLE to the analyzer that ran" are different facts, and
+    // this path reported both as `no-matches`: a Flask service scanned without
+    // a python3 interpreter yields zero routes, because the pattern fallback
+    // cannot match `@app.route(...)` at all, and the result was indistinguishable
+    // from a project that genuinely registers none.
     return {
       ...resultFromFindings(findings, { passed: specRoutePassed, total: specRouteTotal }),
       fixes,
       authoritativeSpec: drift.source || specRoute.specPath,
+      ...(coverage ? { applicability: coverage } : {}),
     };
   }
 
-  const { documentedButAbsent, presentButUndocumented, matched, confidence, source } = drift;
-  const total = matched.length + documentedButAbsent.length + presentButUndocumented.length + specRouteTotal;
+  const { documentedButAbsent, contractMismatches = [], presentButUndocumented, matched, confidence, source } = drift;
+  const total = matched.length + (confidence === 'spec' ? contractMismatches.length : documentedButAbsent.length) + presentButUndocumented.length + specRouteTotal;
   const passed = matched.length + specRoutePassed;
 
-  // documented-but-absent → deterministic remove-endpoint fixes
-  if (documentedButAbsent.length) {
-    const { shown, extra } = trim(documentedButAbsent);
+  // Spec omissions stay actionable without masquerading as runtime absence.
+  if (contractMismatches.length) {
+    const { shown, extra } = trim(contractMismatches);
     for (const e of shown) {
-      const msg = `Documented endpoint not found in code: ${e.method} ${e.path} (${API_DOC})`;
-      if (confidence === 'spec') {
-        findings.push(mkFinding({
-          code: 'API004',
-          validator: 'apiSurface',
-          severity: 'error',
-          message: msg,
+      const codeDescription = e.codeEvidence.status === 'present'
+        ? 'A matching route was extracted from code.'
+        : e.codeEvidence.status === 'not-found'
+          ? 'No matching route was extracted from code; scanner coverage may be incomplete.'
+          : 'Code presence is unknown: no routes were extracted.';
+      findings.push({
+        ...mkFinding({
+          code: 'API004', validator: 'apiSurface', parserTier: codeTier, severity: 'error',
+          confidence: 'high', // certain contract omission, NOT certain code absence
+          message: `Documented endpoint missing from OpenAPI contract (${source}): ${e.method} ${e.path} (${API_DOC}). ${codeDescription}`,
           location: API_DOC,
-          suggestion: { kind: 'fix', text: 'Remove the dead endpoint from the doc', command: 'docguard fix --write' },
-        }));
-      } else {
-        findings.push(mkFinding({
-          code: 'API004',
-          validator: 'apiSurface',
-          severity: 'warn',
-          // The "[code-scan — verify]" suffix marks this as heuristic-only:
-          // the route scanner may simply not see the endpoint's registration.
-          confidence: 'low',
-          message: `${msg} [code-scan — verify]`,
-          location: API_DOC,
-          suggestion: { kind: 'review', text: 'Verify the endpoint really is gone from the code, then remove it from the doc' },
-        }));
-      }
+          suggestion: { kind: 'review', text: e.codeEvidence.status === 'present'
+            ? 'Reconcile the implementation with the intended contract; update OpenAPI if the route is intended. Preserve the documented endpoint during review.'
+            : 'Reconcile the contract and documentation with the intended API. Verify implementation coverage and whether the endpoint was removed before editing documentation.' },
+        }),
+        evidence: { authority: e.authority, code: e.codeEvidence },
+      });
     }
     if (extra > 0) {
-      const tail = `…and ${extra} more documented endpoint(s) not found in code`;
-      if (confidence === 'spec') {
-        findings.push(mkFinding({
-          code: 'API004',
-          validator: 'apiSurface',
-          severity: 'error',
-          message: tail,
-          location: API_DOC,
-          suggestion: { kind: 'fix', text: 'Remove the dead endpoints from the doc', command: 'docguard fix --write' },
-        }));
-      } else {
-        findings.push(mkFinding({
-          code: 'API004',
-          validator: 'apiSurface',
-          severity: 'warn',
-          confidence: 'low',
-          message: tail,
-          location: API_DOC,
-          suggestion: { kind: 'review', text: 'Verify each documented endpoint against the code, then prune the doc' },
-        }));
-      }
+      findings.push(mkFinding({
+        code: 'API004', validator: 'apiSurface', parserTier: codeTier, severity: 'error',
+        message: `…and ${extra} more documented endpoint(s) missing from OpenAPI contract (${source}); code presence requires individual review`,
+        location: API_DOC,
+        suggestion: { kind: 'review', text: 'Reconcile each contract omission with code and intended behavior before editing documentation' },
+      }));
     }
-    // Only spec-confirmed absences are safe to auto-remove.
-    if (confidence === 'spec') {
-      for (const e of documentedButAbsent) {
-        fixes.push({ type: 'remove-endpoint', method: e.method, path: e.path, doc: API_DOC });
-      }
+  }
+
+  // A route scanner can prove presence, but unsupported syntax means it cannot
+  // prove absence. Contract omissions therefore remain review-only and never
+  // become mechanical deletion candidates, even when no route was extracted.
+
+  // Without a spec, a negative scan remains a low-confidence review candidate.
+  if (confidence !== 'spec' && documentedButAbsent.length) {
+    const { shown, extra } = trim(documentedButAbsent);
+    for (const e of shown) {
+      findings.push(mkFinding({
+        code: 'API004', validator: 'apiSurface', parserTier: codeTier, severity: 'warn', confidence: 'low',
+        message: `Documented endpoint not found in code: ${e.method} ${e.path} (${API_DOC}) [code-scan — verify]`,
+        location: API_DOC,
+        suggestion: { kind: 'review', text: 'Verify the endpoint really is gone from the code, then remove it from the doc' },
+      }));
+    }
+    if (extra > 0) {
+      findings.push(mkFinding({
+        code: 'API004', validator: 'apiSurface', parserTier: codeTier, severity: 'warn', confidence: 'low',
+        message: `…and ${extra} more documented endpoint(s) not found by the code scanner`,
+        location: API_DOC,
+        suggestion: { kind: 'review', text: 'Verify each documented endpoint against the code before editing documentation' },
+      }));
     }
   }
 
@@ -435,8 +553,9 @@ export function validateApiSurface(projectDir, config) {
       findings.push(mkFinding({
         code: 'API005',
         validator: 'apiSurface',
+        parserTier: codeTier,
         severity: 'warn',
-        message: `Undocumented endpoint in code: ${e.method} ${e.path} — add it to ${API_DOC}`,
+        message: `Undocumented endpoint in ${confidence === 'spec' ? `OpenAPI contract (${source})` : 'code'}: ${e.method} ${e.path} — add it to ${API_DOC}`,
         location: API_DOC,
         suggestion: { kind: 'fix', text: `Document the endpoint in ${API_DOC}` },
       }));
@@ -445,13 +564,19 @@ export function validateApiSurface(projectDir, config) {
       findings.push(mkFinding({
         code: 'API005',
         validator: 'apiSurface',
+        parserTier: codeTier,
         severity: 'warn',
-        message: `…and ${extra} more undocumented endpoint(s) in code`,
+        message: `…and ${extra} more undocumented endpoint(s) in ${confidence === 'spec' ? `OpenAPI contract (${source})` : 'code'}`,
         location: API_DOC,
         suggestion: { kind: 'fix', text: `Document the remaining endpoints in ${API_DOC}` },
       }));
     }
   }
 
-  return { ...resultFromFindings(findings, { passed, total }), fixes, authoritativeSpec: source };
+  return {
+    ...resultFromFindings(findings, { passed, total }),
+    fixes,
+    authoritativeSpec: source,
+    ...(coverage ? { applicability: coverage } : {}),
+  };
 }

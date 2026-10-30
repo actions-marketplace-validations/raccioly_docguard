@@ -1,4 +1,6 @@
 /**
+ * @implements docguard.evidence-scoped-verification#FR-013
+ * @implements docguard.first-spec-preflight#FR-007
  * Explain Command — v0.16-P6.
  *
  * Asked for by a user who'd spent 5-10 minutes per warning spelunking
@@ -16,8 +18,14 @@
  * Zero NPM dependencies. Pure lookup table.
  */
 
+import { readFileSync } from 'node:fs';
+import { resolve as resolvePath, dirname as dn } from 'node:path';
+import { fileURLToPath as fp } from 'node:url';
 import { c } from '../shared.mjs';
-import { CODES } from '../findings.mjs';
+import { BLOCKER_CODES, CODES } from '../findings.mjs';
+import { describeEvidenceForCode, evidenceForCode } from '../precision-evidence.mjs';
+
+const CLI_VERSION = JSON.parse(readFileSync(resolvePath(dn(fp(import.meta.url)), '..', '..', 'package.json'), 'utf-8')).version;
 
 /**
  * Validator-key → human-readable explainer. Keyed by the same key DocGuard
@@ -32,6 +40,7 @@ import { CODES } from '../findings.mjs';
  *   - standard: the spec/practice the validator references
  */
 const EXPLAINERS = {
+  __proto__: null,
   structure: {
     title: 'Structure — required CDD files exist',
     what: 'Verifies the canonical files declared in .docguard.json `requiredFiles.canonical` are present, plus AGENTS.md/CLAUDE.md, CHANGELOG.md, DRIFT-LOG.md.',
@@ -45,10 +54,10 @@ const EXPLAINERS = {
   },
   docsSync: {
     title: 'Docs-Sync — code files are referenced in canonical docs',
-    what: 'Walks route/service files in your source tree. For each, checks that the file path or basename appears in any canonical doc.',
+    what: 'Walks route/service files in your source tree. For each, checks that a canonical doc names it in text a reader sees, not inside an HTML comment. A Next.js route handler is named by the URL path it serves (`/api/users/{id}`) or its file path, never by the word `route`. Any other file is named by its path, file name or module name (the file name without its extension) as a whole name: `users` or `user-service` does not document `user`. A module name that several checked files share needs its directory (`auth/types`); an `index` file is named by its directory (`services/auth`). A file tree drawn in a doc (`├──`, `└──`) names the paths it lists, and a `docguard:section` marker whose `covers` lists the file also counts.',
     why:  'Code that exists but isn\'t mentioned in any doc is invisible to future contributors and AI agents.',
     triggers: [
-      ['not referenced in any canonical doc', 'A route or service file has no mention anywhere in docs-canonical/. Add a one-line reference (path or filename) to ARCHITECTURE.md or DATA-MODEL.md.'],
+      ['not referenced in any canonical doc', 'A route or service file has no mention anywhere in docs-canonical/. Add a one-line reference to ARCHITECTURE.md or an API doc: the URL path of a Next.js route handler, or the file\'s path or the name the finding suggests.'],
     ],
     example: '`src/services/auth.ts` mentioned in ARCHITECTURE.md\'s Components table',
     standard: 'arc42 Component Map',
@@ -89,10 +98,11 @@ const EXPLAINERS = {
   },
   environment: {
     title: 'Environment — env vars used in code are documented',
-    what: 'Greps `process.env.X` and `import.meta.env.X` (plus `os.environ` for Python) across source. Each name must appear in ENVIRONMENT.md or .env.example/.env.template.',
+    what: 'Matches env reads by pattern across source: `process.env.X` and `import.meta.env.X` (JS/TS), `os.environ` / `os.getenv` (Python), `os.Getenv` / `os.LookupEnv` (Go), `ENV["X"]` / `ENV.fetch` (Ruby), `System.getenv` and `@Value("${X}")` (Java, Kotlin), `Environment.GetEnvironmentVariable` (C#), `getenv` / `$_ENV` / `env()` (PHP), `env::var` (Rust), and `${X}` placeholders in Spring `application*`/`bootstrap*` config. Each name must appear in ENVIRONMENT.md or .env.example/.env.template. A source language with no env patterns makes the check `partial`.',
     why:  'Undocumented env vars are runtime surprises waiting to happen.',
     triggers: [
       ['used but not documented', 'Code reads an env var that ENVIRONMENT.md doesn\'t list. Add it to the table.'],
+      ['missing "## Environment Variables" section', 'ENV001/ENV002 match headings as STR003 does: any case, section numbers allowed, synonyms ("Env Vars", "Getting Started") accepted; "Environment" and "Configuration" only as the whole heading or followed by a word such as "Reference" or "Variables".'],
       ['VITE_API_URL or similar prefix', 'Naked prefixes like `VITE_` (no suffix) get filtered out — they\'re convention markers, not real var names.'],
     ],
     example: '`DATABASE_URL` listed in ENVIRONMENT.md\'s Environment Variables table AND read via `process.env.DATABASE_URL` in code',
@@ -252,6 +262,115 @@ const EXPLAINERS = {
     example: 'plan.md has Summary, Technical Context, Constitution Check, Project Structure',
     standard: 'GitHub Spec Kit',
   },
+  documentLifecycle: {
+    title: 'Document-Lifecycle — retired documents leave active AI context safely',
+    what: 'Scans Git-tracked Markdown for exact terminal lifecycle metadata, completed specs that merit review, and disagreement between the working tree and .docguard-archive.json. It does not infer that completed work is safe to retire.',
+    why: 'Historical specs and plans can mislead people and agents when they remain mixed with current intent. Retirement must preserve recovery evidence and avoid deleting still-referenced context.',
+    triggers: [
+      ['declares terminal lifecycle status', 'Review the document, its backreferences, and its replacement or evidence, then retire the explicit clean tracked path with `docguard retire --write`.'],
+      ['artifact maturity is', 'Completion is only a review signal. Confirm the implemented outcome is represented in current documentation before considering retirement.'],
+      ['fully checked task list', 'Checked tasks do not prove delivery or documentation reconciliation. Verify code/test evidence and current docs.'],
+      ['Document lifecycle coverage is', 'Restore Git access, repair the retirement manifest, or make tracked Markdown readable before relying on the lifecycle result.'],
+      ['recorded as retired but remains', 'Complete the recorded retirement or correct the manifest so active context and recovery metadata agree.'],
+    ],
+    example: 'A superseded plan is absent from the working tree, recorded in .docguard-archive.json with a retained Git ref, and linked to its current replacement.',
+    standard: 'Canonical-Driven Development lifecycle and Git-backed recovery contract',
+  },
+  suppressions: {
+    title: 'Suppressions — every exclusion says why, and none outlives its date',
+    what: 'Reads `.docguardignore` entries written as `pattern  expires:YYYY-MM-DD  # reason`. Reports an entry whose expiry day has passed (IGN001), one whose expiry is not a calendar date or that has no pattern (IGN003), and, when `suppressions.requireReason` is true, one with no reason (IGN002). Expired and unreadable entries already exclude nothing; this validator says so.',
+    why: 'An exclusion hides files from every check. One written for a temporary condition stays forever unless it can end, and one without a reason cannot be reviewed.',
+    triggers: [
+      ['expired on', 'Set a new expires: date if the reason still holds; otherwise delete the line.'],
+      ['not a YYYY-MM-DD calendar date', 'Write the date as expires:2026-12-31, or remove the token.'],
+      ['has no reason', 'Add a trailing `# reason` saying why the path is excluded.'],
+    ],
+    example: 'build/  expires:2026-12-31  # generated output, removed when the v2 build lands',
+    standard: 'claimspec v1 ignore: every entry carries a reason; an expired entry excuses nothing',
+  },
+  specRegistry: {
+    title: 'Spec-Registry — one lifecycle index for intent, delivery, and evidence',
+    what: 'Checks that every active spec has an immutable identity and that `.docguard-specs.json` exactly reflects spec artifacts, task counts, explicit test references, and archive tombstones while preserving reviewed lifecycle, lineage, and scope fields.',
+    why: 'Agents need to know which intent is current and what evidence exists before they create another spec. A deterministic registry makes stale state visible without copying or rewriting requirement prose.',
+    triggers: [
+      ['registry is missing or stale', 'Run `docguard specs --write`, review the projection, and commit it with the relevant change.'],
+      ['identity missing or reused', 'Add one unique namespaced Spec ID to the authoritative spec metadata; never recycle a retired ID.'],
+      ['lifecycle contradicts storage', 'Align current/retired context and working_tree/git_history storage with the recovery archive.'],
+    ],
+    example: '`docguard specs preflight --path specs/007-feature/spec.md` blocks reused IDs and reports prior lifecycle/evidence before planning.',
+    standard: 'Canonical-Driven Development lifecycle registry contract',
+  },
+  docDependency: {
+    title: 'Doc-Dependency — a reviewed doc section whose covered code changed',
+    what: 'For each `docguard:section` that declares `covers="path#symbol, …"`, compares the current fingerprint of every covered dependency (normalized JS/TS AST, Python `ast.dump`, file bytes, or a glob set) with the one `docguard review --accept` recorded in `.docguard-doc-lock.json`.',
+    why: 'Freshness counts every commit in the repository; this names the one section whose code changed, and ignores formatting, comments and line moves. A same-size edit that line counts and file sizes cannot see is still caught.',
+    triggers: [
+      ['changed since the section was reviewed', 'Run the git diff the finding names, update the prose if it no longer holds, then `docguard review --accept <doc>#<id> --reason "<what you checked>"`.'],
+      ['does not resolve', 'Point covers= at what the section now describes, update the prose, and accept the review again.'],
+      ['has no accepted review', 'Read the section against the code, then accept it with a reason.'],
+      ['no such section declares covers=', 'Run `docguard review --prune`.'],
+    ],
+    example: '`<!-- docguard:section id=pricing source=human covers="src/pricing.mjs#discount" -->` — a change to `discount` reports DLK001 until the section is re-accepted.',
+    standard: 'Canonical-Driven Development doc dependency lock (specs/030-doc-dependency-lock)',
+  },
+  requirementAnchors: {
+    title: 'Requirement-Anchors — code→requirement tags that cite nothing, or were read below their exact tier',
+    what: 'Resolves every `@implements` / `@req` tag in a non-test source file to the code under it (the file, a qualified symbol, a statement or a route) and to the requirement it cites. Reports a tag whose requirement no spec or requirement document declares, and files anchored below their exact tier. Not applicable until the project commits `.docguard-anchor-lock.jsonl` or sets `anchors.enabled`.',
+    why: 'A tag that names a requirement nobody declares is a dead link: the code claims intent the specs no longer state. A file the exact parser could not read is anchored less precisely, and saying so keeps a green result honest.',
+    triggers: [
+      ['which no spec or requirement document declares', 'Qualify the tag with the Spec ID that declares the requirement (`@implements acme.billing#FR-003`), fix the ID, or remove the tag.'],
+      ['documents declare', 'Qualify the bare ID with its Spec ID.'],
+      ['anchored at a lower tier', 'Install the missing parser (python3) or fix the file that does not parse; the anchors still count, less precisely.'],
+      ['The anchor cache was ignored', 'Untrack `.docguard/` with `git rm --cached -r .docguard`.'],
+      ['changed since it was', 'Read the change (the finding carries the git diff command), then `docguard anchors accept --link \'<key>\' --reason "<what you checked>"`. It is an error only under anchors.failOn reviewed-exact (the default) for a reviewed, exact-tier link at symbol, statement or route scope.'],
+      ['changed its text since', 'Read the new requirement text against the code, then accept the link again.'],
+      ['no tag anchors it any more', 'Restore the tag where the requirement is implemented, or `docguard anchors accept --remove \'<key>\' --reason "…"`.'],
+      ['retired or superseded spec', 'Point the tag at the requirement that replaced it, or remove it.'],
+      ['with different content', 'Accept the link again; that rewrites one entry and resolves the merge conflict.'],
+    ],
+    example: '`/** @implements acme.billing#FR-002 */` directly above `export function applyDiscount` anchors FR-002 to that function; `docguard anchors` lists it.',
+    standard: 'Canonical-Driven Development requirement anchors (specs/070-requirement-anchors)',
+  },
+  pathScopedRules: {
+    title: 'Path-Scoped-Rules — agent instructions whose scope or pointers went stale',
+    what: 'Reads every agent instruction file per harness (nested AGENTS.md and CLAUDE.md, Claude Code rules and skills, Cursor .mdc rules, Copilot .instructions.md, OpenHands skills), derives each one\'s scope from its frontmatter, and checks it against the tracked files.',
+    why: 'A rule scoped to src/api/** keeps silently not loading after the code moves to packages/api/; a routing line pointing at a renamed doc sends every agent to nothing; a scope key the harness does not read turns a scoped rule into an always-on one.',
+    triggers: [
+      ['matches no tracked file', 'Point the pattern at where the code lives now (`docguard rules --for <path>` shows what applies), or delete the rule.'],
+      ['points at … which does not exist', 'Point it at the file that replaced it, or remove the reference.'],
+      ['bytes of instructions', 'Narrow the scopes, move procedures into linked docs, or record an allowance in agentInstructions.allowances.'],
+      ['reads `paths:`, not `globs:`', 'Rename the key to the one the harness reads.'],
+    ],
+    example: '`.cursor/rules/api.mdc` with `globs: "src/api/**"` after `src/api/` moved reports PSR001.',
+    standard: 'Canonical-Driven Development path-scoped agent rules (specs/033-path-scoped-rules)',
+  },
+  docOwnership: {
+    title: 'Doc-Ownership — one responsible doc section per source path',
+    what: 'Resolves every tracked file against the `ownership` block in .docguard.json (exact path beats glob; longer literal prefix beats shorter) and lints a committed .devin/wiki.json against Devin\'s documented rules.',
+    why: 'Which doc should change when cli/writers/ changes? Without a declared owner the answer is a text search. A directory nobody owns stays undocumented; two owners for one path drift apart; a wiki note naming a deleted path keeps steering Devin toward it.',
+    triggers: [
+      ['no ownership entry covers', 'Add the directory to the paths of the doc section that describes it (`docguard trace --owners --suggest` drafts a block).'],
+      ['equally specific owners', 'Narrow one entry or name the file exactly in its owner.'],
+      ['matches no tracked file', 'Point the pattern at where the code lives now.'],
+      ['.devin/wiki.json', 'Keep within Devin\'s limits and point notes at paths that exist.'],
+    ],
+    example: '`{"ownership":{"entries":[{"doc":"docs-canonical/ARCHITECTURE.md","section":"component-map","paths":["src/**"]}]}}`',
+    standard: 'Canonical-Driven Development doc ownership map (specs/034-doc-ownership-map)',
+  },
+  evidence: {
+    title: 'Evidence — declared statements match bounded local sources',
+    what: 'Evaluates opt-in declarations in `.docguard-evidence.json`. Each declaration selects one exact statement under one Markdown heading, reads a bounded local JSON value, file collection, saved oasdiff report, or saved Buf report, and reports verified-within-scope, contradicted, stale, inconclusive, or unsupported.',
+    why: 'Structural checks can prove that documentation exists and is connected, but they cannot prove factual claims. Evidence declarations add reproducible checks for selected high-value statements without claiming that the whole document is accurate.',
+    triggers: [
+      ['Evidence manifest is invalid', 'Validate `.docguard-evidence.json` against `schemas/docguard-evidence.schema.json`; unknown fields and ambiguous declarations fail closed.'],
+      ['Declared evidence contradicts', 'Inspect the selected statement and source. Update the implementation when the canonical statement is still intended, or revise the statement through the normal reviewed documentation workflow.'],
+      ['Declared evidence is stale', 'Regenerate the saved external-tool report from the declared inputs and update their SHA-256 digests.'],
+      ['Declared evidence is inconclusive', 'Repair the missing or ambiguous heading/statement, unreadable source, unsafe collection, or malformed saved report before relying on the declaration.'],
+      ['Declared evidence uses an unsupported', 'Use a documented adapter version and command, or upgrade DocGuard when support for that producer shape becomes available.'],
+    ],
+    example: 'A retention statement under `## Policy` declares JSON Pointer `/retentionDays`; `docguard verify --evidence` reports verified-within-scope only when the exact typed values match.',
+    standard: 'RFC 6901 JSON Pointer; JSON Schema 2020-12; DocGuard evidence-scoping contract',
+  },
 
   // ── Backfilled in v0.24 (field report, Issue A) ─────────────────────────
   // These validators were registered in guard but had no explain entry, so
@@ -267,6 +386,7 @@ const EXPLAINERS = {
     what: 'For each canonical doc, verifies the required `##` sections exist as real headings: ARCHITECTURE.md (System Overview, Component Map, Tech Stack), DATA-MODEL.md (Entities), SECURITY.md (Authentication, Secrets Management), TEST-SPEC.md (Test Categories, Coverage Rules), ENVIRONMENT.md (Environment Variables, Setup Steps). The DATA-MODEL and ENVIRONMENT requirements relax automatically for CLI/library projects.',
     why:  'A canonical doc that exists but lacks its sections is an empty shell — the section structure is what makes it a reliable memory anchor for humans and agents.',
     triggers: [
+      ['unedited scaffold', 'STR006: the document holds nothing beyond the template `docguard init` wrote it from (comments, empty cells, the Metadata table, dates). Write it, run `docguard generate --plan --write` for code-derived sections, or own an intentionally blank document with `<!-- docguard:section scaffold n/a — reason -->` (any reasoned section N/A marker owns it). A placeholder owner or unchosen status alone is not reported. Until then scores treat the document as unfinished: docQuality counts none of its checks, ALCOA+ Legible is a gap, and Machine markers does not count it as marked.'],
       ['missing section', 'Add the named `## Section` heading. If the section is genuinely not applicable (e.g. a CLI with no auth), add the N/A marker — a reason is required: `<!-- docguard:section authentication n/a — CLI tool, no auth layer -->`.'],
     ],
     example: 'SECURITY.md contains both `## Authentication` and `## Secrets Management` as real headings — or carries `<!-- docguard:section authentication n/a — CLI, no auth -->`',
@@ -291,6 +411,8 @@ const EXPLAINERS = {
     triggers: [
       ['drift:', 'ARCHITECTURE.md or TEST-SPEC.md disagrees with the code. The warning spells out which items are "in code but not documented" vs. "documented but not found in code".'],
       ['in code but not documented', 'Add the technology or test file to the relevant doc.'],
+      ['brace pattern', 'A documented test such as `src/tests/{alpha,beta}.test.ts` or `foo.{test,spec}.ts` counts as every path it expands to (single level, at most 64 expansions); a missing expansion is reported by its expanded path. A brace glob (`src/**/*.test.{js,jsx}`) is one pattern that documents what any alternative matches.'],
+      ['negated technology', 'A technology is not documented when a negator governs the list it is in (`no CDK, Terraform or Pulumi stacks`), a removal verb takes it as its object (`removed Terraform`, `migrated off`, `was removed`; not `removed all Redis keys`), or it sits under a Revision History, Changelog or Release Notes heading (fenced code and comments are not headings).'],
       ['documented but not found in code', 'Remove the stale reference, or restore the file if it was deleted by mistake.'],
     ],
     example: 'ARCHITECTURE.md names exactly the stack the dependencies imply, and every glob in TEST-SPEC.md matches a real test file',
@@ -337,7 +459,7 @@ const EXPLAINERS = {
   },
   schemaSync: {
     title: 'Schema-Sync — DB models in code are documented in DATA-MODEL.md',
-    what: 'Detects schema files for 7 ORMs/frameworks (Prisma, Drizzle, Sequelize, TypeORM, Knex, Django, Rails), extracts the model/table names, and checks each appears (case-insensitive, singular/plural aware) in docs-canonical/DATA-MODEL.md. Migration/utility tables are filtered out. No schema files → passes silently.',
+    what: 'Reads models from Prisma, Drizzle, Mongoose, TypeORM and Sequelize (the scanner `generate` uses), Django, SQLAlchemy and SQLModel, and table names from Knex and Rails migrations, then checks each appears (case-insensitive, singular/plural aware) in docs-canonical/DATA-MODEL.md. Migration/utility tables are filtered out. No schema files → passes silently.',
     why:  'An undocumented table is a data model only the code knows — exactly the institutional memory CDD exists to preserve.',
     triggers: [
       ['not documented in DATA-MODEL.md', 'Add the model to DATA-MODEL.md\'s Entity Definitions section.'],
@@ -357,7 +479,8 @@ const EXPLAINERS = {
  * tests/explain-coverage.test.mjs asserts it stays in lock-step with the live
  * registry, so a new validator can't ship without an explain entry + name.
  */
-const DISPLAY_NAMES = {
+export const DISPLAY_NAMES = {
+  __proto__: null,
   structure: 'Structure',
   docSections: 'Doc Sections',
   docsSync: 'Docs-Sync',
@@ -377,11 +500,19 @@ const DISPLAY_NAMES = {
   todoTracking: 'TODO-Tracking',
   schemaSync: 'Schema-Sync',
   specKit: 'Spec-Kit',
+  documentLifecycle: 'Document-Lifecycle',
+  suppressions: 'Suppressions',
+  specRegistry: 'Spec-Registry',
+  docDependency: 'Doc-Dependency',
+  requirementAnchors: 'Requirement-Anchors',
+  pathScopedRules: 'Path-Scoped-Rules',
+  docOwnership: 'Doc-Ownership',
   crossReference: 'Cross-Reference',
   generatedStaleness: 'Generated-Staleness',
   surfaceSync: 'Surface-Sync',
   canonicalSync: 'Canonical-Sync',
   metricsConsistency: 'Metrics-Consistency',
+  evidence: 'Evidence',
   diffSuspicion: 'Diff-Suspicion',
   referenceExistence: 'Reference-Existence',
   apiDocSmells: 'API-Doc-Smells',
@@ -396,7 +527,7 @@ const normalizeKey = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
  * and `"doc quality"` all resolve to the same entry.
  */
 const ALIAS_INDEX = (() => {
-  const idx = {};
+  const idx = Object.create(null);
   for (const key of Object.keys(EXPLAINERS)) idx[normalizeKey(key)] = key;
   for (const [key, name] of Object.entries(DISPLAY_NAMES)) {
     if (EXPLAINERS[key]) idx[normalizeKey(name)] = key; // name → key (only if explainable)
@@ -463,17 +594,39 @@ export function runExplain(projectDir, _config, flags) {
   if (CODES[codeKey]) {
     const cd = CODES[codeKey];
     if (isJson) {
-      console.log(JSON.stringify({ query, code: codeKey, ...cd }, null, 2));
+      console.log(JSON.stringify({
+        query, code: codeKey, ...cd, precisionEvidence: evidenceForCode(codeKey),
+      }, null, 2));
       return;
     }
     console.log(`${c.bold}🧭 ${codeKey} — ${cd.title}${c.reset}`);
     console.log(`${c.dim}   validator: ${cd.validator}${c.reset}\n`);
     console.log(`${c.bold}What it means:${c.reset}\n  ${cd.help}\n`);
+    // What has actually been measured about this code, including "nothing".
+    console.log(`${c.bold}Benchmark evidence:${c.reset}`);
+    for (const line of describeEvidenceForCode(codeKey, CLI_VERSION)) console.log(`  ${c.dim}${line}${c.reset}`);
+    console.log(`  ${c.dim}Every finding carries the same answer as ${c.cyan}evidence.status${c.reset}${c.dim} in ${c.cyan}guard --format json${c.reset}${c.dim}, beside ${c.cyan}disposition${c.reset}${c.dim} (act or escalate) and ${c.cyan}parserTier${c.reset}${c.dim} (which analyzer produced it).${c.reset}`);
+    console.log('');
     if (cd.suppress) {
       console.log(`${c.bold}Suppress inline${c.reset} ${c.dim}(only if it's a confirmed false positive):${c.reset}`);
       console.log(`  ${c.cyan}${cd.suppress}${c.reset}\n`);
     }
     console.log(`${c.bold}Got it wrong?${c.reset} ${c.dim}Send a redacted report so a future release stops flagging it: ${c.cyan}docguard feedback${c.reset}`);
+    return;
+  }
+
+  // Lifecycle command blockers (SPC…) are not findings: no validator, no
+  // benchmark evidence, no inline suppression (docguard.first-spec-preflight#FR-007).
+  if (BLOCKER_CODES[codeKey]) {
+    const bc = BLOCKER_CODES[codeKey];
+    if (isJson) {
+      console.log(JSON.stringify({ query, code: codeKey, kind: 'blocker', ...bc }, null, 2));
+      return;
+    }
+    console.log(`${c.bold}🧭 ${codeKey} — ${bc.title}${c.reset}`);
+    console.log(`${c.dim}   blocker printed by: ${bc.command}${c.reset}\n`);
+    console.log(`${c.bold}What it means:${c.reset}\n  ${bc.help}\n`);
+    console.log(`${c.dim}A blocker is not a guard finding: it stops the command until the condition is fixed, and cannot be suppressed.${c.reset}`);
     return;
   }
 
@@ -518,10 +671,11 @@ export function runExplain(projectDir, _config, flags) {
 
   // v0.24: surface how to mute/tune from config — there was no in-tool way to
   // discover this, so users reached for severity:"off" (a no-op) instead of
-  // the real switch (field report). docSections is reported under the
-  // `structure` key in guard, so it disables via that key.
-  const cfgKey = match.key === 'docSections' ? 'structure' : match.key;
+  // the real switch (field report). docSections has its own key and falls
+  // back to `structure` when the config does not name it.
+  const cfgKey = match.key;
   console.log(`\n${c.bold}Tune it${c.reset} ${c.dim}(.docguard.json):${c.reset}`);
+  if (cfgKey === 'docSections') console.log(`  ${c.dim}Unset, docSections follows validators.structure and severity.structure.${c.reset}`);
   console.log(`  ${c.cyan}validators.${cfgKey}: false${c.reset} ${c.dim}— disable this validator entirely${c.reset}`);
   console.log(`  ${c.cyan}severity.${cfgKey}: "high" | "low"${c.reset} ${c.dim}— change exit-code weight (low = warn-only). Severity never hides the warning from output.${c.reset}`);
 }

@@ -3,13 +3,32 @@ name: Auto Release — Tag, GitHub Release, npm, PyPI
 # Triggers on push to main — detects version bumps automatically
 on:
   workflow_dispatch: # Allow manual trigger for recovery
+  schedule:
+    # GitHub suppresses push workflows when native auto-merge was armed by
+    # GITHUB_TOKEN, and maintainers rarely approve the release PR's workflows
+    # inside the scheduler's 10-minute wait -- so this cheap tag-driven sweep is
+    # the normal publication route, not a fallback (#447). Every 10 minutes
+    # bounds merge-to-publish at 10 minutes without a PAT, App key, or a
+    # continuously polling runner; its no-op path is a version check.
+    # @implements docguard.release-dispatch-window#FR-001
+    - cron: '*/10 * * * *'
   push:
     branches: [main]
     paths:
       - 'package.json' # Only run when package.json changes (version bump)
 
+# Read by default. A job that writes asks for its own scope, and no job that
+# runs the test suite, a package manager or a build tool holds a token that can
+# write to the repository: a bot may merge new test files (spec 067), and the
+# assets are built where no write token exists (specs/068-release-least-privilege).
+# Enforced by tests/workflow-permissions.test.mjs.
+# @implements docguard.release-least-privilege#FR-001
 permissions:
-  contents: write # Needed to create tags and releases
+  contents: read
+
+concurrency:
+  group: docguard-release
+  cancel-in-progress: false
 
 jobs:
   # ── Step 1: Detect if version changed ──────────────────────────────────
@@ -18,8 +37,9 @@ jobs:
     outputs:
       version: ${{ steps.check.outputs.version }}
       changed: ${{ steps.check.outputs.changed }}
+      brew_missing: ${{ steps.brew.outputs.brew_missing }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1 # only need HEAD's package.json; the tag check hits the remote
 
@@ -45,21 +65,45 @@ jobs:
             echo "✅ $TAG is not yet released — releasing"
           fi
 
+      # The Homebrew tap is its own surface: a release whose tap update failed
+      # (or predates the deploy key) is retried by this 10-minute sweep until
+      # the tap serves the released version. Without the key configured there is
+      # nothing to retry, so the sweep stays a no-op instead of warning forever.
+      # @implements docguard.release-readiness#FR-004
+      - name: Is the Homebrew tap behind the released version?
+        id: brew
+        env:
+          HAS_TAP_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY != '' }}
+        run: |
+          CURRENT=$(node -p "require('./package.json').version")
+          BEHIND=false
+          if [ "$HAS_TAP_KEY" = "true" ] && git ls-remote --tags origin "refs/tags/v$CURRENT" | grep -q "refs/tags/v$CURRENT$"; then
+            TAP=$(curl -fsSL https://raw.githubusercontent.com/raccioly/homebrew-tap/main/Formula/docguard.rb \
+              | sed -nE 's#^[[:space:]]*url ".*docguard-cli-([0-9]+\.[0-9]+\.[0-9]+)\.tgz"#\1#p' || true)
+            if [ "$TAP" != "$CURRENT" ]; then BEHIND=true; fi
+            echo "tap serves ${TAP:-nothing}; released v$CURRENT"
+          fi
+          echo "brew_missing=$BEHIND" >> "$GITHUB_OUTPUT"
+
   # ── Step 2: Run full test suite ────────────────────────────────────────
   test:
     needs: detect-version
     if: needs.detect-version.outputs.changed == 'true'
     runs-on: ubuntu-latest
+    # @implements docguard.release-least-privilege#FR-002
+    permissions:
+      contents: read
     strategy:
       matrix:
         # 24 = npm 11 coverage (18/20/22 ship npm 10). Gates releases on the
         # newer npm so a version-incompatible .npmrc / install can't ship (bug-198).
         node-version: [18, 20, 22, 24]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v7
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node-version }}
       - name: Install dependencies
@@ -74,10 +118,13 @@ jobs:
     needs: [detect-version, test]
     if: needs.detect-version.outputs.changed == 'true'
     runs-on: ubuntu-latest
+    # Tags and creates the release with git, awk and gh only: no build, no tests.
+    permissions:
+      contents: write
     outputs:
       tag: v${{ needs.detect-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # Fetch all history + tags for reliable tag detection
 
@@ -130,11 +177,17 @@ jobs:
           fi
 
   # ── Step 4: Build and attach spec-kit extension ZIP ────────────────────
+  # Built without credentials; attach-assets uploads it.
+  # @implements docguard.release-least-privilege#FR-004
   build-extension:
     needs: [detect-version, create-release]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Build extension ZIP
         run: |
@@ -145,26 +198,93 @@ jobs:
           echo "--- ZIP contents ---"
           unzip -l "spec-kit-docguard-v${VERSION}.zip"
 
-      - name: Upload to release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Hand the ZIP to attach-assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: spec-kit-extension
+          path: spec-kit-docguard-v${{ needs.detect-version.outputs.version }}.zip
+          if-no-files-found: error
+          retention-days: 3
+
+  # ── Step 4c: Publish the MCP server image to GHCR ──────────────────────
+  # The Dockerfile already existed but was only ever built FROM SOURCE by MCP
+  # directory inspectors (Glama et al.) on every check, and was undocumented.
+  # Publishing it means they (and CI users) can pull a prebuilt image instead.
+  #
+  # GHCR, not GitHub's npm registry: public GHCR images pull with NO auth,
+  # whereas npm.pkg.github.com requires a PAT even for public packages — which
+  # would make it strictly worse than npmjs.com and purely cosmetic.
+  #
+  # NOTHING depends on this job, so a failure here cannot block npm, PyPI, the
+  # GitHub Release, or the catalog reminder — they all run in parallel. It is
+  # deliberately NOT `continue-on-error`, because that reports a failed job as
+  # successful and would hide a broken image behind a green run.
+  #
+  # Uses the docker CLI (preinstalled on the runner) rather than third-party
+  # actions: two separate action-pin problems bit this pipeline today
+  # (@babel/parser major, and a pypa action too old for metadata 2.5), and this
+  # needs no action versions at all. Auth is GITHUB_TOKEN — nothing to expire.
+  publish-ghcr:
+    needs: [detect-version, test, create-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The registry login comes after the build and the smoke run, so neither
+      # runs with a credential on the runner.
+      # @implements docguard.release-least-privilege#FR-006
+      - name: Build and smoke-test the image
         run: |
           VERSION="${{ needs.detect-version.outputs.version }}"
-          gh release upload "v${VERSION}" \
-            "spec-kit-docguard-v${VERSION}.zip" \
-            --clobber
+          # GHCR requires a lowercase path; github.repository is already
+          # lowercase here but normalise anyway so a future rename can't break it.
+          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "Building $IMAGE:$VERSION"
+          docker build -t "$IMAGE:$VERSION" -t "$IMAGE:latest" .
+
+          # Prove the image actually starts before publishing it. The entrypoint
+          # is an stdio MCP server, so it blocks waiting on stdin — feed it a
+          # JSON-RPC initialize and require a response rather than just checking
+          # the container didn't exit.
+          echo "Smoke-testing the image..."
+          REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}'
+          OUT="$(echo "$REQ" | timeout 60 docker run -i --rm "$IMAGE:$VERSION" 2>/dev/null | head -1 || true)"
+          echo "response: ${OUT:0:200}"
+          echo "$OUT" | grep -q '"jsonrpc"' || { echo "::error::Image did not answer an MCP initialize over stdio — not publishing."; exit 1; }
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push the image
+        run: |
+          VERSION="${{ needs.detect-version.outputs.version }}"
+          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          docker push "$IMAGE:$VERSION"
+          docker push "$IMAGE:latest"
+          echo "Published $IMAGE:$VERSION and :latest"
 
   # ── Step 4b: Build and attach Claude Desktop extension (.mcpb) ─────────
   # One-click local install for Claude Desktop (Settings → Extensions).
   # Stages the exact npm-pack payload + the one production dep, stamps the
   # manifest template, and packs with the official @anthropic-ai/mcpb tool
   # (its schema is strict — the template must contain no unknown keys).
+  # npm pack, npm install and npx run here without credentials; attach-assets
+  # uploads the bundle. @implements docguard.release-least-privilege#FR-004
   build-mcpb:
     needs: [detect-version, create-release]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
 
@@ -178,14 +298,81 @@ jobs:
           sed "s/__VERSION__/${VERSION}/" "$GITHUB_WORKSPACE/mcpb/manifest.template.json" > manifest.json
           npx -y @anthropic-ai/mcpb pack . "/tmp/docguard-v${VERSION}.mcpb"
 
-      - name: Upload to release
+      - name: Hand the bundle to attach-assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: claude-desktop-bundle
+          path: /tmp/docguard-v${{ needs.detect-version.outputs.version }}.mcpb
+          if-no-files-found: error
+          retention-days: 3
+
+  # ── Step 4d: Attach the built assets to the GitHub Release ─────────────
+  # The only job here that writes release assets. It checks nothing out and
+  # runs no build: it receives the files the read-only jobs produced.
+  # @implements docguard.release-least-privilege#FR-004
+  attach-assets:
+    needs: [detect-version, create-release, build-extension, build-mcpb]
+    if: needs.detect-version.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Receive the built assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/assets
+          merge-multiple: true
+
+      - name: Upload to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ needs.detect-version.outputs.version }}"
+          ls -l "$RUNNER_TEMP/assets"
           gh release upload "v${VERSION}" \
-            "/tmp/docguard-v${VERSION}.mcpb" \
-            --clobber
+            "$RUNNER_TEMP/assets/spec-kit-docguard-v${VERSION}.zip" \
+            "$RUNNER_TEMP/assets/docguard-v${VERSION}.mcpb" \
+            --clobber --repo "${{ github.repository }}"
+
+  # ── Step 5b: Homebrew tap ──────────────────────────────────────────────
+  # Renders packaging/homebrew/docguard.rb from the PUBLISHED tarball (checked
+  # against npm's dist.integrity) and pushes it to raccioly/homebrew-tap with a
+  # write deploy key scoped only to that tap. One-time setup: add a write deploy
+  # key to raccioly/homebrew-tap and store its private half as the Actions
+  # secret HOMEBREW_TAP_DEPLOY_KEY in this repository. Until then the job warns
+  # once per release and skips.
+  # @implements docguard.release-readiness#FR-004
+  publish-homebrew:
+    needs: [detect-version, publish-npm]
+    if: >-
+      !cancelled()
+      && (needs.detect-version.outputs.brew_missing == 'true'
+          || (needs.detect-version.outputs.changed == 'true' && needs.publish-npm.result == 'success'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Render the formula from the published tarball and publish the tap
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          if [ -z "${HOMEBREW_TAP_DEPLOY_KEY}" ]; then
+            MSG="Homebrew tap not updated for v${VERSION}: add a write deploy key to raccioly/homebrew-tap and store its private half as the Actions secret HOMEBREW_TAP_DEPLOY_KEY here. The 10-minute sweep then publishes it."
+            echo "::warning::$MSG"
+            echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          node .github/scripts/homebrew-formula.mjs --version "$VERSION" --out "$RUNNER_TEMP/docguard.rb" --wait 900
+          .github/scripts/publish-homebrew-tap.sh "$VERSION" "$RUNNER_TEMP/docguard.rb"
 
   # ── Step 5: Publish to npm ─────────────────────────────────────────────
   publish-npm:
@@ -200,24 +387,119 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: 20
-          registry-url: 'https://registry.npmjs.org'
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # MUST be >= 22.14.0. npm Trusted Publishing (OIDC) requires
+          # npm CLI >= 11.5.1 AND Node >= 22.14.0, per npm's own docs.
+          # This job ran Node 20 for five straight failed releases
+          # (v0.34.1 - v0.34.5): below that floor npm never even ATTEMPTS the
+          # OIDC exchange, it just falls through to token auth. That produced
+          # two red herrings in sequence -- E404 "not found or you do not have
+          # permission" while an empty _authToken was present, then ENEEDAUTH
+          # once it wasn't -- neither of which names the actual cause.
+          node-version: 24
+          # NO registry-url, deliberately, and this combination has never
+          # actually been tried before. Tracing every failed run:
+          #   v0.34.4  Node 20 + registry-url  -> E404      (Node too old for
+          #                                                  OIDC; empty token
+          #                                                  used instead)
+          #   v0.34.5  Node 20 + no registry   -> ENEEDAUTH (no token at all,
+          #                                                  Node still too old)
+          #   v0.34.6  Node 24 + registry-url  -> E404      (Node fine, but the
+          #                                                  empty _authToken
+          #                                                  setup-node writes
+          #                                                  took the token path)
+          # Each run had exactly ONE of the two blockers. Node >= 22.14 clears
+          # the OIDC floor; omitting registry-url stops setup-node writing
+          # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`, which with
+          # NODE_AUTH_TOKEN unset expands to an EMPTY token that npm still
+          # treats as configured auth. npm defaults to registry.npmjs.org
+          # anyway, so nothing is lost by omitting it.
 
-      - name: Publish (with provenance)
-        run: npm publish --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Belt and braces: Node 24 already bundles npm >= 11.5.1, but pin
+      # explicitly so a runner-image change can't silently drop below the
+      # floor. npm@11 (not @latest) -- npm 12 raised its own Node floor, and
+      # an unpinned "latest" is exactly how bug-258 happened.
+      - run: npm install -g npm@11
 
-  # ── Step 6: Publish to PyPI ────────────────────────────────────────────
-  publish-pypi:
-    needs: [detect-version, test, create-release]
+      # Assert the OIDC preconditions up front, rather than discovering a
+      # violation three minutes later as an unrelated-looking auth error.
+      - name: Assert Trusted Publishing preconditions
+        run: |
+          NPM_V=$(npm --version)
+          echo "node=$(node -p 'process.versions.node') npm=$NPM_V"
+          node -e '
+            const [maj, min] = process.versions.node.split(".").map(Number);
+            if (!(maj > 22 || (maj === 22 && min >= 14))) {
+              console.error(`::error::Node ${process.versions.node} is below the 22.14.0 floor npm Trusted Publishing requires. OIDC is silently not attempted below it and publish fails as an auth error.`);
+              process.exit(1);
+            }
+          '
+          node -e '
+            const v = process.argv[1].split(".").map(Number);
+            if (!(v[0] > 11 || (v[0] === 11 && (v[1] > 5 || (v[1] === 5 && v[2] >= 1))))) {
+              console.error(`::error::npm ${process.argv[1]} is below the 11.5.1 floor npm Trusted Publishing requires.`);
+              process.exit(1);
+            }
+          ' "$NPM_V"
+          if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            echo "::error::ACTIONS_ID_TOKEN_REQUEST_URL is unset — this job lacks id-token: write, so no OIDC token can be minted."
+            exit 1
+          fi
+          echo "OIDC preconditions satisfied."
+
+      # Diagnostics. Six releases have failed here on a generic 404 that never
+      # names the real cause, so capture the auth state BEFORE publishing
+      # rather than inferring it from the failure afterwards.
+      - name: Diagnose npm auth state
+        run: |
+          echo "--- versions ---"
+          echo "node=$(node -p 'process.versions.node')  npm=$(npm --version)"
+          echo "--- OIDC env present? (values intentionally not printed) ---"
+          [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ] && echo "ACTIONS_ID_TOKEN_REQUEST_URL: set" || echo "ACTIONS_ID_TOKEN_REQUEST_URL: MISSING"
+          [ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ] && echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN: set" || echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN: MISSING"
+          echo "--- resolved registry ---"
+          npm config get registry
+          echo "--- .npmrc files (token VALUES redacted, presence shown) ---"
+          USERCONFIG=$(npm config list | sed -n 's/^userconfig = "\(.*\)"$/\1/p')
+          for f in "$USERCONFIG" ".npmrc" "$HOME/.npmrc"; do
+            if [ -n "$f" ] && [ -f "$f" ]; then
+              echo "  [$f]"
+              sed -E 's/(_authToken=).*/\1<REDACTED-OR-EMPTY>/' "$f" | sed 's/^/    /'
+            else
+              echo "  [$f] (absent)"
+            fi
+          done
+
+      # No --provenance flag and no NODE_AUTH_TOKEN: under Trusted Publishing
+      # npm generates provenance attestations automatically, and the OIDC
+      # exchange against the trusted-publisher connection on npmjs.com
+      # (raccioly/docguard -> release.yml) IS the authentication.
+      # --loglevel verbose so that if this fails again, the log shows which
+      # auth path npm chose instead of leaving it to inference.
+      - name: Publish (provenance is automatic under Trusted Publishing)
+        run: npm publish --loglevel verbose
+
+  # ── Step 6: Build, then publish to PyPI ───────────────────────────────
+  # The build (pip, setuptools, the repository's packaging) runs without any
+  # credential and hands dist/ over as an artifact; the publishing job only
+  # downloads it and holds the OIDC permission. PyPI's trusted publisher is
+  # bound to this workflow file and the `pypi` environment, not to a job name.
+  # @implements docguard.release-least-privilege#FR-004
+  build-pypi:
+    needs: [detect-version, test]
+    if: needs.detect-version.outputs.changed == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
 
@@ -225,20 +507,69 @@ jobs:
         run: |
           VERSION="${{ needs.detect-version.outputs.version }}"
           sed -i "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
-          echo "Publishing version $VERSION"
+          echo "Building version $VERSION"
           grep 'version' pyproject.toml
 
       - name: Install build tools
-        run: pip install build twine
+        run: pip install build
 
       - name: Build
         run: python -m build
 
-      - name: Publish
-        run: python -m twine upload dist/*
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      - name: Hand dist/ to publish-pypi
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pypi-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 3
+
+  publish-pypi:
+    needs: [detect-version, create-release, build-pypi]
+    runs-on: ubuntu-latest
+    # PyPI Trusted Publishing (OIDC) — same rationale as publish-npm: a stored
+    # API token is a credential that expires silently and takes the release
+    # pipeline down with it (see bug-256: NPM_TOKEN expired and cost seven
+    # releases to diagnose). PYPI_API_TOKEN was last rotated 2026-03-15 and was
+    # the next one due to do exactly that. Nothing here can expire.
+    #
+    # `environment` MUST match the Environment name configured in the PyPI
+    # trusted publisher, and `id-token: write` is what mints the OIDC token.
+    # Mirrors the working setup in raccioly/websec-validator's publish.yml.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Receive the built distribution
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pypi-dist
+          path: dist/
+
+      # Assert the OIDC precondition before publishing, rather than finding out
+      # via an auth error that doesn't name the cause (the npm lesson).
+      - name: Assert OIDC token is available
+        run: |
+          if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            echo "::error::ACTIONS_ID_TOKEN_REQUEST_URL is unset — this job lacks id-token: write, so PyPI Trusted Publishing cannot authenticate."
+            exit 1
+          fi
+          echo "OIDC token endpoint available; publishing via Trusted Publishing."
+
+      # No TWINE_USERNAME/TWINE_PASSWORD: the OIDC exchange against the trusted
+      # publisher configured on PyPI (raccioly / docguard / release.yml /
+      # environment: pypi) IS the authentication.
+      # v1.14.2. Pinned by COMMIT sha (dereferenced from the annotated tag, not
+      # the tag object's own sha -- those differ for annotated tags and pinning
+      # the wrong one does not resolve).
+      #
+      # Do NOT pin this back to the older release/v1 sha used by
+      # raccioly/websec-validator: that build's bundled twine rejects
+      # `Metadata-Version: 2.5`, which current setuptools/build now emits --
+      # "InvalidDistribution: '2.5' is not a valid metadata version". v0.34.8
+      # failed exactly there. websec-validator still carries that old pin and
+      # will hit the same wall whenever its setuptools moves forward.
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
 
   # ── Step 7: Prepare Spec Kit community catalog submission ──────────────
   # Per spec-kit maintainer guidance (github/spec-kit#2707) and spec-kit's
@@ -250,7 +581,7 @@ jobs:
   # builds a prefilled issue-form link and opens a one-click reminder issue
   # in THIS repo. A human submits the real form (so labels/assignment fire).
   sync-catalog:
-    needs: [detect-version, build-extension, publish-npm, publish-pypi]
+    needs: [detect-version, attach-assets, publish-npm, publish-pypi]
     if: needs.detect-version.outputs.changed == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -258,7 +589,9 @@ jobs:
       issues: write # reminder issue in THIS repo only — never github/spec-kit
     steps:
       - name: Checkout docguard repo
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Get version and metadata
         id: meta
@@ -282,7 +615,6 @@ jobs:
         run: |
           VERSION="${{ steps.meta.outputs.version }}"
           SUBMIT_URL=$(cat /tmp/submit-url.txt)
-          TITLE="📦 Submit DocGuard v${VERSION} to the spec-kit community catalog"
 
           # Compose the reminder body: one-click prefilled form link + the full
           # field-by-field body as a paste fallback (URL prefill can truncate).
@@ -308,21 +640,7 @@ jobs:
             echo "</details>"
           } > /tmp/reminder.md
 
-          # Idempotent per-version: refresh the existing reminder, else open one.
-          EXISTING=$(gh issue list \
-            --repo "$GITHUB_REPOSITORY" \
-            --state open \
-            --search "in:title \"DocGuard v${VERSION}\" spec-kit catalog" \
-            --json number,title \
-            --jq "[.[] | select(.title | contains(\"v${VERSION}\"))][0].number" 2>/dev/null || echo "")
-
-          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
-            gh issue edit "$EXISTING" --repo "$GITHUB_REPOSITORY" --body-file /tmp/reminder.md
-            echo "✅ Refreshed reminder issue #${EXISTING}"
-          else
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file /tmp/reminder.md
-            echo "✅ Opened catalog-submission reminder issue"
-          fi
+          bash .github/scripts/upsert-catalog-reminder.sh "$VERSION" /tmp/reminder.md
 
       - name: Write run summary
         run: |

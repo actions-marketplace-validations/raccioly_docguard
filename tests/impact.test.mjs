@@ -13,6 +13,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { fixtureGit } from './helpers/git.mjs';
 
 const CLI = join(process.cwd(), 'cli/docguard.mjs');
 
@@ -27,14 +28,14 @@ function makeRepo(files) {
 }
 
 function gitInit(dir) {
-  spawnSync('git', ['init', '-q'], { cwd: dir });
-  spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'add', '-A'], { cwd: dir });
-  spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { cwd: dir });
+  fixtureGit(dir, ['init', '-q']);
+  fixtureGit(dir, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'add', '-A']);
+  fixtureGit(dir, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init']);
 }
 
 function commit(dir, msg) {
-  spawnSync('git', ['add', '-A'], { cwd: dir });
-  spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', msg], { cwd: dir });
+  fixtureGit(dir, ['add', '-A']);
+  fixtureGit(dir, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', msg]);
 }
 
 describe('docguard impact', () => {
@@ -81,6 +82,23 @@ describe('docguard impact', () => {
       { cwd: dir, encoding: 'utf-8' });
     assert.match(r.stdout, /No canonical doc/i,
       'orphaned file should be highlighted');
+  });
+
+  it('pins the three match kinds for a changed file (docguard.mcp-doc-tools#FR-003)', () => {
+    dir = makeRepo({
+      'package.json': JSON.stringify({ name: 't', version: '0.0.0' }),
+      'src/routes/users.ts': 'x',
+      'docs-canonical/ARCHITECTURE.md': '# A\nPath: src/routes/users.ts.\n',
+      'docs-canonical/DATA-MODEL.md': '# D\nBase: users.ts.\n',
+      'docs-canonical/SECURITY.md': '# S\nModule: the `users` module.\n',
+      '.docguard.json': JSON.stringify({ projectName: 't', profile: 'starter', version: '0.5' }),
+    });
+    gitInit(dir);
+    writeFileSync(join(dir, 'src/routes/users.ts'), 'y');
+    commit(dir, 'change');
+    const data = JSON.parse(spawnSync('node', [CLI, 'impact', '--since', 'HEAD~1', '--format', 'json'], { cwd: dir, encoding: 'utf-8' }).stdout);
+    // One doc per match kind (path, basename, backticked module): all three are affected.
+    assert.deepEqual(data.affectedDocs.map(d => d.doc).sort(), ['ARCHITECTURE.md', 'DATA-MODEL.md', 'SECURITY.md']);
   });
 
   it('--format json emits parseable structured output', () => {

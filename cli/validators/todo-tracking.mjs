@@ -1,8 +1,9 @@
 /**
  * TODO/FIXME Tracking Validator — Ensures code annotations are documented
  *
- * Scans source files for TODO:, FIXME:, HACK:, XXX: annotations and checks
- * if they are tracked in documentation (ROADMAP.md, CURRENT-STATE.md, etc.).
+ * Scans source-file comments for debt tags (todo / fixme / hack / xxx, with a
+ * trailing colon or paren) and checks if they are tracked in documentation
+ * (ROADMAP.md, CURRENT-STATE.md, etc.).
  *
  * Also detects skipped tests without explanation.
  *
@@ -13,12 +14,26 @@
  * which uses tiered issue classification for code hygiene.
  *
  * Zero NPM runtime dependencies — pure Node.js built-ins only.
+ *
+ * @implements docguard.ignore-and-todo-parsing#FR-002
+ * @implements docguard.ignore-and-todo-parsing#FR-003
+ * @implements docguard.ignore-and-todo-parsing#FR-004
+ * @implements docguard.todo-quoted-forms#FR-001
+ * @implements docguard.todo-quoted-forms#FR-002
+ * @implements docguard.todo-quoted-forms#FR-003
+ * @implements docguard.todo-quoted-forms#FR-004
+ * @implements docguard.todo-quoted-forms#FR-005
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { resolve, join, relative, extname } from 'node:path';
 import { shouldIgnore, walkFiles as sharedWalkFiles } from '../shared-ignore.mjs';
+import { maskCodeSpans } from '../shared-html-comments.mjs';
 import { mkFinding, resultFromFindings } from '../findings.mjs';
+import { findDocsByName } from '../shared-doc-roles.mjs';
+import { parseJsTs, walk } from '../scanners/js-ast.mjs';
+import { realComments } from '../scanners/anchor-tags.mjs';
+import { languageOf } from '../scanners/pattern-lexer.mjs';
 
 const IGNORE_DIRS = new Set([
   'node_modules', '.git', '.next', 'dist', 'build', 'coverage',
@@ -38,12 +53,31 @@ const TEST_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx']);
 
 // TEMP must be the standalone word — `(?![A-Za-z])` excludes TEMPLATE, TEMPORARY,
 // TEMPO, TEMPEST, etc. (the old `(?!late|orar)` only caught the first two).
-const TODO_PATTERN = /\b(TODO|FIXME|HACK|XXX|TEMP(?![A-Za-z])|WORKAROUND)\s*[(:]/;
-const TODO_EXTRACT = /\b(TODO|FIXME|HACK|XXX|TEMP(?![A-Za-z])|WORKAROUND)\s*[:(]?\s*(.+)/;
+//
+// Two forms (docguard.ignore-and-todo-parsing#FR-002–FR-004):
+//   - Marked, anywhere in a comment: any keyword with a separator or author —
+//     `TODO: …`, `HACK - …`, `TEMP(ana) …`, `FIXME(bo): …`.
+//   - Bare, TODO / FIXME only, and only as the comment's FIRST word:
+//     `// TODO fix retries`. As a later word the keyword is prose ("the TODO
+//     list", "SKIP/NOTE/TODO/FIXME prefixes"), and `<!-- TODO -->` is an empty
+//     placeholder — both were false findings on this repository's own code.
+// HACK / XXX / TEMP / WORKAROUND are ordinary words ("TEMP directory", "no HACK
+// needed"), so they never match bare. A parenthesised author is stripped from
+// the reported text — `TODO(ana): …` used to be reported as "ana): …".
+const SEP = String.raw`\s*(?::|-(?=\s))`;
+const AUTHOR = String.raw`\([^)]*\)`;
+const KEYWORDS = String.raw`TODO|FIXME|HACK|XXX|TEMP(?![A-Za-z])|WORKAROUND`;
+const TODO_PREFILTER = /\b(?:TODO|FIXME|HACK|XXX|TEMP(?![A-Za-z])|WORKAROUND)/;
+const TODO_MARKED = new RegExp(String.raw`\b(?:${KEYWORDS})(?:${AUTHOR}(?:${SEP})?|${SEP})\s*\S`);
+const TODO_BARE_LEADING = new RegExp(String.raw`^[\s*]*(?:TODO|FIXME)(?:${AUTHOR})?\s+(?!-->|\*\/)\S`);
+const TODO_EXTRACT = new RegExp(
+  String.raw`\b(${KEYWORDS})(?:${AUTHOR})?(?:${SEP})?\s*(.+)`,
+);
+const isTodoAnnotation = commentText => TODO_MARKED.test(commentText) || TODO_BARE_LEADING.test(commentText);
 
-// Matches a comment-opening marker. Real TODOs live in comments — restricting
-// matches to text AFTER a comment marker prevents false positives from regex
-// literals or strings that happen to contain a TODO keyword.
+// Matches a comment-opening marker, for the line scanner that reads files in
+// languages the string-aware comment reader does not know (.vue, .svelte,
+// .astro). It cannot tell a marker inside a string from a real one.
 //   //  — JS/TS/C/C++/Rust/Go/Java line comment
 //   #   — Python/Ruby/shell/YAML
 //   /*  — JS/C/C++ block comment open
@@ -60,9 +94,52 @@ function commentPortion(line) {
   return m ? line.slice(m.index + m[0].length) : null;
 }
 
+/**
+ * The comment lines of a source file, one entry per line of each comment.
+ * Comments come from the reader requirement tags use, so a keyword inside a
+ * string, template or regex is never read (docguard.requirement-anchors#FR-005;
+ * docguard.todo-quoted-forms#FR-003, FR-004). A language that reader does not
+ * know is scanned by line.
+ * @returns {{ text: string, line: number }[]}
+ */
+function commentLines(content, relPath) {
+  if (!languageOf(relPath)) {
+    return content.split('\n').flatMap((line, i) => {
+      const text = commentPortion(line);
+      return text === null ? [] : [{ text, line: i + 1 }];
+    });
+  }
+  return realComments(content, relPath)
+    .flatMap(c => c.text.split('\n').map((text, k) => ({ text, line: c.line + k })));
+}
+
+// A keyword inside an inline code span is a quotation of the form, not an
+// annotation: a comment documenting the accepted forms quotes them in
+// backticks (docguard.todo-quoted-forms#FR-001). Spans follow the one-line
+// CommonMark rule the Markdown readers use (maskCodeSpans), so an unmatched
+// backtick is literal and a keyword after it still counts. The placeholder is
+// neither space nor word: offsets still index the original line, word
+// boundaries hold, and an annotation whose text is all code keeps it.
+const QUOTED = '\u0001';
+
+/**
+ * The annotation on one comment line, or null. The spec 019 patterns run on
+ * the line with its code spans masked; keyword and text are cut from the
+ * original line at the first keyword outside a span, so the reported text
+ * reads as written (docguard.todo-quoted-forms#FR-002).
+ */
+function annotationOn(commentText) {
+  const masked = maskCodeSpans(commentText, QUOTED);
+  if (!isTodoAnnotation(masked)) return null;
+  const at = masked.match(TODO_EXTRACT);
+  if (!at) return null;
+  const [, keyword, text] = commentText.slice(at.index).match(TODO_EXTRACT);
+  return { keyword: keyword.toUpperCase(), text: text.trim() };
+}
+
 // Test skip patterns for common test frameworks
 const SKIP_PATTERNS = [
-  /\btest\.skip\s*\(/,
+  /\btest\.(?:skip|fixme)\s*\(/,
   /\bit\.skip\s*\(/,
   /\bdescribe\.skip\s*\(/,
   /\bxit\s*\(/,
@@ -73,8 +150,124 @@ const SKIP_PATTERNS = [
   /\bit\.todo\s*\(/,
 ];
 
-// Skip explanation patterns (comments that justify the skip)
-const SKIP_REASON_PATTERN = /\/\/\s*(REASON|SKIP|TODO|FIXME|NOTE|WHY)\s*:/i;
+function hasReasonText(value) {
+  return /(?:REASON|SKIP|TODO|FIXME|NOTE|WHY)\s*:[\s\S]*\S/i.test(value);
+}
+
+function hasAdjacentReason(content, call, comments) {
+  const ordered = [...comments].sort((a, b) => a.start - b.start);
+  return ordered.some((comment, index) => {
+    if (comment.end <= call.start) {
+      // A trailing comment belongs to the preceding statement.
+      const lineStart = content.lastIndexOf('\n', comment.start - 1) + 1;
+      if (!/^\s*$/.test(content.slice(lineStart, comment.start))) return false;
+      const gap = content.slice(comment.end, call.start);
+      if (call.loc.start.line - comment.loc.end.line !== 1 || !/^\s*$/.test(gap)) return false;
+
+      // Babel represents adjacent // lines as separate comments. Walk backward
+      // across only contiguous, full-line comments so `// REASON:` can introduce
+      // a multiline explanation without borrowing a disconnected annotation.
+      let first = index;
+      while (first > 0) {
+        const previous = ordered[first - 1];
+        const current = ordered[first];
+        if (previous.type !== 'CommentLine' || current.type !== 'CommentLine') break;
+        if (current.loc.start.line - previous.loc.end.line !== 1) break;
+        const previousLineStart = content.lastIndexOf('\n', previous.start - 1) + 1;
+        if (!/^\s*$/.test(content.slice(previousLineStart, previous.start))) break;
+        if (!/^\s*$/.test(content.slice(previous.end, current.start))) break;
+        first--;
+      }
+      return hasReasonText(ordered.slice(first, index + 1).map(item => item.value).join('\n'));
+    }
+    if (comment.start >= call.end && comment.loc.start.line === call.loc.end.line) {
+      return hasReasonText(comment.value) && /^[\s;]*$/.test(content.slice(call.end, comment.start));
+    }
+    return false;
+  });
+}
+
+function skippedCalls(content, filename) {
+  const { ast, ok } = parseJsTs(content, filename);
+  if (!ok || ast.errors?.length) return null;
+  const calls = [];
+  walk(ast, node => {
+    if (node.type !== 'CallExpression') return;
+    const callee = content.slice(node.callee.start, node.callee.end).replace(/\s/g, '');
+    if (!/^(?:(?:test(?:\.describe)?|it|describe)\.(?:skip|todo)|test\.fixme|xit|xdescribe|xtest)$/.test(callee)) return;
+    const [condition, reason] = node.arguments;
+    // Playwright's conditional overload takes a reason in argument two.
+    // A title followed by a callback is a declaration, not an explanation.
+    const explicitReason = /^(?:test\.skip|test\.fixme)$/.test(callee) &&
+      condition && condition.type !== 'StringLiteral' && condition.type !== 'TemplateLiteral' &&
+      (reason?.type === 'StringLiteral' && reason.value.trim().length > 0 ||
+        reason?.type === 'TemplateLiteral' && reason.expressions.length === 0 &&
+        reason.quasis.some(part => (part.value.cooked ?? part.value.raw).trim().length > 0));
+    calls.push({ line: node.loc.start.line, hasReason: Boolean(explicitReason) ||
+      hasAdjacentReason(content, node, ast.comments || []) });
+  });
+  return calls;
+}
+
+// Parser failure/unavailability cannot turn an unexplained skip into a pass.
+function fallbackSkippedCalls(content) {
+  const lines = content.split('\n');
+  const codeLines = maskJsNonCode(content).split('\n');
+  const calls = [];
+  for (let i = 0; i < codeLines.length; i++) {
+    if (!SKIP_PATTERNS.some(p => p.test(codeLines[i]))) continue;
+    // Only a contiguous block of directly preceding line comments is
+    // unambiguous without a parser. Blank lines and code sever ownership.
+    const commentBlock = [];
+    for (let cursor = i - 1; cursor >= 0 && /^\s*\/\//.test(lines[cursor] || ''); cursor--) {
+      commentBlock.unshift(lines[cursor].replace(/^\s*\/\//, ''));
+    }
+    calls.push({ line: i + 1, hasReason: hasReasonText(commentBlock.join('\n')) });
+  }
+  return calls;
+}
+
+/**
+ * Preserve line structure while hiding comments and string/template literals.
+ * This keeps the parser-failure fallback from treating fixture text such as
+ * `"test.skip()"` as executable code. Template interpolation is intentionally
+ * masked with the surrounding template: on malformed input it is safer to miss
+ * that uncommon form than to report prose as a real skipped test.
+ */
+function maskJsNonCode(content) {
+  let state = 'code';
+  let escaped = false;
+  let out = '';
+  for (let i = 0; i < content.length; i++) {
+    const ch = content[i];
+    const next = content[i + 1];
+    if (state === 'code') {
+      if (ch === '/' && next === '/') { out += '  '; i++; state = 'line-comment'; continue; }
+      if (ch === '/' && next === '*') { out += '  '; i++; state = 'block-comment'; continue; }
+      if (ch === "'") { out += ' '; state = 'single'; escaped = false; continue; }
+      if (ch === '"') { out += ' '; state = 'double'; escaped = false; continue; }
+      if (ch === '`') { out += ' '; state = 'template'; escaped = false; continue; }
+      out += ch;
+      continue;
+    }
+    if (ch === '\n') {
+      out += '\n';
+      if (state === 'line-comment') state = 'code';
+      if (state === 'single' || state === 'double') escaped = false;
+      continue;
+    }
+    if (state === 'block-comment' && ch === '*' && next === '/') {
+      out += '  '; i++; state = 'code'; continue;
+    }
+    if (state === 'line-comment' || state === 'block-comment') { out += ' '; continue; }
+    const quote = state === 'single' ? "'" : state === 'double' ? '"' : '`';
+    if (!escaped && ch === quote) { out += ' '; state = 'code'; continue; }
+    if (!escaped && ch === '\\') { escaped = true; out += ' '; continue; }
+    escaped = false;
+    out += ' ';
+  }
+  return out;
+}
 
 /**
  * Main validator — checks for untracked TODOs and unexplained test skips.
@@ -139,29 +332,8 @@ function checkSkippedTests(projectDir, config) {
     const hasSkip = SKIP_PATTERNS.some(p => p.test(content));
     if (!hasSkip) continue;
 
-    const lines = content.split('\n');
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-
-      // Check if this line has a test skip pattern
-      const isSkipped = SKIP_PATTERNS.some(p => p.test(line));
-      if (!isSkipped) continue;
-
-      // Check surrounding lines (3 above, 1 below, and inline) for explanation
-      // Developers commonly place block comments above the skip call
-      const surroundingLines = [];
-      for (let j = Math.max(0, i - 3); j <= Math.min(lines.length - 1, i + 1); j++) {
-        surroundingLines.push(lines[j]);
-      }
-
-      // Also check for block comment pattern: /* REASON: ... */ or /** ... REASON: ... */
-      const blockCommentPattern = /\/\*[\s\S]*?(REASON|SKIP|TODO|FIXME|NOTE|WHY)\s*:/i;
-
-      const hasReason =
-        surroundingLines.some(l => SKIP_REASON_PATTERN.test(l)) ||
-        blockCommentPattern.test(surroundingLines.join('\n'));
-
+    const calls = skippedCalls(content, relPath) ?? fallbackSkippedCalls(content);
+    for (const { line, hasReason } of calls) {
       if (hasReason) {
         skippedWithReason++;
       } else {
@@ -170,12 +342,12 @@ function checkSkippedTests(projectDir, config) {
           code: 'TDO001',
           validator: 'todoTracking',
           severity: 'warn',
-          message: `Skipped test without explanation at ${relPath}:${i + 1}. ` +
+          message: `Skipped test without explanation at ${relPath}:${line}. ` +
             `Add a // REASON: comment explaining why the test is skipped`,
-          location: `${relPath}:${i + 1}`,
+          location: `${relPath}:${line}`,
           suggestion: {
             kind: 'fix',
-            text: 'Add a // REASON: comment on or up to 3 lines above the skip explaining why',
+            text: 'Add a // REASON: comment immediately above the skip explaining why',
             pragma: '// REASON: <why this test is skipped>',
           },
         }));
@@ -294,13 +466,22 @@ function checkUntrackedTodos(projectDir, config) {
  */
 function loadTrackingDocs(projectDir, config) {
   const docs = [];
+  // Where a project tracks work, by name rather than by exact path. Probing for
+  // literal paths missed `docs/ROADMAP.md`, `PLAN.md` and `TASKS.md`, and was
+  // case-insensitive only by accident — `existsSync('ROADMAP.md')` matches
+  // `roadmap.md` on macOS but not on Linux, so CI and a laptop disagreed about
+  // whether the same TODO was tracked.
+  const TRACKING_ALIASES = [
+    'roadmap', 'currentstate', 'todo', 'todos', 'backlog',
+    'plan', 'plans', 'tasks', 'milestones', 'worklog', 'changelog',
+  ];
+  const TRACKING_DIRS = ['', 'docs', 'doc', 'documentation', 'docs-canonical', 'docs-implementation'];
+
   const trackingFiles = [
-    'ROADMAP.md', 'CURRENT-STATE.md', 'TODO.md', 'BACKLOG.md',
-    'docs-canonical/ARCHITECTURE.md', 'CHANGELOG.md',
-    // v0.27 (field report #6): many projects keep the roadmap/backlog under
-    // docs-canonical/ — a TODO tracked there was wrongly read as "untracked".
-    'docs-canonical/ROADMAP.md', 'docs-canonical/CURRENT-STATE.md',
-    'docs-canonical/BACKLOG.md', 'docs-canonical/TODO.md',
+    ...findDocsByName(projectDir, TRACKING_ALIASES, TRACKING_DIRS),
+    // ARCHITECTURE is a tracking home only in the canonical sense; it is not a
+    // work list, so it stays an explicit entry rather than joining the aliases.
+    'docs-canonical/ARCHITECTURE.md',
     ...(config.todoTracking?.trackingFiles || []),
   ];
 
@@ -346,16 +527,8 @@ function findTestFiles(rootDir, dir, files, config) {
 const TEST_FILE_RE = /(^|\/)__tests?__\//;
 const TEST_NAME_RE = /(?:\.(?:test|spec)\.[cm]?[jt]sx?|(?:^|\/)test_[^/]*\.py|_test\.(?:py|go)|_spec\.rb|(?:^|\/)[^/]*_test\.rb)$/i;
 
-// The validator's own source file describes the keyword list in its docstring
-// and code. Skipping itself avoids self-referential false positives.
-const SELF_PATH = new URL(import.meta.url).pathname;
-
 function isTestFilePath(relPath) {
   return TEST_FILE_RE.test(relPath) || TEST_NAME_RE.test(relPath);
-}
-
-function isSelfPath(fullPath) {
-  return fullPath === SELF_PATH;
 }
 
 function findTodos(rootDir, dir, todos, config) {
@@ -381,8 +554,10 @@ function findTodos(rootDir, dir, todos, config) {
 
 /**
  * v0.15-P3: per-file TODO scan extracted so both the full-tree walker and
- * the --changed-only path can reuse it. Honors test-file filtering,
- * self-path skip, ignore patterns, and the TODO regex.
+ * the --changed-only path can reuse it. Honors test-file filtering, ignore
+ * patterns, and the TODO patterns. DocGuard's own source is scanned like any
+ * file, so the result does not depend on where DocGuard is installed
+ * (docguard.todo-quoted-forms#FR-005).
  */
 function _scanTodoFile(rootDir, full, todos, config) {
   const includeTests = config?.todoTracking?.includeTestFiles === true;
@@ -392,27 +567,14 @@ function _scanTodoFile(rootDir, full, todos, config) {
   const relPath = relative(rootDir, full);
 
   if (!includeTests && isTestFilePath(relPath)) return;
-  if (isSelfPath(full)) return;
   if (config && shouldIgnore(relPath, config, 'todoIgnore')) return;
 
   let content;
   try { content = readFileSync(full, 'utf-8'); } catch { return; }
-  if (!TODO_PATTERN.test(content)) return;
+  if (!TODO_PREFILTER.test(content)) return;
 
-  const lines = content.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const commentText = commentPortion(lines[i]);
-    if (commentText === null) continue;
-    if (TODO_PATTERN.test(commentText)) {
-      const match = commentText.match(TODO_EXTRACT);
-      if (match) {
-        todos.push({
-          keyword: match[1].toUpperCase(),
-          text: match[2].trim(),
-          file: relPath,
-          line: i + 1,
-        });
-      }
-    }
+  for (const { text, line } of commentLines(content, relPath)) {
+    const annotation = annotationOn(text);
+    if (annotation) todos.push({ ...annotation, file: relPath, line });
   }
 }

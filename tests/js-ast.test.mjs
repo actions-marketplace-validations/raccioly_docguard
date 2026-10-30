@@ -7,7 +7,7 @@
  */
 import { describe, it } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { parseJsTs, extractJsSchemaBodies, extractJsRouteCalls, extractJsRouteObjects, extractJsMountsAndImports, extractJsxRouteScreens } from '../cli/scanners/js-ast.mjs';
+import { parseJsTs, extractJsSchemaBodies, extractJsRouteCalls, extractJsRouteObjects, extractJsMountsAndImports, extractJsxRouteScreens, astTierAvailable } from '../cli/scanners/js-ast.mjs';
 
 describe('parseJsTs', () => {
   it('parses TypeScript with types + decorators', () => {
@@ -95,8 +95,9 @@ describe('extractJsSchemaBodies — balanced bodies (the brace-truncation fix)',
 });
 
 describe('extractJsRouteCalls — AST route registration (the routes migration)', () => {
-  it('matches ANY router receiver, not just app/router/server', () => {
+  it('matches receivers proven to be router instances', () => {
     const got = extractJsRouteCalls(
+      "const userRouter = Router(); const v1 = Router(); const r = Router();\n" +
       "userRouter.get('/users', list);\n" +
       "v1.post('/users', create);\n" +
       "r.delete('/users/:id', del);\n",
@@ -106,7 +107,9 @@ describe('extractJsRouteCalls — AST route registration (the routes migration)'
     assert.deepEqual(set, ['DELETE /users/:id', 'GET /users', 'POST /users']);
   });
 
-  it('survives multi-line calls and reads template-literal paths', () => {
+  // A template with a non-constant expression is unresolved, not `:param`
+  // (docguard.js-route-shapes#FR-007).
+  it('survives multi-line calls and lists a dynamic template path as unresolved', () => {
     const src = [
       'app.put(',
       '  "/items/:id",',
@@ -115,8 +118,9 @@ describe('extractJsRouteCalls — AST route registration (the routes migration)'
       ');',
       'app.get(`/items/${kind}`, list);',
     ].join('\n');
-    const set = extractJsRouteCalls(src, 'r.ts').map(x => `${x.method} ${x.path}`).sort();
-    assert.deepEqual(set, ['GET /items/:param', 'PUT /items/:id']);
+    const got = extractJsRouteCalls(src, 'r.ts');
+    assert.deepEqual(got.map(x => `${x.method} ${x.path}`).sort(), ['PUT /items/:id']);
+    assert.deepEqual(got.unresolved.map(u => u.line), [6]);
   });
 
   it('excludes non-route .get()/.post() (path must start with / or be *)', () => {
@@ -145,6 +149,16 @@ describe('extractJsRouteCalls — AST route registration (the routes migration)'
     assert.strictEqual(byPath['/a'], 'router');
     assert.strictEqual(byPath['/health'], 'app');
   });
+
+  it('does not treat chained HTTP client calls as route registrations', () => {
+    const got = extractJsRouteCalls(
+      "request(app).get('/api/items');\n" +
+      "createClient().post('/api/items');\n" +
+      "router.get('/api/items', list);\n",
+      'r.ts'
+    );
+    assert.deepEqual(got.map(x => `${x.method} ${x.path}`), ['GET /api/items']);
+  });
 });
 
 describe('extractJsMountsAndImports — mount-prefix resolution inputs', () => {
@@ -161,6 +175,7 @@ describe('extractJsMountsAndImports — mount-prefix resolution inputs', () => {
     assert.strictEqual(got.imports.tagRoutes, './routes/tags');
     const mounts = got.mounts.map(m => `${m.prefix}=${m.ident}`).sort();
     assert.deepEqual(mounts, ['/api/tags=tagRoutes', '/api/users=userRoutes']);
+    assert.ok(got.mounts.every(m => m.receiver === 'app'));
   });
 
   it('ignores non-string-literal (dynamic) mount prefixes', () => {
@@ -220,5 +235,11 @@ describe('extractJsxRouteScreens — React Router screens', () => {
 
   it('returns null on parse failure (caller falls back to the window regex)', () => {
     assert.strictEqual(extractJsxRouteScreens('not ) ( valid <', 'routes.tsx'), null);
+  });
+});
+
+describe('astTierAvailable', () => {
+  it('returns a boolean', () => {
+    assert.equal(typeof astTierAvailable(), 'boolean');
   });
 });

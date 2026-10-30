@@ -8,7 +8,7 @@ branding:
 
 inputs:
   command:
-    description: 'Command to run: audit, guard, score, diff, fix, sync'
+    description: 'Command to run: audit, guard, score, diff, fix, sync, spec-first (a pull request must name its governing spec or declare Spec-Exempt; needs actions/checkout with fetch-depth: 0)'
     required: false
     default: 'guard'
   format:
@@ -31,6 +31,10 @@ inputs:
     description: 'Node.js version to use'
     required: false
     default: '20'
+  docguard-version:
+    description: 'docguard-cli version to install. Empty (default) installs the version this action release was published with, so pinning raccioly/docguard@vX.Y.Z pins the CLI too. Set "latest" to follow npm.'
+    required: false
+    default: ''
   # ---- PR feedback (guard mode) ----
   annotations:
     description: 'When command=guard: emit inline annotations (::error/::warning) on the PR diff, one per finding, capped at 50.'
@@ -86,13 +90,25 @@ runs:
   using: 'composite'
   steps:
     - name: Setup Node.js
-      uses: actions/setup-node@v7
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
         node-version: ${{ inputs.node-version }}
 
+    # The CLI version travels with the action release: sync-release-version.mjs
+    # stamps DOCGUARD_RELEASED_VERSION on every release, so a pinned action ref
+    # never silently runs a newer CLI (docguard.release-readiness#FR-003).
     - name: Install DocGuard
       shell: bash
-      run: npm install -g docguard-cli@latest || npx docguard-cli --version
+      env:
+        DOCGUARD_RELEASED_VERSION: '0.45.1' # docguard:volatile (rewritten by each release)
+        DOCGUARD_VERSION_INPUT: ${{ inputs.docguard-version }}
+      run: |
+        VERSION="${DOCGUARD_VERSION_INPUT:-$DOCGUARD_RELEASED_VERSION}"
+        if ! printf '%s' "$VERSION" | grep -Eq '^([0-9]+\.[0-9]+\.[0-9]+|latest)$'; then
+          echo "::error::docguard-version must be x.y.z or latest, got '$VERSION'"; exit 1
+        fi
+        npm install -g "docguard-cli@$VERSION"
+        docguard --version
 
     - name: Run DocGuard
       id: run
@@ -108,6 +124,10 @@ runs:
         INPUT_FORMAT: ${{ inputs.format }}
         INPUT_FAIL_ON_WARNING: ${{ inputs.fail-on-warning }}
         INPUT_SCORE_THRESHOLD: ${{ inputs.score-threshold }}
+        # spec-first reads the PR description and base branch as data only.
+        PR_BODY: ${{ github.event.pull_request.body }}
+        BASE_REF: ${{ github.base_ref }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       run: |
         set +e
 
@@ -163,6 +183,22 @@ runs:
             exit 0
           fi
 
+          exit $EXIT_CODE
+        elif [ "$CMD" = "spec-first" ]; then
+          # @implements docguard.spec-first-gate#FR-010
+          # Compare against the PR base, or the default branch outside a PR.
+          # Uncovered (1) and inconclusive (2) both fail: a change that cannot
+          # be shown to name its spec is not a covered change.
+          BASE="${BASE_REF:-$DEFAULT_BRANCH}"
+          git fetch --no-tags --quiet origin "$BASE" 2>/dev/null
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/docguard-pr-body.txt"
+          npx docguard-cli specs require --since "origin/$BASE" --message-file "$RUNNER_TEMP/docguard-pr-body.txt" $FLAGS
+          EXIT_CODE=$?
+          if [ "$EXIT_CODE" = "1" ]; then
+            echo "::error::This change touches governed paths without naming its spec. Add a specs/<dir> path or Spec ID, or 'Spec-Exempt: <kind> — <reason>', to the PR description."
+          elif [ "$EXIT_CODE" = "2" ]; then
+            echo "::error::Spec-first check was inconclusive (base ref or history unavailable). Use actions/checkout with fetch-depth: 0."
+          fi
           exit $EXIT_CODE
         elif [ "$CMD" = "fix" ] || [ "$CMD" = "sync" ]; then
           # Handled by the fix step below — print marker and exit clean here so
@@ -277,7 +313,7 @@ runs:
 
     - name: Post Guard Summary to PR Comment
       if: always() && inputs.command == 'guard' && inputs.pr-comment == 'true' && github.event_name == 'pull_request'
-      uses: actions/github-script@v9
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       with:
         script: |
           // SECURITY: nothing dynamic is expression-interpolated into this
@@ -488,7 +524,7 @@ runs:
 
     - name: Post Fix Summary to PR Comment
       if: (inputs.command == 'fix' || inputs.command == 'sync') && inputs.comment-on-pr == 'true' && github.event_name == 'pull_request'
-      uses: actions/github-script@v9
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
         # SECURITY: read via process.env, not ${{ }} spliced into the JS source.
         # A value like '; maliciousJS; ' would otherwise break out of the string
@@ -537,7 +573,7 @@ runs:
 
     - name: Post Score to PR Comment
       if: inputs.command == 'score' && github.event_name == 'pull_request'
-      uses: actions/github-script@v9
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
         SCORE: ${{ steps.run.outputs.score }}
         GRADE: ${{ steps.run.outputs.grade }}

@@ -21,6 +21,9 @@
  * @req SC-M1-002 — no warning when sections match
  * @req SC-M1-003 — N/A when no canonical docs exist
  * @req SC-M1-004 — N/A when no source=code sections present in any doc
+ * @implements docguard.code-derived-diagrams#FR-006
+ * @implements docguard.code-derived-diagrams#FR-007
+ * @implements docguard.output-ux#FR-003
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
@@ -30,6 +33,8 @@ import { buildMemoryPlan } from '../scanners/memory-plan.mjs';
 import { getSection } from '../writers/sections.mjs';
 import { mkFinding, resultFromFindings } from '../findings.mjs';
 import { listCanonicalDocs } from '../shared-ignore.mjs';
+import { hasGeneratedMarker } from '../writers/api-reference.mjs';
+import { isMappedDocPath } from '../shared-doc-roles.mjs';
 
 /**
  * v0.18-P1 fast-path: cheap pre-flight to detect whether ANY canonical doc
@@ -139,6 +144,7 @@ export function validateGeneratedStaleness(projectDir, config = {}) {
 
   // Walk each doc's source=code sections and compare against on-disk content.
   let anySourceCodeSection = false;
+  const partialSections = [];
   const draftThresholdDays = (config.draftStalenessDays != null)
     ? Number(config.draftStalenessDays)
     : DRAFT_STALENESS_DAYS;
@@ -186,6 +192,15 @@ export function validateGeneratedStaleness(projectDir, config = {}) {
       // Doc Sections concern — not ours. Skip without counting.
       if (!onDisk) continue;
 
+      // docguard.code-derived-diagrams#FR-007: a section drawn from incomplete
+      // evidence (no Python interpreter here, an unreadable file) cannot say the
+      // committed one is stale, and must not flip a guard that another machine
+      // passes. Report it as unchecked instead; emit no regenerate fix.
+      if (sec.completeness === 'partial' && onDisk.attrs?.pinned === undefined) {
+        partialSections.push(`${basename(doc.path)} § ${sec.id} (${sec.partialReason})`);
+        continue;
+      }
+
       result.total++;
 
       // B5 (field report): a `pinned` attribute on the section's open marker
@@ -220,15 +235,19 @@ export function validateGeneratedStaleness(projectDir, config = {}) {
         ? ` (first drift at line ${firstDiff + 1} of section: "${(act[firstDiff] || '').slice(0, 60)}…" vs scanner: "${(exp[firstDiff] || '').slice(0, 60)}…")`
         : '';
 
+      // docguard.output-ux#FR-003: `sync --write` skips a doc that is neither
+      // marked generated nor mapped, so name the command that writes it.
+      const syncCmd = hasGeneratedMarker(content) || isMappedDocPath(config, doc.path)
+        ? 'docguard sync --write' : 'docguard sync --write --force';
       findings.push(mkFinding({
         code: 'GST002',
         validator: 'generatedStaleness',
         severity: 'warn',
-        message: `${basename(doc.path)} → section "${sec.id}" is stale${hint}. Run \`docguard sync --write\` to refresh code-truth sections. ` +
+        message: `${basename(doc.path)} → section "${sec.id}" is stale${hint}. Run \`${syncCmd}\` to refresh code-truth sections. ` +
           `If this section is intentionally hand-maintained (the scanner mislabeled it), pin it: ` +
           `add \`pinned="reason"\` to its \`<!-- docguard:section id=${sec.id} … -->\` marker.`,
         location: doc.path,
-        suggestion: { kind: 'fix', text: 'Refresh the code-truth section (or pin it if it is intentionally hand-maintained)', command: 'docguard sync --write' },
+        suggestion: { kind: 'fix', text: 'Refresh the code-truth section (or pin it if it is intentionally hand-maintained)', command: syncCmd },
       }));
       // v0.14-P3: structured fix so `docguard fix --write` can fix this
       // mechanically (no AI needed — scanner already produced the right body).
@@ -249,5 +268,11 @@ export function validateGeneratedStaleness(projectDir, config = {}) {
     return { ...result, applicable: false };
   }
 
-  return { ...resultFromFindings(findings, { passed: result.passed, total: result.total }), fixes: result.fixes };
+  return {
+    ...resultFromFindings(findings, { passed: result.passed, total: result.total }),
+    fixes: result.fixes,
+    ...(partialSections.length ? {
+      applicability: { status: 'partial', reason: `Not compared, evidence incomplete: ${partialSections.join('; ')}` },
+    } : {}),
+  };
 }

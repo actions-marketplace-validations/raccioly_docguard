@@ -6,20 +6,42 @@
  *   2. Requirement Traceability (V-Model): Requirement IDs in docs trace to tests
  *
  * Requirement traceability is opt-in by convention — if no requirement IDs are
- * found (REQ-001, FR-001, etc.), the check silently passes. Once you add IDs,
+ * defined or explicitly annotated (REQ-001, FR-001, etc.), the check silently passes. Once you add IDs,
  * DocGuard automatically enforces traceability.
  *
  * Inspired by ISO/IEC/IEEE 29119, IEEE 1016, and V-Model methodology.
  * V-Model concepts informed by spec-kit-v-model (github.com/leocamello/spec-kit-v-model).
+ * @implements docguard.document-lifecycle#FR-013
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { resolve, join, relative, basename, extname } from 'node:path';
-import { TRACE_MAP, TEST_PATTERNS, isTraceableSource } from '../shared-trace-patterns.mjs';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve, relative, basename, extname } from 'node:path';
+import { TRACE_MAP, isTraceableSource } from '../shared-trace-patterns.mjs';
 import { walkFiles as sharedWalkFiles, listCanonicalDocs } from '../shared-ignore.mjs';
+/** @implements docguard.adoption-workflow-integrity#FR-006 */
 import { mkFinding, resultFromFindings } from '../findings.mjs';
 import { tokenize } from '../shared-diff.mjs';
 import { rankBySimilarity } from '../shared-ir.mjs';
+import {
+  isTestSource,
+  resolveRequirementReferences as resolveRequirementReferencesShared,
+  scanTestFilesForReferences as scanTestFilesForReferencesShared,
+} from '../scanners/requirement-evidence.mjs';
+import {
+  DEFAULT_REQ_PATTERNS,
+  collectRequirementIdsFromContent,
+  requirementPatterns,
+} from '../shared-requirements.mjs';
+import { readRetirementManifest } from '../scanners/retirement-manifest.mjs';
+import { collectRequirementIds, getRequirementDocPaths } from '../scanners/requirement-docs.mjs';
+
+export { collectRequirementIds };
+import { docAnnotationsIn } from '../scanners/doc-references.mjs';
+import {
+  parseSpecId,
+  trustedSpecLifecycleIndex,
+  uncommittedPlannedSpecLifecycleIndex,
+} from '../scanners/spec-registry.mjs';
 
 /**
  * Optional graphify interop (github.com/Graphify-Labs/graphify, MIT).
@@ -75,9 +97,7 @@ function loadGraphifyDocLinks(projectDir) {
 // requirement can be matched to the test that most likely already covers it
 // (TF-IDF cosine, VSM). Capped so a huge test suite can't blow up guard.
 function buildTestCorpus(projectDir, projectFiles, { maxFiles = 250, maxTokens = 400 } = {}) {
-  const testFiles = projectFiles.filter(f =>
-    TEST_PATTERNS.some(p => p.test(f)) || /__tests__\//.test(f) || /tests?\//.test(f)
-  ).slice(0, maxFiles);
+  const testFiles = projectFiles.filter(isTestSource).slice(0, maxFiles);
   const corpus = [];
   for (const relPath of testFiles) {
     try {
@@ -95,29 +115,6 @@ const IGNORE_DIRS = new Set([
 ]);
 
 
-// ──── Default requirement ID patterns ────
-// Users can override via config.traceability.requirementPattern
-// Includes spec-kit standard IDs: FR-xxx, SC-xxx, T-xxx
-const DEFAULT_REQ_PATTERNS = [
-  /\b(REQ)-(\d{2,4})\b/g,
-  /\b(FR)-(\d{2,4})\b/g,
-  /\b(NFR)-(\d{2,4})\b/g,
-  /\b(US)-(\d{2,4})\b/g,
-  /\b(STORY)-(\d{2,4})\b/g,
-  /\b(AC)-(\d{2,4})\b/g,
-  /\b(UC)-(\d{2,4})\b/g,
-  /\b(SYS)-(\d{2,4})\b/g,
-  /\b(ARCH)-(\d{2,4})\b/g,
-  /\b(MOD)-(\d{2,4})\b/g,
-  /\b(SC)-(\d{2,4})\b/g,     // Spec Kit: Success Criteria
-  // Spec Kit task IDs (T001, T002). Unlike the hyphenated IDs above, a bare
-  // `T350` over-matches prose (timeouts, model names, status codes), forcing
-  // spurious "untraced requirement" warnings. Anchor to the two contexts where
-  // a real task ID actually appears: a markdown checklist marker (`- [ ] T001`,
-  // the spec-kit tasks.md format) or a test annotation (`@req T001`/`@task`).
-  /(?<=\[[ xX]\]\s|@(?:req|task|covers)\s)(T)(\d{3,4})\b/g,
-];
-
 /**
  * Validate traceability — ensures canonical docs have corresponding source artifacts,
  * and requirement IDs trace through to test files.
@@ -134,7 +131,7 @@ export function validateTraceability(projectDir, config) {
   let total = 0;
 
   const docsDir = resolve(projectDir, 'docs-canonical');
-  if (!existsSync(docsDir)) {
+  if (!existsSync(docsDir) && getRequirementDocPaths(projectDir, config).length === 0) {
     // No docs-canonical dir at all — structure validator handles this
     return resultFromFindings([], { passed: 0, total: 0 });
   }
@@ -157,7 +154,7 @@ export function validateTraceability(projectDir, config) {
   // documented by) a canonical doc. It is the user-facing escape hatch when
   // a project's directory layout doesn't match the built-in TRACE_MAP globs
   // (e.g. a route file outside any `routes/` / `app/api/` tree). The
-  // annotation is also shown in templates and templates/commands docs, so
+  // annotation is also shown in templates and the slash-command docs, so
   // users have been told it works — actually honoring it is the fix here.
   const docAnnotations = scanDocAnnotations(projectFiles, projectDir);
 
@@ -166,9 +163,14 @@ export function validateTraceability(projectDir, config) {
     // Skip docs not in the user's required list
     if (!requiredDocs.has(docName)) continue;
 
-    total++;
-    const docPath = resolve(docsDir, docName);
+    const configuredPath = (config.requiredFiles?.canonical || []).find(file => basename(file) === docName);
+    const docPath = configuredPath && (configuredPath.includes('/') || existsSync(resolve(projectDir, configuredPath)))
+      ? resolve(projectDir, configuredPath) : resolve(docsDir, docName);
     const docExists = existsSync(docPath);
+    // Discovering feature specs must not activate missing-canonical findings
+    // for a repository without a canonical home. Structure owns that absence.
+    if (!existsSync(docsDir) && !docExists) continue;
+    total++;
 
     if (!docExists) {
       findings.push(mkFinding({
@@ -176,7 +178,7 @@ export function validateTraceability(projectDir, config) {
         validator: 'traceability',
         severity: 'warn',
         message: `${docName} — required but missing, no traceability possible`,
-        location: `docs-canonical/${docName}`,
+        location: relative(projectDir, docPath),
         suggestion: { kind: 'fix', text: 'Create the required doc from the professional template', command: 'docguard init' },
       }));
       continue;
@@ -203,6 +205,13 @@ export function validateTraceability(projectDir, config) {
       }
     }
 
+    // A doc that names an existing source file or directory is linked to it:
+    // a stronger signal than a project-wide filename glob, and the one every
+    // generated doc carries (docguard.generated-docs-consistency#FR-004).
+    if (!hasSource) {
+      try { hasSource = citesProjectSource(readFileSync(docPath, 'utf-8'), projectFiles); } catch { /* unreadable doc: no evidence */ }
+    }
+
     // Graphify interop: an EXTRACTED doc↔code edge in a committed
     // graphify-out/graph.json is author-grade linkage evidence (the graph's
     // code side is deterministic AST extraction). Only trusted when at least
@@ -220,7 +229,7 @@ export function validateTraceability(projectDir, config) {
         validator: 'traceability',
         severity: 'warn',
         message: `${docName} — exists but no matching source code found (unlinked doc)`,
-        location: `docs-canonical/${docName}`,
+        location: relative(projectDir, docPath),
         suggestion: {
           kind: 'fix',
           text: 'Link a source file explicitly with a header annotation if the code lives in a non-standard location',
@@ -237,9 +246,13 @@ export function validateTraceability(projectDir, config) {
   // finding points at the actual file instead of a fabricated flat one — for
   // a flat tree `doc.rel` already equals the old `docs-canonical/${docFile}`
   // template exactly, so this is a no-op on the flat case.
-  for (const doc of listCanonicalDocs(projectDir)) {
+  for (const doc of listCanonicalDocs(projectDir, { config })) {
     const docFile = basename(doc.rel);
     if (!requiredDocs.has(docFile) && TRACE_MAP[docFile]) {
+      // DocGuard wrote this doc (`generate` on a project without a config
+      // cannot register it); "consider deleting it" is never the right advice
+      // for DocGuard's own output (docguard.generated-docs-consistency#FR-004).
+      if (isGeneratedDoc(doc.abs)) continue;
       findings.push(mkFinding({
         code: 'TRC003',
         validator: 'traceability',
@@ -257,7 +270,9 @@ export function validateTraceability(projectDir, config) {
   passed += reqResult.passed;
   total += reqResult.total;
 
-  return resultFromFindings(findings, { passed, total });
+  const result = resultFromFindings(findings, { passed, total });
+  result.requirementCoverage = reqResult.requirementCoverage;
+  return result;
 }
 
 // ──── Requirement ID Traceability ────────────────────────────────────────────
@@ -266,7 +281,7 @@ export function validateTraceability(projectDir, config) {
  * Scan docs for requirement IDs and verify they appear in test files.
  *
  * Behavior:
- *   - If no requirement IDs found anywhere → silently passes (0 checks)
+ *   - If no definitions or test declarations exist → silently passes (0 checks)
  *   - If IDs found → validates each has a matching test reference
  *   - Reports untraced requirements and orphaned test refs
  */
@@ -276,21 +291,24 @@ function validateRequirementTraceability(projectDir, config, projectFiles) {
   let total = 0;
 
   // Get requirement patterns (user-configurable or defaults)
-  const customPattern = config.traceability?.requirementPattern;
-  const patterns = customPattern
-    ? [new RegExp(customPattern, 'g')]
-    : DEFAULT_REQ_PATTERNS;
+  const patterns = requirementPatterns(config);
 
   // ── Step 1: Collect requirement IDs from documentation ──
   const reqIds = collectRequirementIds(projectDir, config, patterns);
-
-  // If no requirement IDs found, silently pass — this project doesn't use them
-  if (reqIds.size === 0) {
-    return { findings, passed, total };
-  }
+  const retiredReqIds = loadRetiredRequirementIds(projectDir);
+  const lifecycleIndex = trustedSpecLifecycleIndex(projectDir);
+  const uncommittedPlannedIndex = uncommittedPlannedSpecLifecycleIndex(projectDir);
 
   // ── Step 2: Scan test files for requirement ID references ──
   const testRefs = scanTestFilesForReferences(projectDir, projectFiles, patterns);
+  const resolvedRefs = resolveRequirementReferences(reqIds, testRefs, retiredReqIds);
+  const definitionCounts = new Map();
+  for (const def of reqIds.values()) definitionCounts.set(def.id, (definitionCounts.get(def.id) || 0) + 1);
+  const retiredDefinitionCounts = new Map();
+  for (const key of retiredReqIds) {
+    const id = key.slice(key.lastIndexOf('#') + 1);
+    retiredDefinitionCounts.set(id, (retiredDefinitionCounts.get(id) || 0) + 1);
+  }
 
   // ── Step 3: Report traceability results ──
 
@@ -301,173 +319,126 @@ function validateRequirementTraceability(projectDir, config, projectFiles) {
   const softThreshold = config.traceability?.irSoftThreshold ?? 0.10;
   let testCorpus = null;
 
-  // Check each documented requirement has at least one test reference
-  for (const [reqId, location] of reqIds) {
+  let deferred = 0;
+  let lifecycleUnknown = 0;
+  // Planned specs are intent awaiting implementation. Only committed,
+  // digest-current reviewed lifecycle can defer their test linkage.
+  for (const [key, location] of reqIds) {
+    const reqId = location.id;
+    const lifecycleKey = location.specId ? `${location.specId}\0${location.file}` : null;
+    const lifecycle = lifecycleKey ? lifecycleIndex.get(lifecycleKey) : null;
+    if (lifecycle?.delivery === 'planned') {
+      deferred++;
+      continue;
+    }
+    const uncommittedPlanned = lifecycleKey && uncommittedPlannedIndex.has(lifecycleKey);
+    if (location.specId && !lifecycle) lifecycleUnknown++;
     total++;
-    if (testRefs.has(reqId)) {
+    if (resolvedRefs.has(key)) {
       passed++;
     } else {
       // Try to recover a likely-but-unannotated test via TF-IDF cosine.
       let softHint = '';
-      let softText = `Add an @req ${reqId} comment to the test that verifies this requirement`;
+      let softText = uncommittedPlanned
+        ? 'The on-disk lifecycle registry says this requirement is planned, but .docguard-specs.json is not a clean tracked Git artifact. Restore it to its committed state, or commit the registry and its current spec artifacts, before treating the requirement as deferred; do not add an @req marker merely to silence this warning.'
+        : `Review existing tests for this requirement. If a test verifies it, add an @req ${key} annotation or requirement ID test label; write a test only if behavioral coverage is actually missing.`;
       const queryText = location.text && location.text.length > reqId.length ? location.text : reqId;
-      if (testCorpus === null) testCorpus = buildTestCorpus(projectDir, projectFiles);
-      if (testCorpus.length > 0) {
+      if (!uncommittedPlanned && testCorpus === null) testCorpus = buildTestCorpus(projectDir, projectFiles);
+      if (!uncommittedPlanned && testCorpus.length > 0) {
         const ranked = rankBySimilarity(tokenize(queryText), testCorpus);
         const top = ranked[0];
         if (top && top.score >= softThreshold) {
           const pct = (top.score * 100).toFixed(0);
           softHint = ` — IR soft-match: ${top.id} (${pct}% similar) may already cover it`;
-          softText = `${top.id} looks like it already tests this (${pct}% similar) — add @req ${reqId} there, or if unrelated, write the missing test`;
+          softText = `Review ${top.id} as a candidate (${pct}% text similarity, not coverage evidence). Add @req ${key} only if it verifies the requirement; otherwise inspect other tests before deciding a new test is needed.`;
         }
       }
       findings.push(mkFinding({
         code: 'TRC004',
         validator: 'traceability',
         severity: 'warn',
-        message: `Requirement ${reqId} (${location.file}:${location.line}) has no test coverage.${softHint || ' Add @req ' + reqId + ' comment to the test that verifies this requirement'}`,
+        message: `Requirement ${reqId} (${location.file}:${location.line}) has no recognized test annotation or label; behavioral coverage is unknown.${definitionCounts.get(reqId) > 1 ? ` This ID occurs in multiple documents; use ${key} to disambiguate test references.` : ""}${softHint}`,
         location: `${location.file}:${location.line}`,
-        suggestion: { kind: 'fix', text: softText },
+        suggestion: { kind: 'review', text: softText },
       }));
     }
   }
+  const applicableRequirements = total;
+  const tracedRequirements = passed;
 
   // Check for orphaned test refs (tests referencing non-existent requirements)
   for (const [reqId, refs] of testRefs) {
-    if (!reqIds.has(reqId)) {
+    const orphan = refs.find(ref => ref.scope
+      ? resolveRequirementReferences(reqIds, new Map([[reqId, [ref]]]), retiredReqIds).size === 0
+      : !definitionCounts.has(reqId) && !retiredDefinitionCounts.has(reqId));
+    if (orphan) {
       total++;
       findings.push(mkFinding({
         code: 'TRC005',
         validator: 'traceability',
         severity: 'warn',
-        message: `Test references ${reqId} (${refs[0].file}:${refs[0].line}) but no requirement ` +
+        message: `Test references ${orphan.scope ? `${orphan.scope}#` : ""}${reqId} (${orphan.file}:${orphan.line}) but no requirement ` +
           `with this ID exists in documentation. Remove the reference or add the requirement to docs`,
-        location: `${refs[0].file}:${refs[0].line}`,
+        location: `${orphan.file}:${orphan.line}`,
         suggestion: { kind: 'review', text: 'Remove the stale reference, or add the requirement to the documentation' },
       }));
     }
   }
 
-  return { findings, passed, total };
+  return {
+    findings, passed, total,
+    requirementCoverage: {
+      discovered: reqIds.size,
+      applicable: applicableRequirements,
+      traced: tracedRequirements,
+      missing: findings.filter(finding => finding.code === 'TRC004').length,
+      deferred,
+      lifecycleUnknown,
+    },
+  };
 }
 
-function collectRequirementIds(projectDir, config, patterns) {
-  const reqIds = new Map(); // reqId → { file, line }
-  const docSearchPaths = getRequirementDocPaths(projectDir, config);
-
-  for (const docPath of docSearchPaths) {
-    if (!existsSync(docPath)) continue;
-
-    const content = readFileSync(docPath, 'utf-8');
-
-    // Fast early-return: skip expensive string split if no requirement patterns exist
-    const hasMatch = patterns.some(p => { p.lastIndex = 0; return p.test(content); });
-    if (!hasMatch) continue;
-
-    const lines = content.split('\n');
-    const docName = relative(projectDir, docPath);
-
-    for (let i = 0; i < lines.length; i++) {
-      for (const pattern of patterns) {
-        // Reset regex lastIndex for each line
-        pattern.lastIndex = 0;
-        let match;
-        while ((match = pattern.exec(lines[i])) !== null) {
-          const reqId = match[0]; // e.g., "REQ-001"
-          if (!reqIds.has(reqId)) {
-            // capture the line text (the requirement description) for IR soft-match
-            reqIds.set(reqId, { file: docName, line: i + 1, text: lines[i].trim() });
-          }
-        }
+/**
+ * Retired requirement identities remain known without restoring obsolete prose
+ * to active context. Invalid manifests supply no evidence; Document-Lifecycle
+ * reports their integrity failure separately.
+ */
+function loadRetiredRequirementIds(projectDir) {
+  const manifest = readRetirementManifest(projectDir);
+  if (!manifest.ok) return new Set();
+  const ids = new Set();
+  for (const entry of manifest.entries) {
+    if (!Array.isArray(entry.requirementIds)) continue;
+    const path = entry.path.replaceAll('\\', '/').replace(/^\.\//, '');
+    for (const id of entry.requirementIds) {
+      if (typeof id === 'string' && id.length <= 128 && /^[^\s#\0]+$/.test(id)) {
+        ids.add(`${path}#${id}`);
       }
     }
   }
-
-  return reqIds;
+  return ids;
 }
 
-function scanTestFilesForReferences(projectDir, projectFiles, patterns) {
-  const testFiles = projectFiles.filter(f =>
-    TEST_PATTERNS.some(p => p.test(f)) ||   // multilingual: JS/TS, Python, Go, Rust, Java/Kotlin, Ruby, PHP
-    /__tests__\//.test(f) ||
-    /tests?\//.test(f)
-  );
+/** Resolve positive test links without sharing evidence between document scopes. */
+export function resolveRequirementReferences(definitions, references, retiredDefinitions = new Set()) {
+  return resolveRequirementReferencesShared(definitions, references, retiredDefinitions);
+}
 
-  const testRefs = new Map(); // reqId → [{ file, line }]
-
-  for (const relPath of testFiles) {
-    const fullPath = resolve(projectDir, relPath);
-    if (!existsSync(fullPath)) continue;
-
-    let content;
-    try { content = readFileSync(fullPath, 'utf-8'); } catch { continue; }
-
-    // Fast early-return: skip expensive string split if no requirement patterns exist
-    const hasMatch = patterns.some(p => { p.lastIndex = 0; return p.test(content); });
-    if (!hasMatch) continue;
-
-    const lines = content.split('\n');
-
-    for (let i = 0; i < lines.length; i++) {
-      for (const pattern of patterns) {
-        pattern.lastIndex = 0;
-        let match;
-        while ((match = pattern.exec(lines[i])) !== null) {
-          const reqId = match[0];
-          if (!testRefs.has(reqId)) testRefs.set(reqId, []);
-          testRefs.get(reqId).push({ file: relPath, line: i + 1 });
-        }
-      }
-    }
-  }
-
-  return testRefs;
+/**
+ * Read explicit requirement annotations and test labels from eligible test sources.
+ * Shared by validation and feature scoring; fixture data is not linkage evidence.
+ * Callers supply project-relative candidate paths and global requirement regexes.
+ * No files are written and no findings or suppression policy are consulted.
+ * @returns {Map<string, Array<{file: string, line: number}>>} ID to declaration locations
+ */
+export function scanTestFilesForReferences(projectDir, projectFiles, patterns) {
+  return scanTestFilesForReferencesShared(projectDir, projectFiles, patterns);
 }
 
 /**
  * Get all file paths where requirement IDs might be defined.
  * Checks: docs-canonical/*.md, spec.md, REQUIREMENTS.md, specs/[feature]/spec.md
  */
-function getRequirementDocPaths(projectDir, config) {
-  const paths = [];
-
-  // docs-canonical/ directory — recursive. Consumer re-derives the display
-  // path via relative(projectDir, docPath), so nested docs already report
-  // their real path with no further change needed there.
-  for (const doc of listCanonicalDocs(projectDir)) paths.push(doc.abs);
-
-  // Root-level docs
-  const rootDocs = ['REQUIREMENTS.md', 'spec.md', 'README.md'];
-  for (const doc of rootDocs) {
-    const p = resolve(projectDir, doc);
-    if (existsSync(p)) paths.push(p);
-  }
-
-  // User-configured requirement docs
-  const configDocs = config.traceability?.requirementDocs || [];
-  for (const doc of configDocs) {
-    const p = resolve(projectDir, doc);
-    if (existsSync(p) && !paths.includes(p)) paths.push(p);
-  }
-
-  // Spec Kit artifacts: .specify/specs/*/spec.md (v3+) and specs/*/spec.md (legacy)
-  const specKitDirs = [
-    resolve(projectDir, '.specify', 'specs'),  // v3+ standard
-    resolve(projectDir, 'specs'),               // legacy
-  ];
-  for (const specsDir of specKitDirs) {
-    if (existsSync(specsDir)) {
-      try {
-        for (const feature of readdirSync(specsDir)) {
-          const specPath = join(specsDir, feature, 'spec.md');
-          if (existsSync(specPath) && !paths.includes(specPath)) paths.push(specPath);
-        }
-      } catch { /* ignore */ }
-    }
-  }
-
-  return paths;
-}
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -490,9 +461,7 @@ function getRequirementDocPaths(projectDir, config) {
  */
 function scanDocAnnotations(projectFiles, projectDir) {
   const map = new Map();
-  const annotationRe = /(?:\/\/|\/\*|#)\s*@doc\s+(\S+\.md)/g;
   const CODE_EXT = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.rb', '.go', '.rs', '.java']);
-  const HEAD_BYTES = 4096;
 
   for (const relPath of projectFiles) {
     const ext = extname(relPath);
@@ -500,19 +469,47 @@ function scanDocAnnotations(projectFiles, projectDir) {
     const full = resolve(projectDir, relPath);
     let content;
     try { content = readFileSync(full, 'utf-8'); } catch { continue; }
-    // Annotations live near the top of the file. Slicing avoids reading
-    // megabytes of bundled / minified output looking for a header comment.
-    const head = content.length > HEAD_BYTES ? content.slice(0, HEAD_BYTES) : content;
-    if (!head.includes('@doc')) continue;
-    annotationRe.lastIndex = 0;
-    let m;
-    while ((m = annotationRe.exec(head)) !== null) {
-      const docName = basename(m[1]);
+    // Annotations live near the top of the file; the shared reader slices the
+    // head so bundled output is never scanned (docguard.mcp-doc-tools#FR-003).
+    for (const annotated of docAnnotationsIn(content)) {
+      const docName = basename(annotated);
       if (!map.has(docName)) map.set(docName, new Set());
       map.get(docName).add(relPath);
     }
   }
   return map;
+}
+
+const GENERATED_MARKER_RE = /^[ \t]*<!--\s*docguard:generated\s+true\s*-->[ \t]*$/m;
+
+function isGeneratedDoc(absPath) {
+  try { return GENERATED_MARKER_RE.test(readFileSync(absPath, 'utf-8')); } catch { return false; }
+}
+
+/**
+ * True when `content` cites (in backticks or a Markdown link) a path that
+ * exists in the project as a non-Markdown file or as a directory holding one.
+ * Comments and fenced blocks are skipped: a template's `<!-- e.g. src/ -->`
+ * placeholder is not a citation.
+ * @implements docguard.generated-docs-consistency#FR-004
+ */
+export function citesProjectSource(content, projectFiles) {
+  const files = projectFiles.map(f => f.replaceAll('\\', '/')).filter(isTraceableSource);
+  const fileSet = new Set(files);
+  const text = String(content).replace(/<!--[\s\S]*?-->/g, '').replace(/^(`{3,}|~{3,})[\s\S]*?^\1/gm, '');
+  const tokens = [
+    ...[...text.matchAll(/`([^`\s]+)`/g)].map(m => m[1]),
+    ...[...text.matchAll(/\]\(([^)\s]+)\)/g)].map(m => m[1]),
+  ];
+  for (const raw of tokens) {
+    if (/^[a-z][a-z0-9+.-]*:/i.test(raw) || raw.startsWith('/') || raw.includes('..') || raw.includes('*')) continue;
+    const token = raw.replace(/^\.\//, '').replace(/#.*$/, '').replace(/:\d+(?::\d+)?$/, '').replace(/\/+$/, '');
+    if (!token || token.endsWith('.md')) continue;
+    if (fileSet.has(token)) return true;
+    const prefix = `${token}/`;
+    if (files.some(f => f.startsWith(prefix))) return true;
+  }
+  return false;
 }
 
 // v0.29 consolidation: traversal delegates to the shared canonical walker.

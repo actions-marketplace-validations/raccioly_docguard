@@ -1,5 +1,5 @@
 ---
-description: Keep canonical docs always up to date — refresh code-truth sections in place, preserve human prose
+description: Refresh canonical code-truth sections and flag prose for review — refresh code-truth sections in place, preserve human prose
 allowed-tools: Bash, Read, Edit
 ---
 
@@ -11,6 +11,12 @@ matching `source=code` sections of existing canonical docs in place. **Human pro
 is never touched** — it lives outside markers or in `source=human` sections.
 
 When a code section changes, the prose sections in that doc are flagged for agent review.
+
+## Running DocGuard
+
+Run `docguard` from PATH when it is installed. Otherwise run
+`npx --yes docguard-cli@0.45.1`, the release these instructions ship with, in its
+place. Every `docguard …` command below means one of the two.
 
 ## User Input
 
@@ -25,13 +31,13 @@ You **MUST** consider the user input before proceeding (if not empty).
 1. Preview what will change (dry run, never writes):
 
 ```bash
-npx --yes docguard-cli@latest sync $ARGUMENTS
+docguard sync $ARGUMENTS
 ```
 
 2. If only `source=code` sections are stale, apply the mechanical refresh:
 
 ```bash
-npx --yes docguard-cli@latest sync --write $ARGUMENTS
+docguard sync --write $ARGUMENTS
 ```
 
 3. For each "prose to review" line, **read the affected doc and update the
@@ -39,14 +45,14 @@ npx --yes docguard-cli@latest sync --write $ARGUMENTS
    endpoints table grew, update the API overview prose). Then re-run guard:
 
 ```bash
-npx --yes docguard-cli@latest guard
+docguard guard
 ```
 
 ## Flags
 
 - `--since <ref>` — also report which code files changed since this git ref (context for prose updates).
 - `--write` — apply the mechanical refreshes. Default is a dry-run preview.
-- `--force` — sync docs even without the `<!-- docguard:generated true -->` marker.
+- `--force` — sync unmarked default-path docs. It never bypasses mapped-document section ownership.
 - `--format json` — machine-readable output (`updates`, `reviews`, `skipped`).
 
 ## When to use

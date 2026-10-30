@@ -20,15 +20,16 @@
  * text is the human summary.
  *
  *   docguard verify [--semantic | --instructions] [--format json]
+ * @implements docguard.evidence-scoped-verification#FR-009
  */
 
 import { basename } from 'node:path';
 import { c } from '../shared.mjs';
-import { detectAgentMode } from '../ensure-skills.mjs';
 import { extractSemanticClaims, buildSemanticVerifyTasks } from '../scanners/semantic-claims.mjs';
 import { auditInstructions } from '../scanners/instruction-audit.mjs';
 import { isGitRepo, getDiffText } from '../shared-git.mjs';
 import { parseUnifiedDiff, activityLabeledDiff } from '../shared-diff.mjs';
+import { coverSemanticClaims, evaluateEvidence } from '../evidence/evaluate.mjs';
 
 const CHANGE_CODE_EXT = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|cs|swift|scala|dart)$/;
 
@@ -68,14 +69,30 @@ function taskTouchesChange(task, changedSet, changedBasenames) {
 }
 
 export function runVerify(projectDir, config, flags) {
+  const selectedModes = ['semantic', 'instructions', 'evidence'].filter(mode => flags[mode]);
+  if (selectedModes.length > 1) {
+    const message = `Choose exactly one verify mode; --${selectedModes.join(', --')} cannot be combined.`;
+    if (flags.format === 'json') {
+      console.log(JSON.stringify({ command: 'verify', status: 'error', error: { code: 'VERIFY_MODE_CONFLICT', message } }, null, 2));
+    } else {
+      console.error(`${c.red}Error: ${message}${c.reset}`);
+    }
+    process.exitCode = 1;
+    return;
+  }
   if (flags.instructions) {
     runInstructionAudit(projectDir, config, flags);
+    return;
+  }
+  if (flags.evidence) {
+    runEvidenceVerification(projectDir, config, flags);
     return;
   }
 
   const isJson = flags.format === 'json';
   const claims = extractSemanticClaims(projectDir, config);
-  const tasks = buildSemanticVerifyTasks(claims);
+  const evidenceCoverage = coverSemanticClaims(claims, evaluateEvidence(projectDir, config));
+  const tasks = buildSemanticVerifyTasks(evidenceCoverage.remaining);
 
   // Change-aware staging (feat 6): if --since given, attach the structured diff
   // and flag which claims are about just-changed code (verify those first).
@@ -92,6 +109,9 @@ export function runVerify(projectDir, config, flags) {
     console.log(JSON.stringify({
       command: 'verify --semantic',
       project: config.projectName,
+      discoveredClaimCount: evidenceCoverage.total,
+      verifiedWithinScope: evidenceCoverage.verifiedWithinScope,
+      coveredClaimIds: evidenceCoverage.covered,
       claimCount: tasks.length,
       // How to act on this: each task is a claim to confirm against the code.
       howToVerify: changeContext
@@ -107,7 +127,10 @@ export function runVerify(projectDir, config, flags) {
   console.log(`${c.dim}   ${config.projectName} · documented numbers / limits / enums to check against code${c.reset}\n`);
 
   if (tasks.length === 0) {
-    console.log(`  ${c.green}✅ No semantic claims found in the canonical docs.${c.reset}`);
+    const message = evidenceCoverage.total > 0
+      ? `${evidenceCoverage.verifiedWithinScope} discovered claim(s) are already covered by unique current evidence declarations.`
+      : 'No semantic claims found in the canonical docs.';
+    console.log(`  ${c.green}✅ ${message}${c.reset}`);
     console.log(`  ${c.dim}(Looks for numbers with units — days/ms/req-s/GSIs/roles/… — and status/enum lists.)${c.reset}\n`);
     return;
   }
@@ -120,6 +143,9 @@ export function runVerify(projectDir, config, flags) {
   }
 
   console.log(`  ${c.yellow}${tasks.length} claim(s) to verify against the code:${c.reset}\n`);
+  if (evidenceCoverage.verifiedWithinScope > 0) {
+    console.log(`  ${c.green}✓ ${evidenceCoverage.verifiedWithinScope} additional discovered claim(s) have unique verified-within-scope declarations.${c.reset}\n`);
+  }
   if (changeContext) {
     const nChanged = tasks.filter(t => t.aboutChangedCode).length;
     console.log(`  ${c.cyan}⚡ ${nChanged} claim(s) are about code changed since ${flags.since}${c.reset} ${c.dim}— verify these first (structured diff in --format json).${c.reset}\n`);
@@ -134,10 +160,54 @@ export function runVerify(projectDir, config, flags) {
     console.log('');
   }
 
-  const mode = detectAgentMode(projectDir);
-  const cmd = mode === 'llm' ? '/docguard.verify' : 'docguard verify --semantic --format json';
+  // No agent command runs `verify`; name the CLI (docguard.spec-kit-integration-honesty#FR-006).
+  const cmd = 'docguard verify --semantic --format json';
   console.log(`  ${c.dim}This is the highest-value bug class and DocGuard can't judge it — an agent must.${c.reset}`);
   console.log(`  ${c.dim}Get the machine task list: ${c.cyan}${cmd}${c.dim}, then read each cited file and confirm the value.${c.reset}\n`);
+}
+
+function runEvidenceVerification(projectDir, config, flags) {
+  const evaluation = evaluateEvidence(projectDir, config);
+  // Match guard's severity contract so this command is safe as a direct CI
+  // gate: contradictions and invalid manifests fail, while unresolved evidence
+  // uses the warning-only status shared by the rest of the CLI.
+  process.exitCode = evaluation.status === 'contradicted' || evaluation.status === 'invalid'
+    ? 1
+    : evaluation.status === 'attention-required'
+      ? 2
+      : 0;
+  if (flags.format === 'json') {
+    console.log(JSON.stringify(evaluation, null, 2));
+    return;
+  }
+  console.log(`${c.bold}🔬 DocGuard Verify — declared evidence${c.reset}`);
+  console.log(`${c.dim}   ${config.projectName} · exact statement-to-source checks${c.reset}\n`);
+  if (!evaluation.exists) {
+    console.log(`  ${c.dim}No .docguard-evidence.json manifest is configured.${c.reset}`);
+    console.log(`  ${c.dim}Start from templates/evidence-manifest.json; heuristic discovery remains available with docguard verify --semantic.${c.reset}\n`);
+    return;
+  }
+  if (evaluation.errors.length) {
+    console.log(`  ${c.red}Invalid evidence manifest:${c.reset}`);
+    for (const error of evaluation.errors) console.log(`    ${c.red}✗${c.reset} ${error.message}`);
+    console.log('');
+    return;
+  }
+  const symbols = {
+    'verified-within-scope': `${c.green}✓${c.reset}`,
+    contradicted: `${c.red}✗${c.reset}`,
+    stale: `${c.yellow}↻${c.reset}`,
+    inconclusive: `${c.yellow}?${c.reset}`,
+    unsupported: `${c.yellow}◇${c.reset}`,
+  };
+  for (const state of ['contradicted', 'stale', 'inconclusive', 'unsupported', 'verified-within-scope']) {
+    const results = evaluation.results.filter(result => result.state === state);
+    if (!results.length) continue;
+    console.log(`  ${c.bold}${state}${c.reset} (${results.length})`);
+    for (const result of results) console.log(`    ${symbols[state]} ${result.declarationId} · ${result.location} · ${result.message}`);
+    console.log('');
+  }
+  console.log(`  ${c.dim}${evaluation.scopeLimitation}${c.reset}\n`);
 }
 
 // ── verify --instructions: agent-instruction drift/conflict audit ───────────
@@ -145,8 +215,8 @@ export function runVerify(projectDir, config, flags) {
 function runInstructionAudit(projectDir, config, flags) {
   const isJson = flags.format === 'json';
   const { rules, deterministic, tasks } = auditInstructions(projectDir, config);
-  const { duplicates, negations, stalePointers, staleCommands } = deterministic;
-  const findingCount = duplicates.length + negations.length + stalePointers.length + staleCommands.length;
+  const { duplicates, negations, stalePointers, ambiguousPointers = [], unsafePointers = [], staleCommands } = deterministic;
+  const findingCount = duplicates.length + negations.length + stalePointers.length + ambiguousPointers.length + unsafePointers.length + staleCommands.length;
   // Structured change context helps the agent judge whether a rule about code
   // has been invalidated by a recent change (feat 6).
   const changeContext = buildChangeContext(projectDir, flags.since);
@@ -191,6 +261,13 @@ function runInstructionAudit(projectDir, config, flags) {
     for (const s of stalePointers) {
       console.log(`    ${c.yellow}⚠${c.reset} stale pointer — ${s.file}:${s.line}: ${c.cyan}${s.path}${c.reset} does not exist`);
     }
+    for (const pointer of ambiguousPointers) {
+      console.log(`    ${c.yellow}AMBIGUOUS POINTER${c.reset} ${pointer.file}:${pointer.line} — ${pointer.path}`);
+      console.log(`      ${c.dim}${pointer.matchCount} matches: ${pointer.matches.join(', ')}${c.reset}`);
+    }
+    for (const pointer of unsafePointers) {
+      console.log(`    ${c.yellow}UNSAFE POINTER${c.reset} ${pointer.file}:${pointer.line} — ${pointer.path}`);
+    }
     for (const s of staleCommands) {
       console.log(`    ${c.yellow}⚠${c.reset} stale command — ${s.file}:${s.line}: ${c.cyan}docguard ${s.command}${c.reset} is not a docguard command`);
     }
@@ -206,8 +283,7 @@ function runInstructionAudit(projectDir, config, flags) {
       console.log('');
     }
 
-    const mode = detectAgentMode(projectDir);
-    const cmd = mode === 'llm' ? '/docguard.verify' : 'docguard verify --instructions --format json';
+    const cmd = 'docguard verify --instructions --format json';
     console.log(`  ${c.dim}Whether clustered rules contradict in practice is judgment DocGuard can't make — an agent must.${c.reset}`);
     console.log(`  ${c.dim}Get the machine task list: ${c.cyan}${cmd}${c.dim}, then judge each pair and report which rule should win.${c.reset}\n`);
   } else if (findingCount === 0) {

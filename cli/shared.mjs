@@ -2,7 +2,15 @@
  * Shared constants for DocGuard CLI — colors, profiles, version.
  * Extracted from docguard.mjs to break circular dependencies.
  * All commands import from here instead of docguard.mjs.
+ * @implements docguard.adoption-workflow-integrity#FR-007
+ * @implements docguard.adoption-workflow-integrity#FR-008
  */
+
+import { readFileSync, statSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { buildIgnoreFilter, loadDocguardIgnore } from './shared-ignore.mjs';
+import { codeDefaultLevel } from './findings.mjs';
 
 /**
  * Current .docguard.json schema version that this CLI version writes via
@@ -13,7 +21,21 @@
  * `.docguard.json.version` is BEHIND this constant — pointing users at
  * `docguard upgrade` to migrate.
  */
-export const CURRENT_SCHEMA_VERSION = '0.5';
+export const CURRENT_SCHEMA_VERSION = '0.6';
+
+/**
+ * The version of the DocGuard TOOL, read from the package manifest — the single
+ * source of truth, so a release bump cannot leave a stale literal behind.
+ *
+ * NOT to be confused with CURRENT_SCHEMA_VERSION above, or with a project's
+ * `.docguard.json.version`: those describe the CONFIG FILE FORMAT and move on
+ * their own, much slower, schedule. Anything user-facing that says "DocGuard
+ * vX" means this constant. (llms.txt quoted the config schema version for
+ * several releases and told every adopter the tool was "v0.6".)
+ */
+export const TOOL_VERSION = JSON.parse(
+  readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf-8')
+).version;
 
 /**
  * Allowed severity values for per-validator `severity` overrides in
@@ -39,6 +61,37 @@ export function resolveSeverity(config, validatorKey) {
   return 'medium';
 }
 
+/**
+ * Resolve the enforcement level for one structured finding. Exact finding-code
+ * policy wins over validator policy. Without an exact override, intrinsic
+ * errors remain blocking, a code registered as informational stays
+ * informational (it is more specific than its validator's policy), and
+ * validator severity reweights the remaining warnings.
+ */
+export function resolveFindingEnforcement(config, finding, validatorKey) {
+  const code = typeof finding?.code === 'string' ? finding.code.toUpperCase() : null;
+  const exact = code && config?.findingSeverity?.[code];
+  const normalizedExact = typeof exact === 'string' ? exact.toLowerCase() : null;
+  if (normalizedExact && SEVERITY_LEVELS.has(normalizedExact)) {
+    return {
+      level: normalizedExact === 'high' ? 'error' : normalizedExact === 'medium' ? 'warn' : 'info',
+      source: 'finding',
+      key: code,
+    };
+  }
+  if (finding?.severity === 'error') {
+    return { level: 'error', source: 'intrinsic', key: code };
+  }
+  const codeLevel = codeDefaultLevel(code);
+  if (codeLevel) return { level: codeLevel, source: 'code', key: code };
+  const validatorSeverity = resolveSeverity(config, validatorKey);
+  return {
+    level: validatorSeverity === 'high' ? 'error' : validatorSeverity === 'low' ? 'info' : 'warn',
+    source: 'validator',
+    key: validatorKey,
+  };
+}
+
 // ── Canonical section heading matching ─────────────────────────────────────
 /**
  * Required canonical sections used to be matched by literal substring, so an
@@ -59,7 +112,7 @@ export const SECTION_SYNONYMS = {
   'secrets management':    ['secrets', 'secret management', 'secrets handling', 'credentials', 'credential management'],
   'test categories':       ['test types', 'categories of tests', 'test strategy', 'testing strategy', 'test approach'],
   'coverage rules':        ['coverage', 'coverage targets', 'coverage goals', 'coverage requirements', 'coverage policy'],
-  'environment variables': ['env vars', 'environment', 'configuration', 'config variables'],
+  'environment variables': ['env vars', 'environment variable', 'environment', 'configuration', 'config variables', 'environment configuration', 'runtime configuration'],
   'setup steps':           ['setup', 'getting started', 'installation', 'setup instructions', 'local setup', 'quick start'],
   'layer boundaries':      ['layers', 'layering', 'module boundaries', 'layer boundary', 'boundaries'],
   'external dependencies': ['dependencies', 'external systems', 'third party dependencies', 'integrations', 'external interfaces'],
@@ -77,6 +130,32 @@ function normalizeHeadingText(line) {
 }
 
 /**
+ * Synonyms too generic to name a section inside a longer heading: they count
+ * only as the whole heading, or followed by a word that names the variables
+ * ("reference", "variables", "env", …). "## Configuration" and
+ * "## Configuration Reference" name the Environment Variables section;
+ * "## Configuration Files", "## Production environment" and "## Test
+ * environment" do not. Every other phrase matches as before, inside a longer
+ * heading too ("## Data Models", "## 2. Architecture Layers").
+ * @implements docguard.doc-validator-fidelity#FR-001
+ */
+const WHOLE_HEADING_SYNONYMS = new Set(['environment', 'configuration']);
+// What may follow them and still name the variables: "Configuration Variables",
+// "Configuration (.env)", "Configuration Reference".
+const GENERIC_SUFFIXES = ['reference', 'variables', 'vars', 'env', 'settings', 'options', 'keys'];
+
+/** Whether a normalized heading names `phrase`. */
+function headingNames(norm, phrase) {
+  if (WHOLE_HEADING_SYNONYMS.has(phrase)) return norm === phrase || GENERIC_SUFFIXES.some(suffix => norm === `${phrase} ${suffix}`);
+  return norm.includes(phrase);
+}
+
+/** The synonyms of a canonical heading key (own keys only). */
+function synonymsOf(key) {
+  return Object.hasOwn(SECTION_SYNONYMS, key) ? SECTION_SYNONYMS[key] : [];
+}
+
+/**
  * True if `content` has an H2–H6 heading equivalent to `canonicalHeading` —
  * the exact text, a known synonym, or the same text behind an arc42-style
  * section number (e.g. "## 5.4 Layer boundaries" satisfies "## Layer Boundaries").
@@ -87,15 +166,45 @@ function normalizeHeadingText(line) {
 export function docHasSection(content, canonicalHeading) {
   const key = normalizeHeadingText(canonicalHeading);
   if (!key) return false;
-  const accepted = [key, ...(SECTION_SYNONYMS[key] || [])];
+  const synonyms = synonymsOf(key);
   const headings = content.match(/^#{2,6}\s+.+$/gm) || [];
   for (const line of headings) {
     const norm = normalizeHeadingText(line);
-    for (const phrase of accepted) {
-      if (norm.includes(phrase)) return true;
-    }
+    if (headingNames(norm, key)) return true;
+    for (const phrase of synonyms) if (headingNames(norm, phrase)) return true;
   }
   return false;
+}
+
+/**
+ * Index of the line holding the H2–H6 heading that satisfies `canonicalHeading`
+ * (the same equivalence docHasSection uses), or -1. Fenced blocks are skipped.
+ * An exact match wins over a containing one, which wins over a synonym, so
+ * `## Environment Variables` is chosen over an earlier `## Environment Setup`.
+ * @implements docguard.generated-docs-consistency#FR-003
+ */
+export function findSectionHeading(content, canonicalHeading) {
+  const key = normalizeHeadingText(canonicalHeading);
+  if (!key) return -1;
+  const lines = String(content).split('\n');
+  const headings = [];
+  let fence = null;
+  for (let i = 0; i < lines.length; i++) {
+    const marker = lines[i].match(/^\s{0,3}(`{3,}|~{3,})/);
+    if (fence) { if (marker && marker[1][0] === fence[0]) fence = null; continue; }
+    if (marker) { fence = marker[1]; continue; }
+    if (/^#{2,6}\s+\S/.test(lines[i])) headings.push({ i, norm: normalizeHeadingText(lines[i]) });
+  }
+  const tiers = [
+    h => h.norm === key,
+    h => h.norm.includes(key),
+    h => synonymsOf(key).some(phrase => headingNames(h.norm, phrase)),
+  ];
+  for (const test of tiers) {
+    const hit = headings.find(test);
+    if (hit) return hit.i;
+  }
+  return -1;
 }
 
 /**
@@ -126,7 +235,21 @@ export function compareVersions(a, b) {
 }
 
 // ── Colors (ANSI escape codes, zero deps) ──────────────────────────────────
-export const c = {
+/**
+ * Whether to print ANSI colour (docguard.output-ux#FR-002). `FORCE_COLOR`
+ * wins, as in Node itself: any value but `0` forces colour on, `0` turns it
+ * off. Otherwise a non-empty `NO_COLOR` (no-color.org) turns it off, and so
+ * does a stdout that is not a terminal: the artifacts colour corrupts (piped
+ * output, redirected files) are on stdout.
+ * @implements docguard.output-ux#FR-002
+ */
+export function colorEnabled(env = process.env, stream = process.stdout) {
+  if (env.FORCE_COLOR !== undefined) return env.FORCE_COLOR !== '0';
+  if (env.NO_COLOR) return false;
+  return Boolean(stream && stream.isTTY);
+}
+
+const ANSI_CODES = {
   reset: '\x1b[0m',
   bold: '\x1b[1m',
   dim: '\x1b[2m',
@@ -141,8 +264,14 @@ export const c = {
   bgYellow: '\x1b[43m',
 };
 
+/** The palette every command prints through: empty strings when colour is off. */
+export const c = colorEnabled()
+  ? { ...ANSI_CODES }
+  : Object.fromEntries(Object.keys(ANSI_CODES).map(key => [key, '']));
+
 // ── Compliance Profiles ───────────────────────────────────────────────────
 export const PROFILES = {
+  __proto__: null,
   starter: {
     description: 'Minimal CDD — architecture + changelog, no Spec Kit framework scaffold (pass --spec-kit to add it). For side projects and prototypes.',
     requiredFiles: {
@@ -253,14 +382,12 @@ export const PROFILES = {
 };
 
 // ── .docguardignore Support ───────────────────────────────────────────────
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { resolve, relative } from 'node:path';
 
 /**
  * Conventional documentation-home directory names. A folder named one of these
  * is unambiguously "docs DocGuard governs" — distinct from arbitrary markdown
  * buried in a non-doc subdir (security/wolf-archive/, vendored toolkits), which
- * the wu-whatsappinbox scoping fix deliberately excludes. We auto-track the
+ * the downstream-project scoping fix deliberately excludes. We auto-track the
  * former and never blanket-walk the latter.
  */
 export const DEFAULT_DOC_DIRS = [
@@ -311,28 +438,9 @@ export function resolveDocDirs(projectDir, config = {}) {
  * @returns {(relPath: string) => boolean} - Returns true if file should be ignored
  */
 export function loadIgnorePatterns(projectDir) {
-  const ignorePath = resolve(projectDir, '.docguardignore');
-  if (!existsSync(ignorePath)) return () => false;
-
-  let content;
-  try { content = readFileSync(ignorePath, 'utf-8'); } catch { return () => false; }
-
-  const patterns = content
-    .split('\n')
-    .map(line => line.trim())
-    .filter(line => line && !line.startsWith('#'))
-    .map(pattern => {
-      // Convert glob to regex:
-      // ** → match any path segments
-      // * → match any chars except /
-      // . → literal dot
-      const escaped = pattern
-        .replace(/\./g, '\\.')
-        .replace(/\*\*/g, '§§')     // temp placeholder
-        .replace(/\*/g, '[^/]*')
-        .replace(/§§/g, '.*');
-      return new RegExp(`^${escaped}$|/${escaped}$|^${escaped}/|/${escaped}/`);
-    });
-
-  return (relPath) => patterns.some(regex => regex.test(relPath));
+  // One parser for .docguardignore (docguard.ignore-and-todo-parsing#FR-001).
+  // This used to be a private copy of shared-ignore's glob compiler that never
+  // received its gitignore-style `dir/` fix, so `fixtures/` was honoured by
+  // some checks and silently ignored by others.
+  return buildIgnoreFilter(loadDocguardIgnore(projectDir));
 }

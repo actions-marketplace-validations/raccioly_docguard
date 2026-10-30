@@ -15,27 +15,28 @@
  * Uses shared-ignore.mjs for consistent filtering (Constitution IV, v1.1.0).
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { resolve, join, extname, relative, dirname, basename } from 'node:path';
-import { shouldIgnore, walkFiles as sharedWalkFiles } from '../shared-ignore.mjs';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve, join, extname, relative } from 'node:path';
+
 import { mkFinding, resultFromFindings } from '../findings.mjs';
+import { resolveDocRole } from '../shared-doc-roles.mjs';
+import { summarizeTiers } from '../shared-source.mjs';
 
-const IGNORE_DIRS = new Set([
-  'node_modules', '.git', '.next', 'dist', 'build',
-  'coverage', '.cache', '__pycache__', '.venv', 'vendor',
-  'templates', 'configs', 'Research', 'docs-canonical', 'docs-implementation',
-]);
 
-const CODE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.mjs', '.cjs', '.jsx']);
+import { buildImportGraph, JS_EXTENSIONS, readImports, getFilesRecursive, posixPath } from '../scanners/import-graph.mjs';
+// Re-exported so existing importers of the validator keep working.
+export { buildImportGraph };
 
 // v0.29: migrated to structured findings (ARC001–ARC003). Messages are
 // byte-identical to the legacy strings — resultFromFindings derives the
 // errors/warnings arrays from the same findings array (acc), which the
 // helpers below mutate in place.
-export function validateArchitecture(projectDir, config) {
+export function validateArchitecture(projectDir, config = {}) {
   const acc = { findings: [], passed: 0, total: 0 };
+  let applicability = { status: 'checked', reason: 'Repository-local JS/TS and Python static import graphs inspected; runtime dependency resolution is outside scope' };
   const compose = () => ({
     name: 'architecture',
+    applicability,
     ...resultFromFindings(acc.findings, { passed: acc.passed, total: acc.total }),
   });
 
@@ -47,16 +48,33 @@ export function validateArchitecture(projectDir, config) {
 
   // ── 2. Auto-detect import graph ──
   const importGraph = buildImportGraph(projectDir, config);
+  if (importGraph.limitations.length > 0) {
+    applicability = {
+      status: importGraph.files.length > 0 ? 'partial' : 'unsupported',
+      reason: `Static import findings are retained; incomplete evidence: ${summarizeLimitations(importGraph.limitations)}`,
+    };
+  } else if (importGraph.files.length === 0) {
+    applicability = { status: 'not-applicable', reason: 'No supported JS/TS or Python source files found for import graph analysis' };
+  }
   if (importGraph.files.length === 0) return compose();
+
+  if (layers && Object.keys(layers).length > 0) {
+    validatePythonConfigLayers(importGraph, layers, acc);
+  }
 
   // ── 3. Detect circular dependencies ──
   const circles = detectCircularDeps(importGraph);
+  // A file's edges all come from one read, so the tier of its first edge is
+  // the file's tier (docguard.js-import-edges#FR-008).
+  const tierOf = new Map();
+  for (const edge of importGraph.edges) if (!tierOf.has(edge.from)) tierOf.set(edge.from, edge.tier);
   for (const circle of circles) {
     acc.total++;
     acc.findings.push(mkFinding({
       code: 'ARC002',
       validator: 'architecture',
       severity: 'warn',
+      parserTier: summarizeTiers(circle.slice(0, -1).map(file => ({ tier: tierOf.get(file) }))).tier,
       message: `Circular dependency: ${circle.join(' → ')}`,
       location: circle[0],
       suggestion: {
@@ -67,8 +85,8 @@ export function validateArchitecture(projectDir, config) {
   }
 
   // ── 4. Check layer boundaries from ARCHITECTURE.md ──
-  const archPath = resolve(projectDir, 'docs-canonical/ARCHITECTURE.md');
-  if (existsSync(archPath)) {
+  const archPath = resolveDocRole(projectDir, config, 'architecture');
+  if (archPath && existsSync(archPath)) {
     const archContent = readFileSync(archPath, 'utf-8');
     const declaredLayers = parseLayerBoundaries(archContent);
 
@@ -111,11 +129,11 @@ function validateConfigLayers(projectDir, config, layers, acc) {
 
     const files = getFilesRecursive(layerDir, config, projectDir);
     for (const file of files) {
-      if (!CODE_EXTENSIONS.has(extname(file))) continue;
+      if (!JS_EXTENSIONS.has(extname(file))) continue;
 
       const content = readFileSync(file, 'utf-8');
       const relPath = relative(projectDir, file);
-      const imports = extractImports(content);
+      const { imports, tier } = readImports(content, file);
 
       for (const { spec } of imports) {
         if (!spec.startsWith('.') && !spec.startsWith('/')) continue;
@@ -127,6 +145,7 @@ function validateConfigLayers(projectDir, config, layers, acc) {
               code: 'ARC001',
               validator: 'architecture',
               severity: 'error',
+              parserTier: tier,
               message: `${relPath}: ${layer.name} layer imports from forbidden layer (${forbiddenDir})`,
               location: relPath,
               suggestion: {
@@ -141,117 +160,39 @@ function validateConfigLayers(projectDir, config, layers, acc) {
   }
 }
 
-// ── Import Graph Builder ────────────────────────────────────────────────────
-
-/**
- * Build the project's JS/TS import graph. Exported for reuse by `impact`
- * (indirect code→doc analysis walks this graph's reverse edges) — one graph
- * builder, not two.
- *
- * @returns {{files: string[], edges: {from,to,dynamic}[], fileMap: Map<string,string[]>}}
- */
-export function buildImportGraph(projectDir, config) {
-  const graph = { files: [], edges: [], fileMap: new Map() };
-
-  const allFiles = getFilesRecursive(projectDir, config, projectDir);
-  const codeFiles = allFiles.filter(f => CODE_EXTENSIONS.has(extname(f)));
-
-  for (const file of codeFiles) {
-    const relPath = relative(projectDir, file);
-
-    // Skip files in ignored directories (config.ignore)
-    if (config && shouldIgnore(relPath, config)) continue;
-
-    graph.files.push(relPath);
-
-    try {
-      const content = readFileSync(file, 'utf-8');
-      const imports = extractImports(content);
-
-      const resolvedImports = [];
-      for (const imp of imports) {
-        if (!imp.spec.startsWith('.') && !imp.spec.startsWith('/')) continue;
-
-        // Resolve relative imports
-        const fromDir = dirname(file);
-        const resolved = resolveImport(fromDir, imp.spec, projectDir);
-        if (resolved) {
-          graph.edges.push({ from: relPath, to: resolved, dynamic: imp.dynamic });
-          // v0.28 (field report #2): a dynamic `await import()` does NOT create a
-          // load-time edge — it's the canonical way to BREAK an import cycle. So
-          // it's excluded from the cycle-detection adjacency (fileMap) while still
-          // recorded in graph.edges for layer-boundary checks (an import is still
-          // an import for layering).
-          if (!imp.dynamic) resolvedImports.push(resolved);
-        }
-      }
-
-      graph.fileMap.set(relPath, resolvedImports);
-    } catch { /* skip binary or unreadable files */ }
-  }
-
-  return graph;
+function summarizeLimitations(limitations) {
+  const labels = {
+    'python-interpreter-unavailable': 'Python interpreter unavailable',
+    'python-parse-failed': 'Python parse failure',
+    'python-dynamic-import': 'dynamic Python import',
+    'python-path-mutation': 'runtime sys.path mutation',
+    'python-relative-outside-package': 'relative import outside a resolvable package',
+    'python-ambiguous-module': 'ambiguous Python module across import roots',
+    'source-unreadable': 'unreadable source file',
+    'js-parser-unavailable': 'JS/TS parser unavailable, imports read by the pattern fallback',
+    'js-parse-failed': 'JS/TS file read by the pattern fallback after a parse failure',
+  };
+  const counts = new Map();
+  for (const item of limitations) counts.set(item.code, (counts.get(item.code) || 0) + 1);
+  return [...counts].map(([code, count]) => `${labels[code] || code}${count > 1 ? ` (${count})` : ''}`).join('; ');
 }
 
-/**
- * Extract a file's imports as `{ spec, dynamic }`. `dynamic:true` marks a
- * runtime `import('…')` — which does NOT create a load-time dependency edge and
- * is the canonical way to break an import cycle (field report #2). ES `import …
- * from` and CommonJS `require()` are load-time (static).
- */
-function extractImports(content) {
-  const imports = [];
-
-  // ES module imports (static, load-time). `import\s+` requires whitespace after
-  // `import`, so it never matches a dynamic `import(` call.
-  const esImportRegex = /import\s+(?:.*?\s+from\s+)?['"]([^'"]+)['"]/g;
-  let match;
-  while ((match = esImportRegex.exec(content)) !== null) {
-    imports.push({ spec: match[1], dynamic: false });
+function validatePythonConfigLayers(graph, layers, acc) {
+  const layerEntries = Object.entries(layers)
+    .filter(([, value]) => value?.dir && Array.isArray(value.canImport))
+    .map(([name, value]) => ({ name, dir: posixPath(value.dir).replace(/\/$/, ''), canImport: value.canImport }));
+  for (const edge of graph.edges.filter(item => item.language === 'python')) {
+    const from = layerEntries.find(layer => edge.from === layer.dir || edge.from.startsWith(`${layer.dir}/`));
+    const to = layerEntries.find(layer => edge.to === layer.dir || edge.to.startsWith(`${layer.dir}/`));
+    if (!from || !to || from.name === to.name || from.canImport.includes(to.name)) continue;
+    acc.total++;
+    acc.findings.push(mkFinding({
+      code: 'ARC001', validator: 'architecture', severity: 'error', parserTier: edge.tier,
+      message: `${edge.from}: ${from.name} layer imports from forbidden layer (${to.dir})`,
+      location: edge.from,
+      suggestion: { kind: 'fix', text: 'Remove the import or route it through an allowed layer (see the layers config in .docguard.json)' },
+    }));
   }
-
-  // Dynamic imports (runtime — NOT a load-time cycle edge)
-  const dynamicRegex = /import\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
-  while ((match = dynamicRegex.exec(content)) !== null) {
-    imports.push({ spec: match[1], dynamic: true });
-  }
-
-  // CommonJS require (static, load-time)
-  const requireRegex = /require\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
-  while ((match = requireRegex.exec(content)) !== null) {
-    imports.push({ spec: match[1], dynamic: false });
-  }
-
-  return imports;
-}
-
-function resolveImport(fromDir, importPath, projectDir) {
-  // Try to resolve the import to an actual file
-  const extensions = ['.ts', '.tsx', '.js', '.mjs', '.jsx', '.cjs'];
-  const basePath = resolve(fromDir, importPath);
-
-  // Direct file match
-  for (const ext of extensions) {
-    const candidate = basePath + ext;
-    if (existsSync(candidate)) {
-      return relative(projectDir, candidate);
-    }
-  }
-
-  // Exact match (has extension already)
-  if (existsSync(basePath)) {
-    return relative(projectDir, basePath);
-  }
-
-  // Index file match
-  for (const ext of extensions) {
-    const candidate = join(basePath, `index${ext}`);
-    if (existsSync(candidate)) {
-      return relative(projectDir, candidate);
-    }
-  }
-
-  return null;
 }
 
 // ── Circular Dependency Detection ───────────────────────────────────────────
@@ -367,6 +308,7 @@ function validateLayerBoundaries(projectDir, graph, declaredLayers, acc) {
         code: 'ARC003',
         validator: 'architecture',
         severity: 'error',
+        parserTier: edge.tier,
         message: `${edge.from}: ${fromLayer.name} → ${toLayer.name} (forbidden by ARCHITECTURE.md)`,
         location: edge.from,
         suggestion: {
@@ -417,22 +359,3 @@ function getFileLayer(filePath, layerDirMap) {
   return null;
 }
 
-// ── Utilities ───────────────────────────────────────────────────────────────
-
-// v0.29 consolidation: traversal delegates to the shared canonical walker.
-// The old version pruned config-ignored DIRECTORIES before descending; the
-// per-file check below yields the same result set (ignore-glob semantics match
-// any path under the dir — see globToRegex's `^pattern/` alternation), at the
-// cost of descending then filtering. Correctness-equivalent, verified by the
-// ignore-validator specs.
-function getFilesRecursive(dir, config, projectDir) {
-  const results = [];
-  sharedWalkFiles(dir, (fullPath) => {
-    if (config && projectDir) {
-      const relPath = relative(projectDir, fullPath);
-      if (shouldIgnore(relPath, config)) return;
-    }
-    results.push(fullPath);
-  }, { ignoreDirs: IGNORE_DIRS });
-  return results;
-}

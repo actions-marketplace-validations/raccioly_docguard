@@ -1,4 +1,10 @@
+import { compactGuardResult } from '../shared-guard-json.mjs';
+import { describeCheckCoverage, summarizeCheckCoverage } from '../validator-coverage.mjs';
+import { applyDocRoles } from '../shared-doc-roles.mjs';
 /**
+ * @implements docguard.evidence-scoped-verification#FR-010 {scope=file}
+ * @implements docguard.output-ux#FR-001 {scope=file}
+ * @implements docguard.output-ux#FR-008 {scope=file}
  * Guard Command — Validate project against its canonical documentation
  * Runs all enabled validators and reports results.
  *
@@ -7,17 +13,20 @@
  *   runGuardInternal() → returns data, no side effects (for diagnose, ci)
  */
 
-import { c, resolveSeverity, loadIgnorePatterns, resolveDocDirs } from '../shared.mjs';
-import { walkFiles } from '../shared-ignore.mjs';
-import { mkFinding, resultFromFindings } from '../findings.mjs';
+import { c, resolveSeverity, resolveFindingEnforcement, loadIgnorePatterns, resolveDocDirs } from '../shared.mjs';
+import { walkFiles, buildIgnoreFilter } from '../shared-ignore.mjs';
+import { CODES, mkFinding, resultFromFindings } from '../findings.mjs';
 import { loadValidatorSuppressions } from '../validator-markers.mjs';
 import { detectAgentMode, isSpecKitInitialized } from '../ensure-skills.mjs';
+import { readAgentSurface, agentCommand, commandHint } from '../agent-surface.mjs';
+import { findConstitution } from '../scanners/speckit.mjs';
 import { checkUpgradeStatus } from './upgrade.mjs';
 import { changedFilesSince, isGitRepo } from '../shared-git.mjs';
 import { extractSemanticClaims } from '../scanners/semantic-claims.mjs';
 import { toSarif } from '../writers/sarif.mjs';
 import { toJUnit } from '../writers/junit.mjs';
-import { loadBaseline, saveBaseline, fingerprintFinding, BASELINE_FILE } from '../writers/baseline.mjs';
+import { loadBaseline, saveBaseline, fingerprintFinding, legacyFingerprint, baselineAgeDays, BASELINE_FILE } from '../writers/baseline.mjs';
+import { precisionEvidenceBlock } from '../precision-evidence.mjs';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { resolve as resolvePath, relative as relativePath } from 'node:path';
 import { fileURLToPath as fp } from 'node:url';
@@ -153,6 +162,16 @@ import { validateSurfaceSync } from '../validators/surface-sync.mjs';
 import { validateDiffSuspicion } from '../validators/diff-suspicion.mjs';
 import { validateReferenceExistence } from '../validators/reference-existence.mjs';
 import { validateApiDocSmells } from '../validators/api-doc-smells.mjs';
+import { validateDocumentLifecycle } from '../validators/document-lifecycle.mjs';
+import { validateSuppressions } from '../validators/suppressions.mjs';
+import { validateSpecRegistry } from '../validators/spec-registry.mjs';
+import { validateDocDependency } from '../validators/doc-dependency.mjs';
+import { validateRequirementAnchors } from '../validators/requirement-anchors.mjs';
+import { validatePathScopedRules } from '../validators/path-scoped-rules.mjs';
+import { validateDocOwnership } from '../validators/doc-ownership.mjs';
+import { validateEvidence } from '../validators/evidence.mjs';
+import { coverSemanticClaims } from '../evidence/evaluate.mjs';
+import { footerHint } from '../release-age.mjs';
 
 /**
  * Internal guard — returns structured data, no console output, no process.exit.
@@ -199,9 +218,16 @@ function renderableItems(v) {
   if (Array.isArray(v.findings) && v.findings.length > 0) {
     return v.findings.map((f) => ({
       severity: f.severity,
+      effectiveSeverity: f.effectiveSeverity || f.severity,
       message: f.message,
       code: f.code,
       confidence: f.confidence,
+      // Carried, not dropped. The renderer below annotates an `escalate`
+      // finding with "(review — signal, not a verdict)". Omitting the field
+      // here made that annotation unreachable for every structured finding —
+      // which is all of them — so the per-finding half of FR-008 printed
+      // nothing while the summary counts said escalations existed.
+      disposition: f.disposition,
       suggestion: f.suggestion,
     }));
   }
@@ -216,13 +242,24 @@ function renderableItems(v) {
 // .md could drift forever while guard stayed green — the human had to REMEMBER to
 // enroll each doc, which is exactly the step that fails silently. We deliberately
 // do NOT deep-scan every doc for claims (that floods false positives — see the
-// wu-whatsappinbox scar in metrics-consistency). Instead we cheaply report what's
+// downstream-project scar in metrics-consistency). Instead we cheaply report what's
 // under a validation tier and what isn't, turning silent non-coverage into a
 // visible nudge. Pure visibility — never gates the build.
 //
 // DocGuard's OWN installed slash-command docs are tool-managed, not the project's
 // docs — counting them as "untracked drift" is noise the user can't act on.
 const DOCGUARD_OWN_DOC_RE = /(^|\/)commands\/docguard\.[a-z-]+\.md$/i;
+
+// At or below this many untiered files, print the names instead of a count: a
+// nag you cannot act on from the run that printed it is a nag users learn to
+// skip. Above it, the count plus `--verbose` stays calmer than a wall of paths.
+const INLINE_UNCLASSIFIED = 3;
+
+// A Markdown artifact inside a top-level Spec Kit feature directory: spec,
+// plan, tasks, research, data-model, quickstart, contracts/, checklists/.
+// Nested `specs/` trees (fixtures under tests/ or benchmarks/) are not the
+// project's own Spec Kit artifacts.
+const SPEC_KIT_FEATURE_DOC_RE = /^specs\/[^/]+\/.+\.md$/i;
 
 function collectMarkdown(projectDir) {
   const out = [];
@@ -239,43 +276,58 @@ function collectMarkdown(projectDir) {
 /**
  * Classify every discoverable Markdown file into a validation tier:
  *   canonical    — in requiredFiles.canonical (structure + review-gated)
- *   tracked      — under a doc home or root-level (claim/freshness checks reach it)
+ *   specKit      — Spec Kit artifacts: every Markdown file in a top-level
+ *                  specs/<feature>/ directory, plus the constitution. The
+ *                  Spec-Kit validator and the spec registry own these; before
+ *                  this tier existed they were all reported "outside any tier"
+ *                  and the constitution (in a dot directory) was never seen.
+ *   tracked      — inventoried under a doc home or at root; individual detector scopes differ
  *   ignored      — matched by .docguardignore
  *   unclassified — under NO tier; drift here is invisible (the Gap-1 trap)
  */
 function computeDocCoverage(projectDir, config) {
-  const isIgnored = loadIgnorePatterns(projectDir);
+  const fileIgnored = loadIgnorePatterns(projectDir);
+  const configIgnored = buildIgnoreFilter(config.ignore || []);
+  const isIgnored = path => fileIgnored(path) || configIgnored(path);
   const canonical = new Set(
     ((config.requiredFiles && config.requiredFiles.canonical) || []).map(p => p.replace(/\\/g, '/'))
   );
   // Any path declared in documentTypes is a KNOWN doc (even if optional) — not
   // "untracked." This keeps the warning specific to genuinely-unenrolled files.
   const known = new Set(Object.keys(config.documentTypes || {}).map(p => p.replace(/\\/g, '/')));
-  // Same doc-home set the claim scanner uses — so "tracked" provably means
-  // "actually scanned," never a label the scanner ignores. With trailing slash
-  // for prefix matching.
+  // This is a document inventory, not a claim that every detector checks
+  // each tracked file. Keep individual check coverage separate.
   const docHomePrefixes = resolveDocDirs(projectDir, config).map(d => d.replace(/\/?$/, '/'));
   const all = collectMarkdown(projectDir);
-  let canonicalCount = 0, tracked = 0, ignored = 0;
+  // The walker skips dot directories; the constitution usually lives in one.
+  const constitution = findConstitution(projectDir);
+  if (constitution && !all.includes(constitution.rel)) all.push(constitution.rel);
+  let canonicalCount = 0, tracked = 0, ignored = 0, specKit = 0;
   const unclassified = [];
   for (const rel of all) {
-    if (canonical.has(rel)) { canonicalCount++; continue; }
     if (isIgnored(rel) || DOCGUARD_OWN_DOC_RE.test(rel)) { ignored++; continue; }
+    if (canonical.has(rel)) { canonicalCount++; continue; }
+    if (SPEC_KIT_FEATURE_DOC_RE.test(rel) || rel === constitution?.rel) { specKit++; continue; }
     const inHome = docHomePrefixes.some(h => rel.startsWith(h));
     const atRoot = !rel.includes('/');
     if (inHome || atRoot || known.has(rel)) { tracked++; continue; }
     unclassified.push(rel);
   }
-  return { discovered: all.length, canonical: canonicalCount, tracked, ignored, unclassified };
+  return { discovered: all.length, canonical: canonicalCount, specKit, tracked, ignored, unclassified };
 }
 
 export function runGuardInternal(projectDir, config) {
+  config = applyDocRoles(projectDir, config);
   const validators = config.validators || {};
   const results = [];
 
   const validatorMap = [
     { key: 'structure', name: 'Structure', fn: () => validateStructure(projectDir, config) },
-    { key: 'structure', name: 'Doc Sections', fn: () => validateDocSections(projectDir, config) },
+    // docguard.output-ux#FR-008: its own key, so full and compact results can
+    // tell it from Structure. Configs written for the shared `structure` key
+    // keep working: `parent` supplies the switch, severity and N/A marker
+    // whenever the config does not name docSections itself.
+    { key: 'docSections', parent: 'structure', name: 'Doc Sections', fn: () => validateDocSections(projectDir, config) },
     { key: 'docsSync', name: 'Docs-Sync', fn: () => validateDocsSync(projectDir, config) },
     { key: 'drift', name: 'Drift-Comments', fn: () => validateDrift(projectDir, config) },
     { key: 'changelog', name: 'Changelog', fn: () => validateChangelog(projectDir, config) },
@@ -286,8 +338,7 @@ export function runGuardInternal(projectDir, config) {
     { key: 'freshness', name: 'Freshness', fn: () => {
       // v0.29: adapter now emits structured findings (FRS001–FRS005). The
       // validator keeps its array-of-{status, code, doc, message} contract;
-      // messages are byte-identical (the sweep-needed nudge below regex-matches
-      // them), so counts/exit codes are unchanged.
+      // messages describe review signals rather than asserting semantic drift.
       const freshnessResults = validateFreshness(projectDir, config);
       const findings = [];
       let passed = 0;
@@ -298,14 +349,17 @@ export function runGuardInternal(projectDir, config) {
           code: r.code || null,
           validator: 'freshness',
           severity: r.status === 'fail' ? 'error' : 'warn',
+          confidence: r.confidence || 'low',
+          disposition: r.disposition || 'escalate',
           message: r.message,
           location: r.doc || null,
-          suggestion: r.code === 'FRS001'
-            ? { kind: 'fix', text: 'Commit the doc, or stamp it reviewed', pragma: '<!-- docguard:last-reviewed YYYY-MM-DD -->' }
-            : { kind: 'fix', text: 'Refresh the stale code-truth sections', command: 'docguard sync --write' },
+          suggestion: r.suggestion || { kind: 'review', text: 'Review the document against its intended scope. A history signal does not establish which side should change.' },
         }));
       }
-      return resultFromFindings(findings, { passed, total: passed + findings.length });
+      const skipped = freshnessResults.filter(r => r.status === 'skip');
+      const prerequisite = skipped.find(r => r.prerequisite)?.prerequisite;
+      if (prerequisite) return { ...resultFromFindings(findings, { passed, total: passed + findings.length }), applicability: prerequisite };
+      return { ...resultFromFindings(findings, { passed, total: passed + findings.length }), ...(passed + findings.length === 0 && skipped.length ? { applicability: { status: 'no-matches', reason: skipped.map(r => r.message).join('; ') } } : {}) };
     }},
     { key: 'traceability', name: 'Traceability', fn: () => validateTraceability(projectDir, config) },
     { key: 'docsDiff', name: 'Docs-Diff', fn: () => validateDocsDiff(projectDir, config) },
@@ -316,9 +370,18 @@ export function runGuardInternal(projectDir, config) {
     { key: 'todoTracking', name: 'TODO-Tracking', fn: () => validateTodoTracking(projectDir, config) },
     { key: 'schemaSync', name: 'Schema-Sync', fn: () => validateSchemaSync(projectDir, config) },
     { key: 'specKit', name: 'Spec-Kit', fn: () => validateSpecKitIntegration(projectDir, config) },
+    { key: 'documentLifecycle', name: 'Document-Lifecycle', fn: () => validateDocumentLifecycle(projectDir, config) },
+    { key: 'specRegistry', name: 'Spec-Registry', fn: () => validateSpecRegistry(projectDir, config) },
+    { key: 'docDependency', name: 'Doc-Dependency', fn: () => validateDocDependency(projectDir, config) },
+    { key: 'requirementAnchors', name: 'Requirement-Anchors', fn: () => validateRequirementAnchors(projectDir, config) },
+    { key: 'pathScopedRules', name: 'Path-Scoped-Rules', fn: () => validatePathScopedRules(projectDir, config) },
+    { key: 'docOwnership', name: 'Doc-Ownership', fn: () => validateDocOwnership(projectDir, config) },
+    { key: 'evidence', name: 'Evidence', fn: () => validateEvidence(projectDir, config) },
     { key: 'crossReference', name: 'Cross-Reference', fn: () => validateCrossReferences(projectDir, config) },
     { key: 'generatedStaleness', name: 'Generated-Staleness', fn: () => validateGeneratedStaleness(projectDir, config) },
     { key: 'surfaceSync', name: 'Surface-Sync', fn: () => validateSurfaceSync(projectDir, config) },
+    // docguard.ignore-reasons#FR-005: expired, unreadable and (opt-in) reason-less .docguardignore entries.
+    { key: 'suppressions', name: 'Suppressions', fn: () => validateSuppressions(projectDir, config) },
     // v0.31.0 — change-driven + smell detectors (all confidence:low / soft).
     { key: 'diffSuspicion', name: 'Diff-Suspicion', fn: () => validateDiffSuspicion(projectDir, config) },
     { key: 'referenceExistence', name: 'Reference-Existence', fn: () => validateReferenceExistence(projectDir, config) },
@@ -341,13 +404,14 @@ export function runGuardInternal(projectDir, config) {
   // v0.14-Q2: per-validator timing. Cheap (one `performance.now()` pair per
   // validator) and the data is what we'd need to optimize anything later.
   // Exposed via --profile in the public guard.
-  for (const { key, name, fn } of validatorMap) {
-    if (naMarkers.has(key)) {
-      results.push(naResult(name, key));
+  for (const { key, parent, name, fn } of validatorMap) {
+    const naKey = naMarkers.has(key) ? key : parent && naMarkers.has(parent) ? parent : null;
+    if (naKey) {
+      results.push({ ...naResult(name, naKey), key, ...(parent ? { parent } : {}) });
       continue;
     }
-    if (validators[key] === false) {
-      results.push({ name, key, status: 'skipped', quality: null, errors: [], warnings: [], passed: 0, total: 0, durationMs: 0 });
+    if (validators[key] === false || (parent && validators[key] === undefined && validators[parent] === false)) {
+      results.push({ name, key, ...(parent ? { parent } : {}), status: 'skipped', quality: null, errors: [], warnings: [], passed: 0, total: 0, durationMs: 0 });
       continue;
     }
 
@@ -355,10 +419,10 @@ export function runGuardInternal(projectDir, config) {
     try {
       const result = fn();
       const durationMs = Math.round((performance.now() - start) * 100) / 100;
-      results.push({ ...result, name, key, durationMs, ...classifyResult(result) });
+      results.push({ ...result, name, key, ...(parent ? { parent } : {}), durationMs, ...classifyResult(result) });
     } catch (err) {
       const durationMs = Math.round((performance.now() - start) * 100) / 100;
-      results.push({ name, key, status: 'fail', quality: 'LOW', errors: [err.message], warnings: [], passed: 0, total: 1, durationMs });
+      results.push({ name, key, ...(parent ? { parent } : {}), status: 'fail', quality: 'LOW', applicability: { status: 'error', reason: 'Validator could not complete: ' + err.message }, errors: [err.message], warnings: [], passed: 0, total: 1, durationMs });
     }
   }
 
@@ -376,7 +440,7 @@ export function runGuardInternal(projectDir, config) {
       results.push({ ...result, name: 'Canonical-Sync', key: 'canonicalSync', durationMs, ...classifyResult(result) });
     } catch (err) {
       const durationMs = Math.round((performance.now() - start) * 100) / 100;
-      results.push({ name: 'Canonical-Sync', key: 'canonicalSync', status: 'fail', quality: 'LOW', errors: [err.message], warnings: [], passed: 0, total: 1, durationMs });
+      results.push({ name: 'Canonical-Sync', key: 'canonicalSync', status: 'fail', quality: 'LOW', applicability: { status: 'error', reason: 'Validator could not complete: ' + err.message }, errors: [err.message], warnings: [], passed: 0, total: 1, durationMs });
     }
   }
 
@@ -391,7 +455,7 @@ export function runGuardInternal(projectDir, config) {
       results.push({ ...result, name: 'Metrics-Consistency', key: 'metricsConsistency', durationMs, ...classifyResult(result) });
     } catch (err) {
       const durationMs = Math.round((performance.now() - start) * 100) / 100;
-      results.push({ name: 'Metrics-Consistency', key: 'metricsConsistency', status: 'fail', quality: 'LOW', errors: [err.message], warnings: [], passed: 0, total: 1, durationMs });
+      results.push({ name: 'Metrics-Consistency', key: 'metricsConsistency', status: 'fail', quality: 'LOW', applicability: { status: 'error', reason: 'Validator could not complete: ' + err.message }, errors: [err.message], warnings: [], passed: 0, total: 1, durationMs });
     }
   }
 
@@ -404,6 +468,11 @@ export function runGuardInternal(projectDir, config) {
   // errors/warnings can't be fingerprinted), and `--no-baseline`
   // (config.baseline === false) turns it off.
   let baselineSuppressed = 0;
+  // What the baseline hides, not only how much (#437; field-report-followups#FR-002).
+  const baselineBySeverity = { error: 0, warn: 0, info: 0 };
+  let baselineStillFiring = 0;
+  let baselineStale = 0;
+  let baselineAge = null;
   const baselineMap = config.baseline === false ? null : loadBaseline(projectDir);
   if (baselineMap) {
     // Occurrence budget: each fingerprint suppresses at most its frozen
@@ -414,10 +483,20 @@ export function runGuardInternal(projectDir, config) {
       if (!Array.isArray(r.findings) || r.findings.length === 0) continue;
       if (r.errors.length + r.warnings.length !== r.findings.length) continue;
       const kept = r.findings.filter(f => {
-        const fp = fingerprintFinding(f);
+        // The exact (legacy) fingerprint first, then the stable one; one finding
+        // consumes one unit from one entry (docguard.baseline-stable-fingerprint
+        // #FR-002). Exact first because findings that differ only in digits and
+        // in their advisory tail share a stable fingerprint: tried first, it let
+        // a hinted finding spend the unit a legacy baseline holds for an
+        // unhinted one (FR-006). For a finding without a tail both are equal.
+        const stable = fingerprintFinding(f);
+        const legacy = legacyFingerprint(f);
+        const fp = (remaining.get(legacy) || 0) > 0 ? legacy : stable;
         const budget = remaining.get(fp) || 0;
         if (budget <= 0) return true;
         remaining.set(fp, budget - 1);
+        const sev = f.severity === 'error' ? 'error' : f.severity === 'info' ? 'info' : 'warn';
+        baselineBySeverity[sev]++;
         return false;
       });
       const removed = r.findings.length - kept.length;
@@ -429,32 +508,62 @@ export function runGuardInternal(projectDir, config) {
       r.total = r.passed + kept.length;
       Object.assign(r, classifyResult(r));
     }
+    // Both numbers fall out of the loop above at no extra cost. A fingerprint
+    // whose budget was consumed still fires today (frozen, never resolved); one
+    // whose budget is untouched no longer matches anything, so the baseline can
+    // shrink. Reporting only the suppression total let a baseline quietly become
+    // permanent amnesty and never get smaller.
+    for (const [fp, frozen] of baselineMap) {
+      if ((remaining.get(fp) || 0) < frozen) baselineStillFiring++;
+      else baselineStale++;
+    }
+    baselineAge = baselineAgeDays(baselineMap.generatedAt);
   }
 
+  for (const key of ['canonicalSync', 'metricsConsistency']) {
+    if (validators[key] === false && !results.some(r => r.key === key)) results.push({ key, name: key === 'canonicalSync' ? 'Canonical-Sync' : 'Metrics-Consistency', status: 'skipped', quality: null, errors: [], warnings: [], passed: 0, total: 0, durationMs: 0 });
+  }
+  for (const result of results) result.applicability = describeCheckCoverage(projectDir, config, result);
+  const checkCoverage = summarizeCheckCoverage(results);
   const activeResults = results.filter(r => r.status !== 'skipped');
   const totalErrors = activeResults.reduce((sum, r) => sum + r.errors.length, 0);
   const totalWarnings = activeResults.reduce((sum, r) => sum + r.warnings.length, 0);
   const totalPassed = activeResults.reduce((sum, r) => sum + r.passed, 0);
   const totalChecks = activeResults.reduce((sum, r) => sum + r.total, 0);
 
-  // Per-validator severity overrides (v0.5 schema). Affects EXIT-CODE only,
-  // not display. Annotate each validator with its resolved severity and roll
-  // up effective error/warning counts:
-  //   - high  → validator's warnings get promoted to "effective errors"
-  //   - low   → validator's warnings are demoted (ignored for exit code)
-  //   - medium (default) → warnings stay as-is
+  // Compute enforcement after baseline suppression. Structured findings can
+  // be reweighted by exact stable code; legacy validators retain the existing
+  // per-validator behavior. Preserve intrinsic severity for auditability.
+  // A child validator (docSections) inherits its parent's severity policy
+  // unless the config names the child (docguard.output-ux#FR-008).
+  const parentOf = Object.fromEntries(validatorMap.filter(v => v.parent).map(v => [v.key, v.parent]));
+  const policyKey = key => (parentOf[key] && config.severity?.[key] === undefined ? parentOf[key] : key);
   for (const v of activeResults) {
-    v.severity = resolveSeverity(config, v.key);
+    v.severity = resolveSeverity(config, policyKey(v.key));
+    let errors = 0, warnings = 0, infos = 0;
+    if (Array.isArray(v.findings) && v.findings.length > 0) {
+      for (const finding of v.findings) {
+        const enforcement = resolveFindingEnforcement(config, finding, policyKey(v.key));
+        finding.effectiveSeverity = enforcement.level;
+        finding.enforcement = enforcement;
+        if (enforcement.level === 'error') errors++;
+        else if (enforcement.level === 'warn') warnings++;
+        else infos++;
+      }
+    } else {
+      errors = v.errors.length;
+      if (v.severity === 'high') errors += v.warnings.length;
+      else if (v.severity === 'medium') warnings = v.warnings.length;
+      else infos = v.warnings.length;
+    }
+    v.effectiveErrors = errors;
+    v.effectiveWarnings = warnings;
+    v.effectiveInfos = infos;
+    v.effectiveStatus = errors > 0 ? 'fail' : warnings > 0 ? 'warn' : v.status === 'na' ? 'na' : 'pass';
   }
-  let effectiveErrors = totalErrors;
-  let effectiveWarnings = 0;
-  for (const v of activeResults) {
-    const wCount = v.warnings.length;
-    if (wCount === 0) continue;
-    if (v.severity === 'high') effectiveErrors += wCount;
-    else if (v.severity === 'low') { /* ignored for exit */ }
-    else effectiveWarnings += wCount;
-  }
+  const effectiveErrors = activeResults.reduce((sum, v) => sum + v.effectiveErrors, 0);
+  const effectiveWarnings = activeResults.reduce((sum, v) => sum + v.effectiveWarnings, 0);
+  const effectiveInfos = activeResults.reduce((sum, v) => sum + v.effectiveInfos, 0);
 
   // The headline status word MUST agree with the exit code, which is
   // severity-aware (effectiveErrors/effectiveWarnings, computed above).
@@ -480,9 +589,14 @@ export function runGuardInternal(projectDir, config) {
   const lite = Array.isArray(config.changedFiles);
   let coverage = null;
   let semanticClaims = null;
+  const evidence = results.find(result => result.key === 'evidence')?.evidence || null;
   if (!lite) {
     try { coverage = computeDocCoverage(projectDir, config); } catch { coverage = null; }
-    try { semanticClaims = { count: extractSemanticClaims(projectDir, config).length }; }
+    try {
+      const claims = extractSemanticClaims(projectDir, config);
+      const scoped = coverSemanticClaims(claims, evidence);
+      semanticClaims = { count: scoped.unverified, discovered: scoped.total, verifiedWithinScope: scoped.verifiedWithinScope, coveredClaimIds: scoped.covered };
+    }
     catch { semanticClaims = null; }
   }
 
@@ -502,9 +616,19 @@ export function runGuardInternal(projectDir, config) {
     // things they've marked as high-severity.
     effectiveErrors,
     effectiveWarnings,
+    effectiveInfos,
     baselineSuppressed,
+    baselineBySeverity,
+    baselineStillFiring,
+    baselineStale,
+    baselineAgeDays: baselineAge,
     coverage,
+    checkCoverage,
     semanticClaims,
+    evidence,
+    // Benchmark evidence for the codes this run actually emitted. Codes the
+    // corpus never exercised say so; none inherits another code's measurement.
+    precisionEvidence: precisionEvidenceBlock(allFindings.map(f => f.code), CLI_VERSION),
     validators: results,
     // Unknown keys in `docguard:validator … n/a` markers — typo protection so
     // a mistyped key doesn't silently fail to suppress. Surfaced by runGuard.
@@ -513,6 +637,47 @@ export function runGuardInternal(projectDir, config) {
     ),
     timestamp: new Date().toISOString(),
   };
+}
+
+/**
+ * Validator states that mean DocGuard could NOT check what it was asked to.
+ *
+ * `no-matches` is deliberately absent: a validator that ran and found nothing
+ * applicable did its job completely. `disabled` and `not-applicable` are
+ * choices the project made, not gaps.
+ * @implements docguard.calibrated-finding-channels#FR-020
+ */
+export const INCOMPLETE_COVERAGE_STATES = Object.freeze(['partial', 'missing-prerequisite', 'unsupported', 'error']);
+
+/** How many active validators could not complete their checks. */
+export function incompleteCoverage(checkCoverage) {
+  if (!checkCoverage || !checkCoverage.counts) return 0;
+  return INCOMPLETE_COVERAGE_STATES.reduce((sum, key) => sum + (checkCoverage.counts[key] || 0), 0);
+}
+
+/**
+ * Badge colour for a run.
+ *
+ * `passed/total` counts CHECKS, and its denominator excludes every validator
+ * that could not run — so a run can print 100% while part of the project went
+ * unexamined. The summary says so in prose, but the badge is the artifact that
+ * travels into a README without the prose.
+ *
+ * The cap is `green`, not `yellow`, and the distinction matters: a partial run
+ * is not a failing run, since everything that ran passed. `yellow` would be
+ * wrong, and would train readers to ignore the badge on any project that
+ * legitimately has no API reference. `brightgreen` claims everything is fine,
+ * which a run that could not read its Python imports cannot support.
+ * `green` says: passed, with a caveat.
+ *
+ * @param {number} pct passed/total as a percentage
+ * @param {number} incomplete active validators that could not complete
+ * @implements docguard.calibrated-finding-channels#FR-020
+ */
+export function badgeColor(pct, incomplete = 0) {
+  if (pct >= 90) return incomplete > 0 ? 'green' : 'brightgreen';
+  if (pct >= 70) return 'green';
+  return pct >= 50 ? 'yellow' : 'red';
 }
 
 /**
@@ -526,7 +691,7 @@ export function runGuardInternal(projectDir, config) {
  * Freshness (git log), Traceability (REQ scan), Doc-Quality (prose lint) —
  * stay off for speed.
  */
-export const CHANGED_ONLY_VALIDATORS = ['docsSync', 'environment', 'apiSurface', 'drift', 'todoTracking'];
+export const CHANGED_ONLY_VALIDATORS = ['docsSync', 'environment', 'apiSurface', 'drift', 'todoTracking', 'evidence', 'docDependency'];
 
 /**
  * Build a validators map that enables the pre-commit-lite set — PLUS any
@@ -542,17 +707,28 @@ export const CHANGED_ONLY_VALIDATORS = ['docsSync', 'environment', 'apiSurface',
  */
 export function liteValidatorsConfig(config = {}) {
   const all = [
-    'structure', 'docsSync', 'drift', 'changelog', 'testSpec', 'environment',
+    'structure', 'docSections', 'docsSync', 'drift', 'changelog', 'testSpec', 'environment',
     'security', 'architecture', 'freshness', 'traceability', 'docsDiff',
     'apiSurface', 'metadataSync', 'docsCoverage', 'docQuality', 'todoTracking',
     'schemaSync', 'specKit', 'crossReference', 'generatedStaleness',
-    'canonicalSync', 'metricsConsistency',
+    'canonicalSync', 'surfaceSync', 'metricsConsistency', 'documentLifecycle',
+    'specRegistry', 'diffSuspicion', 'referenceExistence', 'apiDocSmells',
+    'evidence', 'docDependency', 'requirementAnchors', 'pathScopedRules', 'docOwnership', 'suppressions',
   ];
   const userValidators = (config && config.validators) || {};
+  const exactHighValidators = new Set(
+    Object.entries(config.findingSeverity || {})
+      .filter(([, level]) => typeof level === 'string' && level.toLowerCase() === 'high')
+      .map(([code]) => CODES[code.toUpperCase()]?.validator)
+      .filter(Boolean)
+  );
   const out = {};
   for (const k of all) {
     let enabled = CHANGED_ONLY_VALIDATORS.includes(k);
-    if (!enabled && resolveSeverity(config, k) === 'high' && userValidators[k] !== false) {
+    // docSections follows structure's policy unless named (docguard.output-ux#FR-008).
+    const policy = k === 'docSections' && config.severity?.docSections === undefined ? 'structure' : k;
+    const userSwitch = k === 'docSections' && userValidators.docSections === undefined ? userValidators.structure : userValidators[k];
+    if (!enabled && (resolveSeverity(config, policy) === 'high' || exactHighValidators.has(k)) && userSwitch !== false) {
       enabled = true;
     }
     out[k] = enabled;
@@ -591,7 +767,11 @@ export function runGuard(projectDir, config, flags) {
     const escalatedNote = escalated.length > 0
       ? ` ${c.yellow}+ ${escalated.length} high-severity validator(s): ${escalated.join(', ')}${c.reset}`
       : '';
-    console.log(`${c.cyan}⚡ docguard guard --changed-only${c.reset} ${c.dim}(${label})${c.reset}${escalatedNote}\n`);
+    // docguard.output-ux#FR-001: in a machine format stdout is the artifact,
+    // so the note explaining the reduced validator set goes to stderr.
+    const note = `${c.cyan}⚡ docguard guard --changed-only${c.reset} ${c.dim}(${label})${c.reset}${escalatedNote}\n`;
+    if (['json', 'sarif', 'junit'].includes(flags.format)) process.stderr.write(`${note}\n`);
+    else console.log(note);
   }
 
   // ── `--update-baseline`: freeze the CURRENT full finding set ──
@@ -620,12 +800,23 @@ export function runGuard(projectDir, config, flags) {
 
   const data = runGuardInternal(projectDir, config);
 
+  // A project with no .docguard.json has not adopted DocGuard. Its "failures"
+  // are missing canonical docs, which is not the same fact as "this project
+  // failed its checks" — and consumers need to tell them apart. Exit 3 says
+  // "not initialised": still non-zero, so a CI gate that fails on any non-zero
+  // status is unchanged, but the generated Git hook can let the commit through
+  // instead of blocking a project that never adopted the tool.
+  const uninitialised = !existsSync(resolvePath(projectDir, '.docguard.json'));
+  const exitFor = d => (d.effectiveErrors > 0
+    ? (uninitialised ? 3 : 1)
+    : d.effectiveWarnings > 0 ? 2 : 0);
+
   // ── SARIF output (2.1.0) ──
   // Same flush discipline as the JSON branch below (bug-105): set exitCode and
   // write+return so a piped consumer never gets a truncated payload.
   if (flags.format === 'sarif') {
     const sarif = toSarif(data, { projectDir });
-    process.exitCode = data.effectiveErrors > 0 ? 1 : data.effectiveWarnings > 0 ? 2 : 0;
+    process.exitCode = exitFor(data);
     process.stdout.write(JSON.stringify(sarif, null, 2) + '\n');
     return;
   }
@@ -636,7 +827,7 @@ export function runGuard(projectDir, config, flags) {
   // Exit-code semantics identical to sarif/json.
   if (flags.format === 'junit') {
     const xml = toJUnit(data);
-    process.exitCode = data.effectiveErrors > 0 ? 1 : data.effectiveWarnings > 0 ? 2 : 0;
+    process.exitCode = exitFor(data);
     process.stdout.write(xml + '\n');
     return;
   }
@@ -645,14 +836,16 @@ export function runGuard(projectDir, config, flags) {
   if (flags.format === 'json') {
     // Use severity-aware effective counts for exit code; raw counts stay in the JSON
     // for display tools that want to show the full picture.
-    const code = data.effectiveErrors > 0 ? 1 : data.effectiveWarnings > 0 ? 2 : 0;
+    const code = exitFor(data);
     // v0.28: set exitCode + return instead of process.exit(). A large JSON
     // payload (>~8 KB) written to a PIPE flushes asynchronously; an immediate
     // process.exit() truncates it mid-string, so a CI consumer parsing stdout
     // gets "Unterminated string in JSON" on exactly the big reports that matter.
     // Returning lets Node drain stdout and exit naturally with process.exitCode.
     process.exitCode = code;
-    process.stdout.write(JSON.stringify(data, null, 2) + '\n');
+    // docguard.compact-guard-response#FR-004: --compact selects the projection;
+    // the default JSON contract is unchanged.
+    process.stdout.write(JSON.stringify(flags.compact ? compactGuardResult(data) : data, null, 2) + '\n');
     return;
   }
 
@@ -671,8 +864,9 @@ export function runGuard(projectDir, config, flags) {
     // Not applicable — nothing to validate. Render neutrally (NOT a green pass)
     // so the reader can tell "checked and clean" apart from "nothing checked".
     if (v.status === 'na') {
-      const reason = v.note ? ` ${c.dim}(${v.note})${c.reset}` : ` ${c.dim}(nothing to validate)${c.reset}`;
-      console.log(`  ${c.dim}➖ ${v.name}${c.reset} ${c.dim}[N/A]${c.reset}${reason}`);
+      const showReason = flags.verbose || ['unsupported', 'partial', 'missing-prerequisite', 'error'].includes(v.applicability.status);
+      const reason = showReason ? ` ${c.dim}(${v.applicability.reason})${c.reset}` : '';
+      console.log(`  ${c.dim}➖ ${v.name}${c.reset} ${c.dim}[${v.applicability.status}]${c.reset}${reason}`);
       continue;
     }
 
@@ -687,6 +881,9 @@ export function runGuard(projectDir, config, flags) {
     } else {
       console.log(`  ${c.yellow}⚠️  ${v.name}${c.reset} ${qBadge}${c.dim}  ${v.passed}/${v.total} checks passed${c.reset}`);
     }
+    if (v.requirementCoverage?.deferred > 0) {
+      console.log(`     ${c.dim}${v.requirementCoverage.deferred} planned requirement(s) deferred by reviewed lifecycle${c.reset}`);
+    }
 
     // --show-failing forces enumeration of every error/warning regardless of
     // overall validator status — useful when a validator passes overall
@@ -700,12 +897,19 @@ export function runGuard(projectDir, config, flags) {
     for (const item of renderableItems(v)) {
       if (item.severity === 'error' && !showErr) continue;
       if (item.severity === 'warn' && !showWarn) continue;
-      const mark = item.severity === 'error' ? `${c.red}✗` : `${c.yellow}⚠`;
+      const effective = item.effectiveSeverity || item.severity;
+      const mark = effective === 'error' ? `${c.red}✗` : effective === 'info' ? `${c.cyan}•` : `${c.yellow}⚠`;
       const codeTag = item.code ? `${c.dim}[${item.code}]${c.reset} ` : '';
+      // Two distinct annotations, because they answer different questions.
+      // `low confidence` = the detector may have misread its input.
+      // `review` = the detector read its input correctly and the judgement is
+      // yours. A finding can be neither, either, or both.
       const conf = item.confidence === 'low'
         ? ` ${c.dim}(low confidence — possible false positive)${c.reset}` : '';
-      console.log(`     ${mark} ${codeTag}${item.message}${c.reset}${conf}`);
-      if (item.suggestion) {
+      const disp = item.disposition === 'escalate' && item.confidence !== 'low'
+        ? ` ${c.dim}(review — signal, not a verdict)${c.reset}` : '';
+      console.log(`     ${mark} ${codeTag}${item.message}${c.reset}${conf}${disp}`);
+      if (item.suggestion?.text) {
         console.log(`       ${c.cyan}→${c.reset} ${c.dim}${item.suggestion.text}${c.reset}`);
         if (item.suggestion.command) {
           console.log(`         ${c.cyan}${item.suggestion.command}${c.reset}`);
@@ -748,7 +952,39 @@ export function runGuard(projectDir, config, flags) {
   // Baseline suppression is always visible — a gate that hides findings
   // silently is the false-green failure mode this tool exists to prevent.
   if (data.baselineSuppressed > 0) {
-    console.log(`  ${c.dim}📋 ${data.baselineSuppressed} pre-existing finding(s) suppressed by ${BASELINE_FILE} (--no-baseline to show)${c.reset}`);
+    const sev = data.baselineBySeverity;
+    const split = sev
+      ? ` — ${[['error', 'error'], ['warn', 'warning'], ['info', 'info']].filter(([k]) => sev[k] > 0).map(([k, label]) => `${sev[k]} ${label}`).join(' · ')}`
+      : '';
+    console.log(`  ${c.dim}📋 ${data.baselineSuppressed} pre-existing finding(s) suppressed by ${BASELINE_FILE}${split} (--no-baseline to show)${c.reset}`);
+    // Age the amnesty. Wording stays inside what the file can prove: entries
+    // carry occurrence counts, not per-entry timestamps, so "still suppressed"
+    // is demonstrable while "never triaged" would be a guess -- someone may have
+    // fixed and re-frozen. The stale count is the one that lets it shrink.
+    const parts = [];
+    if (data.baselineAgeDays !== null && data.baselineAgeDays !== undefined) {
+      parts.push(`baseline is ${data.baselineAgeDays} day(s) old`);
+    }
+    if (data.baselineStillFiring > 0) parts.push(`${data.baselineStillFiring} still suppressed`);
+    if (data.baselineStale > 0) parts.push(`${data.baselineStale} no longer occur — safe to drop`);
+    if (parts.length) {
+      // Bare flags, not skill(): that helper is declared further down this
+      // function, and the suppression line above already uses the same style.
+      const action = data.baselineStale > 0 ? ' Re-freeze to drop them: --update-baseline' : '';
+      console.log(`  ${c.dim}   ${parts.join('; ')}.${action}${c.reset}`);
+    }
+  }
+
+  // Act vs escalate, immediately under the verdict: the verdict says whether
+  // CI blocks, this says what the work actually is. Severity alone cannot
+  // express it — a blocking error can still be an escalation.
+  if (Array.isArray(data.findings) && data.findings.length > 0) {
+    const act = data.findings.filter(f => f.disposition === 'act').length;
+    const escalate = data.findings.length - act;
+    const parts = [];
+    if (act > 0) parts.push(`${c.cyan}${act} to fix${c.reset}${c.dim}`);
+    if (escalate > 0) parts.push(`${c.yellow}${escalate} to review${c.reset}${c.dim}`);
+    console.log(`  ${c.dim}${parts.join(' · ')} ${c.reset}${c.dim}(fix = DocGuard names the correction; review = the judgement is yours)${c.reset}`);
   }
 
   // ── Next steps — every run ends with a suggested action (v0.27) ──
@@ -756,8 +992,11 @@ export function runGuard(projectDir, config, flags) {
   // suggest what to do next; on a clean run it points at the next workflow step
   // rather than nagging. JSON consumers read this off the `nextStep`/`reportable`
   // contract fields instead of this prose.
+  // A slash command only when its file exists for this project's agent,
+  // otherwise the CLI command (docguard.spec-kit-integration-honesty#FR-006).
   const agentMode = detectAgentMode(projectDir);
-  const skill = (name) => (agentMode === 'llm' ? `/docguard.${name}` : `docguard ${name}`);
+  const surface = readAgentSurface(projectDir);
+  const skill = (name) => commandHint(projectDir, surface, name);
 
   if (data.status !== 'PASS') {
     console.log(`  ${c.dim}Next: run ${c.cyan}${skill('diagnose')}${c.dim} to get AI fix prompts that resolve the issues above.${c.reset}`);
@@ -765,17 +1004,37 @@ export function runGuard(projectDir, config, flags) {
     console.log(`  ${c.dim}Next: ${c.cyan}${skill('score')}${c.dim} for your CDD maturity score, or commit with confidence.${c.reset}`);
   }
 
-  // Low-confidence findings (possible false positives) → offer the local-first
-  // feedback path. Broader than secrets: anything DocGuard flagged uncertainly.
-  if (Array.isArray(data.reportable) && data.reportable.length > 0) {
-    const n = data.reportable.length;
-    console.log(`  ${c.dim}↪ ${n} finding(s) look uncertain (possible false positives). Review or report: ${c.cyan}${skill('feedback')}${c.reset}`);
+  // Analyzer tiers, whenever any evidence came from the pattern fallback.
+  // Silent on a fully-parsed run so a clean report stays clean.
+  if (Array.isArray(data.findings) && data.findings.length > 0) {
+    const degraded = data.findings.filter(f => f.parserTier === 'regex-fallback' || f.parserTier === 'mixed');
+    if (degraded.length > 0) {
+      console.log(`  ${c.dim}↪ ${degraded.length} finding(s) came from the pattern fallback rather than a syntax tree — absence of a finding in those files is weak evidence.${c.reset}`);
+    }
   }
 
-  // Read-only skills nudge (never writes — that's `init`'s job). If the agent
-  // has no /docguard.* commands installed yet, say how to get them.
-  if (agentMode === 'llm' && !existsSync(resolvePath(projectDir, '.agent', 'skills', 'docguard-guard'))) {
-    console.log(`  ${c.dim}💡 Install ${c.cyan}/docguard.*${c.dim} commands for your agent: ${c.cyan}docguard init${c.reset}`);
+  // Low-confidence findings → the feedback path. Scoped to CODES, not
+  // findings: `reportable` now includes every unmeasured code, which on a real
+  // repository runs to hundreds of entries (666 of 671 findings across
+  // fourteen projects), and a contribution is filed against a code once, not
+  // against each occurrence.
+  //
+  // "Never measured" belongs to the benchmark-evidence block below, which
+  // already reports it per code with the version skew and the per-code
+  // command. Saying it twice in one summary just teaches the reader to skip
+  // both. This line stays about the distinct claim: DocGuard suspects it
+  // misread THIS input.
+  if (Array.isArray(data.findings) && data.findings.length > 0) {
+    const uncertain = new Set(data.findings.filter(f => f.confidence === 'low').map(f => f.code));
+    if (uncertain.size > 0) {
+      console.log(`  ${c.dim}↪ ${uncertain.size} code(s) flagged uncertain here (possible false positives). Review or report: ${c.cyan}${skill('feedback')}${c.reset}`);
+    }
+  }
+
+  // Read-only nudge (never writes — that's `init`'s job). If the agent has no
+  // DocGuard command installed yet, say how to get one.
+  if (agentMode === 'llm' && !agentCommand(projectDir, surface, 'guard')) {
+    console.log(`  ${c.dim}💡 Install DocGuard's commands for your agent: ${c.cyan}docguard init${c.reset}`);
   }
 
   // ── Coverage + claim visibility (v0.29, field report #6) ──
@@ -786,32 +1045,84 @@ export function runGuard(projectDir, config, flags) {
   if (data.coverage) {
     const cov = data.coverage;
     const unclassN = cov.unclassified.length;
-    const tierLine = `${cov.canonical} canonical · ${cov.tracked} tracked · ${cov.ignored} ignored`
+    const tierLine = `${cov.canonical} canonical · ${cov.specKit ? `${cov.specKit} spec-kit · ` : ''}${cov.tracked} tracked · ${cov.ignored} ignored`
       + (unclassN ? ` · ${c.yellow}${unclassN} outside any tier${c.reset}${c.dim}` : '');
     console.log(`\n  ${c.dim}📑 Docs: ${tierLine} ${c.reset}${c.dim}(${cov.discovered} Markdown files)${c.reset}`);
     if (unclassN > 0) {
       // Calm by default — surface the COUNT every run (so non-coverage is never
       // silent), but don't enumerate or cry "invisible drift": much of this is
-      // legitimately untracked (fixtures, templates, specs). The file list is one
-      // `--verbose` away. Loud-by-default here would just train users to ignore it.
-      console.log(`  ${c.dim}↪ ${unclassN} file(s) in no validation tier — add to requiredFiles.canonical, a docs/ home, or .docguardignore${flags.verbose ? ':' : ` (${skill('guard')} --verbose to list)`}${c.reset}`);
-      if (flags.verbose) {
+      // legitimately untracked (fixtures, templates, specs). Loud-by-default
+      // here would just train users to ignore it.
+      //
+      // The exception is a handful of files: hiding three strings behind
+      // `--verbose` makes a permanent nag that cannot be acted on from the run
+      // that printed it. At or below INLINE_UNCLASSIFIED the list IS the message,
+      // so print it; above that the count plus a `--verbose` pointer still wins.
+      const inline = flags.verbose || unclassN <= INLINE_UNCLASSIFIED;
+      console.log(`  ${c.dim}↪ ${unclassN} file(s) in no validation tier — add to requiredFiles.canonical, a docs/ home, or .docguardignore${inline ? ':' : ` (${skill('guard')} --verbose to list)`}${c.reset}`);
+      if (inline) {
         for (const f of cov.unclassified.slice(0, 10)) console.log(`     ${c.dim}• ${f}${c.reset}`);
         if (unclassN > 10) console.log(`     ${c.dim}... and ${unclassN - 10} more${c.reset}`);
       }
     }
   }
+  if (data.checkCoverage) {
+    const counts = data.checkCoverage.counts;
+    // Lead with how many validators actually checked. The passed/total figure
+    // counts CHECKS, and its denominator excludes every validator that could
+    // not run — so "628/628 passed" and "seven validators found nothing to
+    // check" were both true of the same run, with only the first travelling
+    // into a badge. (calibrated-finding-channels#FR-020)
+    const active = Object.entries(counts).filter(([status]) => status !== 'disabled')
+      .reduce((sum, [, n]) => sum + n, 0);
+    const rest = Object.entries(counts)
+      .filter(([status, count]) => count > 0 && status !== 'checked')
+      .map(([status, count]) => count + ' ' + status.replaceAll('-', ' '));
+    console.log(`  Check coverage: ${counts.checked} of ${active} validator(s) checked`
+      + (rest.length ? ' · ' + rest.join(' · ') : ''));
+    console.log('  Document inventory and passing checks do not establish factual accuracy.');
+  }
   if (data.semanticClaims && data.semanticClaims.count > 0) {
     console.log(`\n  ${c.cyan}🔍 ${data.semanticClaims.count} documented claim(s) (counts/limits/enums) are unverified against code.${c.reset}`);
-    console.log(`     ${c.dim}A green guard means the structure is sound — NOT that these values still match the code.${c.reset}`);
+    console.log(`     ${c.dim}A passing guard means configured gates passed; these values remain unverified.${c.reset}`);
     console.log(`     ${c.dim}Confirm them: ${c.cyan}${skill('verify')} --semantic${c.reset}`);
   }
 
-  // Badge snippet
+  // How much of what this run reported has ever been benchmarked. Silent when
+  // there is nothing to report, so a clean run stays clean.
+  const pe = data.precisionEvidence;
+  if (pe && pe.coverage.codesInRun > 0) {
+    const { measured, codesInRun, notMeasured } = pe.coverage;
+    console.log(`\n  ${c.cyan}🔬 Benchmark evidence: ${measured} of ${codesInRun} finding code(s) in this run ${measured === 1 ? 'has' : 'have'} measured precision.${c.reset}`);
+    if (notMeasured > 0) {
+      console.log(`     ${c.dim}${notMeasured} ${notMeasured === 1 ? 'has' : 'have'} never been benchmarked; a finding from those may still be correct.${c.reset}`);
+      console.log(`     ${c.dim}Disagree with one? ${c.cyan}docguard feedback --code <CODE> --preview${c.reset}`);
+    }
+    if (!pe.source.matchesRunningVersion) {
+      console.log(`     ${c.dim}Measured on DocGuard ${pe.source.toolVersion}; you are running ${pe.source.runningVersion}.${c.reset}`);
+    }
+    console.log(`     ${c.dim}Per code: ${c.cyan}${skill('explain')} <CODE>${c.reset}`);
+  }
+
+  // Badge snippet.
   const pct = data.total > 0 ? Math.round((data.passed / data.total) * 100) : 0;
-  const bColor = pct >= 90 ? 'brightgreen' : pct >= 70 ? 'green' : pct >= 50 ? 'yellow' : 'red';
+  const bColor = badgeColor(pct, incompleteCoverage(data.checkCoverage));
   const badgeUrl = `https://img.shields.io/badge/CDD_Guard-${data.passed}%2F${data.total}_passed-${bColor}`;
-  console.log(`\n  ${c.dim}📎 Badge: ![CDD Guard](${badgeUrl})${c.reset}`);
+  // This badge is the one a reader actually sees pasted into a README, printed
+  // here a few lines under "N documented claim(s) are unverified". A green
+  // "628/628 passed" standing alone next to that count is the last misleading
+  // surface, so the claims badge travels WITH it. The pass badge keeps its own
+  // colour: it reports gates that passed, which is true, and folding factual
+  // verification into it would overload one number with two meanings.
+  // An unknown count (--changed-only skips extraction; extraction can fail)
+  // renders as `unknown`, never as nothing: an absent claims badge leaves the
+  // pass badge standing alone, which is the surface #438 asked to close
+  // (field-report-followups#FR-001). Same three states as `docguard badge`.
+  const claims = data.semanticClaims?.count;
+  const claimsBadge = claims === undefined || claims === null
+    ? ' ![Claims unverified](https://img.shields.io/badge/claims_unverified-unknown-lightgrey)'
+    : ` ![Claims unverified](https://img.shields.io/badge/claims_unverified-${claims}-${claims > 0 ? 'orange' : 'brightgreen'})`;
+  console.log(`\n  ${c.dim}📎 Badge: ![CDD Guard](${badgeUrl})${claimsBadge}${c.reset}`);
 
   // v0.14-Q2: --timings prints per-validator timing, sorted slowest-first.
   // Designed for self-diagnosis on slow repos: shows exactly which validator
@@ -873,7 +1184,7 @@ export function runGuard(projectDir, config, flags) {
     if (freshness && freshness.warnings) {
       const staleDocs = freshness.warnings.filter(w => /\d+ code commits since/.test(w));
       if (staleDocs.length >= 2) {
-        console.log(`\n  ${c.yellow}↻ ${staleDocs.length} docs are stale (10+ commits since last update). Run ${c.cyan}docguard sync --write${c.yellow} to refresh code-truth sections in one pass.${c.reset}`);
+        console.log(`\n  ${c.yellow}↻ ${staleDocs.length} documents have repository-history review signals. Review their scope and intended behavior before changing documentation or code.${c.reset}`);
       }
     }
   }
@@ -895,15 +1206,26 @@ export function runGuard(projectDir, config, flags) {
   // "high"), show a one-line note so the user knows the exit code may not
   // match what they expected from reading the warning count.
   const severityShifted =
-    data.effectiveErrors !== data.errors || data.effectiveWarnings !== data.warnings;
+    data.effectiveErrors !== data.errors || data.effectiveWarnings !== data.warnings || data.effectiveInfos > 0;
   if (severityShifted) {
-    const upgraded = data.effectiveErrors - data.errors;
-    const ignored = data.warnings - data.effectiveWarnings - upgraded;
+    const upgraded = data.findings.filter(f => f.severity === 'warn' && f.effectiveSeverity === 'error').length
+      + data.validators.filter(v => !Array.isArray(v.findings) || v.findings.length === 0)
+        .reduce((sum, v) => sum + (v.severity === 'high' ? v.warnings.length : 0), 0);
+    const demotedErrors = data.findings.filter(f => f.severity === 'error' && f.effectiveSeverity !== 'error').length;
+    // A code registered as informational (CODES.<code>.defaultLevel) is not
+    // an override: name it apart so the note never blames the user's config.
+    const byDefault = data.findings.filter(f => f.enforcement?.source === 'code' && f.effectiveSeverity === 'info');
+    const informational = data.effectiveInfos - byDefault.length;
     const parts = [];
     if (upgraded > 0) parts.push(`${upgraded} warning(s) escalated to fail (severity=high)`);
-    if (ignored > 0) parts.push(`${ignored} warning(s) ignored for exit code (severity=low)`);
+    if (demotedErrors > 0) parts.push(`${demotedErrors} intrinsic error(s) explicitly demoted by finding code`);
+    if (informational > 0) parts.push(`${informational} finding(s) informational for exit code (severity=low)`);
     if (parts.length > 0) {
       console.log(`\n  ${c.dim}Severity override: ${parts.join('; ')}.${c.reset}`);
+    }
+    if (byDefault.length > 0) {
+      const codes = [...new Set(byDefault.map(f => f.code))].sort().join(', ');
+      console.log(`  ${c.dim}${byDefault.length} finding(s) informational by default (${codes}); set findingSeverity.<CODE> to change that.${c.reset}`);
     }
   }
 
@@ -927,9 +1249,14 @@ export function runGuard(projectDir, config, flags) {
     console.log('');
   }
 
+  // docguard.update-awareness#FR-004: text output only; JSON, SARIF and JUnit
+  // returned above and never reach this line.
+  const hint = footerHint();
+  if (hint) console.log(`  ${c.dim}ⓘ ${hint}${c.reset}\n`);
+
   // v0.5: severity-aware exit codes (see runGuardInternal for the rollup).
   // v0.28: exitCode + return (not process.exit) so the buffered text output
   // flushes to a pipe before the process exits — same truncation fix as the
   // JSON path above.
-  process.exitCode = data.effectiveErrors > 0 ? 1 : data.effectiveWarnings > 0 ? 2 : 0;
+  process.exitCode = exitFor(data);
 }

@@ -38,11 +38,13 @@
  * @req SC-M2-003 — appendFixes is idempotent (same fix logged twice → one entry)
  * @req SC-M2-004 — fingerprint dedupes by type+file+summary (not timestamp)
  * @req SC-M2-005 — entries are capped at MAX_ENTRIES (oldest dropped)
+ * @implements docguard.read-only-commands#FR-005
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
+import { ensureStateDir } from './state-dir.mjs';
 
 const MEMORY_PATH = '.docguard/fixed.json';
 const SCHEMA_VERSION = '1';
@@ -126,6 +128,7 @@ export function appendFixes(projectDir, fixes, appliedBy = 'fix --write') {
 
   const fullPath = resolve(projectDir, MEMORY_PATH);
   const dir = dirname(fullPath);
+  ensureStateDir(projectDir);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   writeFileSync(fullPath, JSON.stringify(next, null, 2) + '\n', 'utf-8');
 

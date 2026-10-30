@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "sections": {
+    "docs-canonical/ARCHITECTURE.md#requirement-identity": {
+      "dependencies": {
+        "cli/commands/specs.mjs#planSpecCompletion": {
+          "fingerprint": "sha256:e2e49d6497c4c35a62f50a47ced6c8483ab2665b625877094bcbebe8247dca71",
+          "tier": "ast"
+        },
+        "cli/shared-requirements.mjs#collectRequirementIdsFromContent": {
+          "fingerprint": "sha256:0dc2b32e91c4e65643d02c453a64502879d55f5b052c642a5db581b7628e8920",
+          "tier": "ast"
+        }
+      },
+      "reason": "planSpecCompletion now reads over-budget ranges in batches and accepts a newer --since only past every budget, recorded as narrowedFrom; the section says so",
+      "reviewedAt": "2026-10-13",
+      "reviewedRevision": "1a7bfabbee9c95f7eb67a3e5b01799c7a3da98e3"
+    },
+    "docs-canonical/DATA-MODEL.md#finding-channels": {
+      "dependencies": {
+        "cli/findings.mjs#PARSER_TIERS": {
+          "fingerprint": "sha256:1eeb4ba2915f257b5d0e4db8a70ecefd7c2c9e365d103277c096dbd230b41dd9",
+          "tier": "ast"
+        },
+        "cli/findings.mjs#mkFinding": {
+          "fingerprint": "sha256:9dd2ff5c173907b8014e19fd5e276b06e8e82ac02da9947753e58b9d9c580dc7",
+          "tier": "ast"
+        }
+      },
+      "reason": "Verified against the code in the 2026-09-29 freshness review of specs 014-029",
+      "reviewedAt": "2026-09-30",
+      "reviewedRevision": "6b3c1586023aeaf1738951c2d04c886caf512125"
+    },
+    "docs-canonical/DATA-MODEL.md#spec-registry": {
+      "dependencies": {
+        "cli/commands/specs.mjs#completeSpec": {
+          "fingerprint": "sha256:eefdad45db5f2dc695cf8f5d954cdca564018811516b1bedbc136d772f93f122",
+          "tier": "ast"
+        },
+        "cli/commands/specs.mjs#reanchorSpec": {
+          "fingerprint": "sha256:789fb75e16087a23957ff96005308de37b9de60749bb4fcebe515c616803a368",
+          "tier": "ast"
+        },
+        "schemas/docguard-specs.schema.json": {
+          "fingerprint": "sha256:2a4d41f67d2262197d4610d35e91559c09d9a234c4d96b334f02d5ab3ddccb2d",
+          "tier": "content"
+        }
+      },
+      "reason": "completeSpec passes narrowedFrom into the canonical outcome and the schema declares it; the outcomes table gains the narrowedFrom row",
+      "reviewedAt": "2026-10-13",
+      "reviewedRevision": "1a7bfabbee9c95f7eb67a3e5b01799c7a3da98e3"
+    }
+  }
+}

@@ -1,3 +1,4 @@
+import { resolveDocRole } from './shared-doc-roles.mjs';
 /**
  * Shared Ignore Utility — Unified file filtering for all validators.
  *
@@ -5,12 +6,16 @@
  *   - config.ignore        (global — all validators)
  *   - config.securityIgnore (security validator only)
  *   - config.todoIgnore     (TODO-tracking validator only)
+ *   - config.documentLifecycle (Document-Lifecycle validator only)
+ *   - .docguardignore       (merged into config.ignore at load)
  *
- * Supports exact paths AND glob patterns:
- *   - "src/foo.ts"           → exact match
+ * Supports exact paths AND glob patterns (full syntax at `globToRegex`):
+ *   - "src/foo.ts"           → exact match, at any depth
  *   - "packages/cdk/**"      → match any file under packages/cdk/
- *   - "backend/src/__tests__/**" → match any file under that path
+ *   - "**\/fixtures/**"      → fixtures/ at the top level or below any directory
  *   - "*.test.ts"            → match files ending in .test.ts
+ *   - "notes?.md", "[ab].md" → gitignore `?` and bracket expressions
+ *   - "/build"               → anchored to the project root
  *
  * Zero NPM dependencies — pure Node.js built-ins only.
  */
@@ -20,19 +25,49 @@
  * of validator. Build outputs, VCS internals, package caches, framework synth
  * outputs. Validators MAY extend this with their own additions but SHOULD
  * start from this base so behavior is consistent across the tool.
+ *
+ * Only names that are build output wherever they appear belong here. `bin` is
+ * not one of them: it is source in a Node CLI, Ruby binstubs or a shell
+ * project, and .NET output only beside a project file — see
+ * `isIgnoredDirEntry` (docguard.coverage-followups#FR-002).
+ *
+ * @implements docguard.coverage-followups#FR-002
  */
 export const DEFAULT_IGNORE_DIRS = new Set([
   // Package managers
   'node_modules', 'vendor', '.venv', '__pycache__',
   // VCS
   '.git', '.jj', '.hg', '.svn',
-  // Build outputs — JS/TS, Rust/Java, generic
-  'dist', 'build', 'out', 'coverage', 'target', '.gradle',
+  // Build outputs — JS/TS, Rust/Java (target), .NET/C (obj), Mix/dune/Sphinx (_build), generic
+  'dist', 'build', 'out', 'coverage', 'target', '.gradle', 'obj', '_build',
   // Framework synth/cache
   '.next', '.nuxt', '.turbo', '.vercel', '.cache', '.svelte-kit', 'cdk.out',
   // OS
   '.DS_Store',
 ]);
+
+/** A .NET project file: the directory holding one keeps its build output in `bin/`. */
+const DOTNET_PROJECT_FILE_RE = /\.(?:cs|fs|vb)proj$/i;
+/** Directory names that are build output only in a particular context. */
+const DOTNET_OUTPUT_DIRS = new Set(['bin']);
+
+/**
+ * Whether a directory entry is build output a walker must skip: a name in
+ * `ignoreDirs` (default `DEFAULT_IGNORE_DIRS`), or `bin` when a sibling entry
+ * is a .NET project file (`*.csproj`, `*.fsproj`, `*.vbproj`). Every other
+ * `bin/` is read.
+ *
+ * @implements docguard.coverage-followups#FR-002
+ * @param {string} name - the entry's name
+ * @param {Array<string|{name: string}>} siblings - every entry of the same directory
+ * @param {Set<string>} [ignoreDirs]
+ * @returns {boolean}
+ */
+export function isIgnoredDirEntry(name, siblings, ignoreDirs = DEFAULT_IGNORE_DIRS) {
+  if (ignoreDirs.has(name)) return true;
+  if (!DOTNET_OUTPUT_DIRS.has(name)) return false;
+  return (siblings || []).some(e => DOTNET_PROJECT_FILE_RE.test(typeof e === 'string' ? e : e?.name || ''));
+}
 
 // Regex for paths that must always be rejected at any depth, regardless of
 // the glob pattern matching them. These are duplicate file trees (worktrees)
@@ -54,42 +89,102 @@ const ALWAYS_REJECT_PATH_RE =
  *
  * SCOPE: detection/generate scanners ONLY — deliberately NOT guard's structural
  * validators. A user's real `examples/` dir still counts toward docs coverage.
- * Anti-false-green: when a surface signal appears ONLY under these dirs, callers
- * SHOULD surface a low-confidence "confirm these are fixtures" note rather than
- * silently drop it. Override via `config.detection.includeNonProduct = true`.
+ * Override via `config.detection.includeNonProduct = true`.
+ *
+ * What callers do with a signal found ONLY under these dirs: the API-surface
+ * validator counts the routes it dropped and, when none remain, reports
+ * `partial` with that count and the override, so an empty surface never reads
+ * as "no routes" (docguard.fallback-language-coverage#FR-007). The env scan
+ * prunes these dirs without reading them, so it cannot count what it skipped;
+ * the other detectors drop such files silently.
+ *
+ * A segment that is a PACKAGE name is not a directory of examples:
+ * Spring Initializr's default package is `com.example`, so
+ * `src/main/java/com/example/…` is the product, and so is a Go
+ * `internal/example` package (see `isPackageSegment`).
  */
 export const DEFAULT_DETECTION_IGNORE_DIRS = new Set([
   'fixtures', '__fixtures__', 'test-fixtures', 'testfixtures', 'testdata',
-  'test', 'tests', '__tests__', 'spec', 'specs', '__mocks__', 'mocks',
+  'test', 'tests', '__tests__', 'test-helpers', 'spec', 'specs', '__mocks__', 'mocks',
   'examples', 'example', 'sample', 'samples',
 ]);
 
-/** True if `dirName` is a non-product dir detection should skip by default. */
-export function isNonProductDir(dirName, config = {}) {
+/**
+ * True for a directory DocGuard itself writes: the canonical and implementation
+ * doc homes, and a Spec Kit `specs/` directory (one whose child directory holds
+ * a `spec.md`). These hold documentation, never product code, so the component
+ * map and DCV003 must not list them — generate created them moments earlier.
+ * A `specs/` without Spec Kit features (an RSpec-style test dir) stays code.
+ * `relDir` is project-relative, POSIX.
+ * @implements docguard.generated-docs-consistency#FR-005
+ */
+export function isDocguardOwnedDir(projectDir, relDir) {
+  const rel = String(relDir || '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+  if (rel === 'docs-canonical' || rel === 'docs-implementation') return true;
+  if (rel !== 'specs') return false;
+  try {
+    return readdirSync(joinPath(projectDir, rel), { withFileTypes: true })
+      .some(e => e.isDirectory() && existsSync(joinPath(projectDir, rel, e.name, 'spec.md')));
+  } catch { return false; }
+}
+
+/** JVM source roots: below `src/main/<one of these>/` every segment is a package. */
+const JVM_SOURCE_LANGUAGES = new Set(['java', 'kotlin', 'scala', 'groovy']);
+/** First segments of a reverse-domain package name (`com.example`, `org.samples`). */
+const REVERSE_DOMAIN_ROOTS = new Set([
+  'com', 'org', 'net', 'io', 'dev', 'edu', 'gov', 'mil', 'info', 'biz', 'co', 'eu',
+  'uk', 'de', 'fr', 'br', 'nl', 'ch', 'se', 'fi', 'dk', 'jp', 'cn', 'au', 'ca', 'ru', 'es', 'pl',
+]);
+const EXAMPLE_NAMES = new Set(['example', 'examples', 'sample', 'samples']);
+
+/**
+ * Is `segments[index]` a package name rather than a directory of its own kind?
+ * - anything below `src/main/{java,kotlin,scala,groovy}/`: Maven and Gradle
+ *   main sources are product code by construction (tests live in `src/test`);
+ * - `example(s)`/`sample(s)` right after a reverse-domain root (`com/example`)
+ *   or after Go's `internal` (`internal/example`).
+ *
+ * @implements docguard.fallback-language-coverage#FR-006
+ */
+function isPackageSegment(segments, index) {
+  for (let j = 0; j + 2 < index; j++) {
+    if (segments[j] === 'src' && segments[j + 1] === 'main' && JVM_SOURCE_LANGUAGES.has(segments[j + 2])) return true;
+  }
+  if (index > 0 && EXAMPLE_NAMES.has(segments[index])) {
+    const before = segments[index - 1];
+    if (REVERSE_DOMAIN_ROOTS.has(before) || before === 'internal') return true;
+  }
+  return false;
+}
+
+/**
+ * True if `dirName` is a non-product dir detection should skip by default.
+ * Pass `parentRel` (the POSIX project-relative path of the directory that
+ * contains it) so a package segment is recognised the way `isNonProductPath`
+ * recognises it; without it, only the name is judged.
+ */
+export function isNonProductDir(dirName, config = {}, parentRel = null) {
   if (config?.detection?.includeNonProduct) return false;
-  return DEFAULT_DETECTION_IGNORE_DIRS.has(dirName);
+  if (!DEFAULT_DETECTION_IGNORE_DIRS.has(dirName)) return false;
+  if (!parentRel) return true;
+  const segments = [...String(parentRel).split('/').filter(s => s && s !== '.'), dirName];
+  return !isPackageSegment(segments, segments.length - 1);
 }
 
 /**
  * True if ANY path segment of `relPath` (POSIX, project-relative) is a
  * non-product detection dir — for filtering file-level detection results.
+ * Package segments (`src/main/java/com/example/…`) do not count.
  */
 export function isNonProductPath(relPath, config = {}) {
   if (config?.detection?.includeNonProduct) return false;
   if (!relPath) return false;
-  return relPath.split('/').some(seg => DEFAULT_DETECTION_IGNORE_DIRS.has(seg));
+  const segments = relPath.split('/');
+  return segments.some((seg, i) => DEFAULT_DETECTION_IGNORE_DIRS.has(seg) && !isPackageSegment(segments, i));
 }
 
-/**
- * Read `.docguardignore` from a project directory and return its patterns.
- *
- * Format: gitignore-style — one pattern per line, `#` for comments, blank lines
- * ignored. Returned patterns are normalized but not transformed (callers
- * decide whether to expand directory globs).
- *
- * Returns [] if the file is missing or unreadable — never throws.
- */
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { resolve as resolvePath, relative as relativePath, join as joinPath, sep } from 'node:path';
 
 /**
@@ -107,18 +202,159 @@ export function relPosix(projectDir, absPath) {
   return relativePath(projectDir, absPath).split(sep).join('/');
 }
 
-export function loadDocguardIgnore(projectDir) {
+/** Today's date in UTC as `YYYY-MM-DD`: the clock `.docguardignore` expiries are read against. */
+export function utcToday(now = new Date()) {
+  return now.toISOString().slice(0, 10);
+}
+
+/** True when `day` is `YYYY-MM-DD` and names a real calendar day (no 2026-02-30). */
+export function isCalendarDay(day) {
+  if (typeof day !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return false;
+  const parsed = new Date(`${day}T00:00:00Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === day;
+}
+
+const EXPIRES_PREFIX = 'expires:';
+
+/**
+ * Parse `.docguardignore` text into entries, one per pattern line.
+ *
+ * Grammar (gitignore-style, plus websec-validator's `.websec-ignore` tail):
+ *
+ *   pattern  [expires:YYYY-MM-DD]  [# reason]
+ *
+ *   - A line whose first non-blank character is `#` is a comment; blank lines
+ *     are skipped. Lines are trimmed, as before.
+ *   - `#` starts a trailing reason only when whitespace precedes it, so a `#`
+ *     inside a pattern (`C#/`, `notes#1.md`) stays part of the pattern.
+ *   - `expires:` is read only as the LAST whitespace-separated token before the
+ *     reason. Internal whitespace in the pattern is kept as written.
+ *
+ * A line with neither whitespace-then-`#` nor a trailing `expires:` token
+ * yields exactly the pattern the pre-057 parser returned
+ * (docguard.ignore-reasons#FR-002).
+ *
+ * `state`:
+ *   - `active`  — applies. An expiry applies through the end of its UTC day.
+ *   - `expired` — `today` is after the expiry day; excludes nothing (FR-003).
+ *   - `invalid` — the expiry is not a calendar day, or there is no pattern;
+ *                 excludes nothing, because its lifetime is unknown (FR-004).
+ *
+ * @param {string} raw - file contents
+ * @param {{ today?: string }} [opts] - `YYYY-MM-DD` (UTC); defaults to now
+ * @returns {Array<{pattern: string|null, reason: string|null, expires: string|null,
+ *   expiryText: string|null, state: 'active'|'expired'|'invalid',
+ *   problem: 'no-pattern'|'unreadable-expiry'|null, line: number, raw: string}>}
+ * @implements docguard.ignore-reasons#FR-001
+ * @implements docguard.ignore-reasons#FR-002
+ * @implements docguard.ignore-reasons#FR-003
+ * @implements docguard.ignore-reasons#FR-004
+ */
+export function parseDocguardIgnore(raw, { today = utcToday() } = {}) {
+  const entries = [];
+  String(raw ?? '').split(/\r?\n/).forEach((rawLine, index) => {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) return;
+    let body = line;
+    let reason = null;
+    const hash = line.search(/\s#/);
+    if (hash >= 0) {
+      body = line.slice(0, hash).trim();
+      reason = line.slice(hash).trim().slice(1).trim() || null;
+    }
+    let expiryText = null;
+    const tokens = body.split(/\s+/);
+    const last = tokens[tokens.length - 1];
+    if (last.startsWith(EXPIRES_PREFIX)) {
+      expiryText = last.slice(EXPIRES_PREFIX.length);
+      body = body.slice(0, body.length - last.length).trim();
+    }
+    const pattern = body || null;
+    const expiryReadable = expiryText === null || isCalendarDay(expiryText);
+    const problem = !pattern ? 'no-pattern' : !expiryReadable ? 'unreadable-expiry' : null;
+    const expires = expiryText !== null && expiryReadable ? expiryText : null;
+    const state = problem ? 'invalid' : expires && today > expires ? 'expired' : 'active';
+    entries.push({ pattern, reason, expires, expiryText, state, problem, line: index + 1, raw: rawLine });
+  });
+  return entries;
+}
+
+/**
+ * Read `.docguardignore` and return every entry, including expired and
+ * invalid ones (`parseDocguardIgnore`). Returns [] if the file is missing or
+ * unreadable — never throws.
+ */
+export function loadDocguardIgnoreEntries(projectDir, opts = {}) {
   const p = resolvePath(projectDir, '.docguardignore');
   if (!existsSync(p)) return [];
   try {
-    const raw = readFileSync(p, 'utf-8');
-    return raw
-      .split(/\r?\n/)
-      .map(line => line.trim())
-      .filter(line => line && !line.startsWith('#'));
+    return parseDocguardIgnore(readFileSync(p, 'utf-8'), opts);
   } catch {
     return [];
   }
+}
+
+/**
+ * Read `.docguardignore` from a project directory and return the patterns that
+ * APPLY today: expired and invalid entries are left out, so every caller
+ * (config merge, watch, scanners) honours expiry the same way.
+ *
+ * Returned patterns are normalized but not transformed (callers decide whether
+ * to expand directory globs). Returns [] if the file is missing or unreadable —
+ * never throws.
+ */
+export function loadDocguardIgnore(projectDir, opts = {}) {
+  return loadDocguardIgnoreEntries(projectDir, opts)
+    .filter(entry => entry.state === 'active')
+    .map(entry => entry.pattern);
+}
+
+/**
+ * Return a predicate for paths Git currently classifies as ignored.
+ *
+ * This deliberately delegates pattern semantics (including nested
+ * `.gitignore` files and negation) to Git instead of maintaining a second,
+ * incomplete gitignore parser. `--directory` lets callers prune a wholly
+ * ignored directory before reading its descendants. A missing Git repository
+ * or an unreadable/overflowing result returns null so callers can retain their
+ * existing conservative traversal behavior.
+ *
+ * Only untracked ignored paths are returned by Git, which is intentional:
+ * tracked source remains part of the repository even if a later ignore rule
+ * happens to mention its name.
+ *
+ * @param {string} projectDir
+ * @returns {((relPath: string) => boolean)|null}
+ */
+export function loadGitIgnoredFilter(projectDir) {
+  let result;
+  try {
+    result = spawnSync('git', [
+      'ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z',
+    ], {
+      cwd: projectDir,
+      encoding: 'utf8',
+      maxBuffer: 8 * 1024 * 1024,
+      windowsHide: true,
+    });
+  } catch {
+    return null;
+  }
+  if (result.status !== 0 || result.error || typeof result.stdout !== 'string') return null;
+
+  const exact = new Set();
+  const directories = [];
+  for (const raw of result.stdout.split('\0')) {
+    const path = raw.replace(/\\/g, '/').replace(/^\.\//, '');
+    if (!path) continue;
+    if (path.endsWith('/')) directories.push(path);
+    else exact.add(path);
+  }
+  if (exact.size === 0 && directories.length === 0) return () => false;
+  return relPath => {
+    const path = String(relPath || '').replace(/\\/g, '/').replace(/^\.\//, '');
+    return exact.has(path) || directories.some(directory => path.startsWith(directory));
+  };
 }
 
 /**
@@ -145,31 +381,104 @@ export function mergeIgnoreFile(projectDir, config) {
   return config;
 }
 
+const REGEX_SPECIAL = /[.*+?^${}()|[\]\\/]/g;
+const escapeRegex = ch => ch.replace(REGEX_SPECIAL, '\\$&');
+
 /**
- * Convert a glob pattern to a RegExp.
- * Supports: * (any chars except /), ** (any path segments), . (literal dot).
+ * A gitignore bracket expression starting at `pattern[start]` (`[`), or null
+ * when it never closes (the `[` is then literal). `!` or `^` first negates; a
+ * `]` first is a member; `a-z` is a range; `\x` is a literal `x`. Like every
+ * gitignore wildcard it never matches `/`. POSIX classes (`[[:alpha:]]`) are
+ * not supported: their characters are read as members.
+ */
+function bracketExpression(pattern, start) {
+  let i = start + 1;
+  let negate = false;
+  if (pattern[i] === '!' || pattern[i] === '^') { negate = true; i++; }
+  let body = '';
+  let first = true;
+  for (; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === ']' && !first) {
+      return { source: `(?:(?!/)[${negate ? '^' : ''}${body}])`, end: i };
+    }
+    first = false;
+    if (ch === '\\' && i + 1 < pattern.length) { body += escapeRegex(pattern[++i]); continue; }
+    if (ch === '-' && body && pattern[i + 1] !== ']') { body += '-'; continue; }
+    body += escapeRegex(ch);
+  }
+  return null;
+}
+
+/**
+ * Translate one ignore pattern (trailing `/` and leading `/` already removed)
+ * into a regex source, gitignore-style:
+ *   `*`   any characters except `/`        `?`  one character except `/`
+ *   `[…]` bracket expression (above)        `\x` the literal character x
+ *   `**\/` at the start or after `/`: zero or more directories
+ *   any other run of `**`: any characters, `/` included (unchanged since v0.11)
+ * Everything else is literal — `( ) + ^ $ | { } .` included.
+ *
+ * @implements docguard.ignore-reasons#FR-010
+ */
+function globBody(pattern) {
+  let re = '';
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === '\\') {
+      re += i + 1 < pattern.length ? escapeRegex(pattern[++i]) : '\\\\';
+    } else if (ch === '*') {
+      let j = i;
+      while (pattern[j] === '*') j++;
+      if (j - i === 1) {
+        re += '[^/]*';
+      } else if (j - i === 2 && (i === 0 || pattern[i - 1] === '/') && pattern[j] === '/') {
+        re += '(?:.*/)?';
+        j++; // the slash belongs to the zero-or-more-directories group
+      } else {
+        re += '.*';
+      }
+      i = j - 1;
+    } else if (ch === '?') {
+      re += '[^/]';
+    } else if (ch === '[') {
+      const bracket = bracketExpression(pattern, i);
+      if (bracket) { re += bracket.source; i = bracket.end; } else re += '\\[';
+    } else {
+      re += escapeRegex(ch);
+    }
+  }
+  return re;
+}
+
+/**
+ * Convert an ignore pattern to a RegExp over project-relative POSIX paths.
+ *
+ * DocGuard's ignore semantics, which every `config.ignore`, `securityIgnore`,
+ * `todoIgnore`, `documentLifecycle` and `.docguardignore` pattern shares:
+ *   - A pattern matches at a path-segment boundary at ANY depth, and
+ *     everything below what it matches (`fixtures` matches `fixtures/x` and
+ *     `a/fixtures/x`). Unlike gitignore, a slash in the middle does not anchor.
+ *   - A leading `/` anchors the pattern to the project root, as in gitignore.
+ *   - A trailing `/` is dropped, so `dir/` also matches a file named `dir`.
+ *   - Wildcards, bracket expressions and escapes as in `globBody`.
+ *   - A leading `!` is a literal character: negation is not supported.
  *
  * @param {string} pattern - Glob pattern
  * @returns {RegExp}
+ * @implements docguard.ignore-reasons#FR-010
  */
 function globToRegex(pattern) {
   // gitignore-style trailing slash ("dir/") means "this directory and everything
-  // under it". Strip it so "dir/" matches identically to "dir" — otherwise the
-  // escaped pattern keeps the slash and the alternation below can only match a
-  // literal "dir//" (double slash), so the pattern silently matches nothing.
+  // under it". Strip it so "dir/" matches identically to "dir".
   // `|| pattern` guards the degenerate all-slashes case (e.g. "/") from emptying.
-  const normalized = pattern.replace(/\/+$/, '') || pattern;
-  const escaped = normalized
-    .replace(/\./g, '\\.')
-    .replace(/\*\*/g, '§§')     // temp placeholder for **
-    .replace(/\*/g, '[^/]*')
-    .replace(/§§/g, '.*');
-  // Match if the relative path:
-  //   - equals the pattern exactly
-  //   - ends with /pattern
-  //   - starts with pattern/
-  //   - contains /pattern/
-  return new RegExp(`^${escaped}$|/${escaped}$|^${escaped}/|/${escaped}/`);
+  let normalized = pattern.replace(/\/+$/, '') || pattern;
+  const anchored = normalized.length > 1 && normalized.startsWith('/');
+  if (anchored) normalized = normalized.replace(/^\/+/, '');
+  const body = globBody(normalized);
+  return anchored
+    ? new RegExp(`^${body}$|^${body}/`)
+    : new RegExp(`^${body}$|/${body}$|^${body}/|/${body}/`);
 }
 
 /**
@@ -332,7 +641,7 @@ export function walkFiles(dir, callback, opts = {}) {
   }
   let complete = true;
   for (const entry of entries) {
-    if (ignoreDirs.has(entry)) continue;
+    if (isIgnoredDirEntry(entry, entries, ignoreDirs)) continue;
     if (skipDotEntries && entry.startsWith('.') && !(keepDot && keepDot(entry))) continue;
     const full = joinPath(dir, entry);
     let stat;
@@ -384,11 +693,11 @@ export function walkFiles(dir, callback, opts = {}) {
 export function listCanonicalDocs(projectDir, opts = {}) {
   const { dirName = 'docs-canonical', isIgnored = null } = opts;
   const root = resolvePath(projectDir, dirName);
-  if (!existsSync(root)) return [];
+  // An explicit role may live outside the conventional canonical directory.
 
   const isMarkdown = (name) => name.toLowerCase().endsWith('.md');
   const out = [];
-  walkFiles(root, (abs) => {
+  if (existsSync(root)) walkFiles(root, (abs) => {
     if (!isMarkdown(abs)) return;
     const rel = relPosix(projectDir, abs);
     if (isIgnored && isIgnored(rel)) return;
@@ -399,6 +708,18 @@ export function listCanonicalDocs(projectDir, opts = {}) {
     keepDot: isMarkdown,
   });
 
+  let roleConfig = opts.config;
+  if (!roleConfig) {
+    const configFile = resolvePath(projectDir, '.docguard.json');
+    try { if (existsSync(configFile)) roleConfig = JSON.parse(readFileSync(configFile, 'utf-8')); }
+    catch { /* loadConfig owns malformed configuration errors */ }
+  }
+  for (const role of Object.keys(roleConfig?.docs?.roles || {})) {
+    const abs = resolveDocRole(projectDir, roleConfig, role);
+    const rel = relPosix(projectDir, abs);
+    if (!existsSync(abs) || !isMarkdown(abs) || (isIgnored && isIgnored(rel))) continue;
+    if (!out.some(doc => doc.abs === abs)) out.push({ abs, rel });
+  }
   out.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
   return out;
 }

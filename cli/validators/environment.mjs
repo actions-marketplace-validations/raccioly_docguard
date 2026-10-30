@@ -1,4 +1,12 @@
 /**
+ * @implements docguard.language-repository-coverage#FR-006
+ * @implements docguard.language-repository-coverage#FR-007
+ * @implements docguard.language-repository-coverage#FR-008
+ * @implements docguard.fallback-language-coverage#FR-002
+ * @implements docguard.fallback-language-coverage#FR-004
+ */
+import { docRolePath, resolveDocRole } from '../shared-doc-roles.mjs';
+/**
  * Environment Validator — Checks ENVIRONMENT.md docs and .env.example
  * Now respects projectTypeConfig (e.g., skip env checks for CLI tools)
  *
@@ -8,19 +16,81 @@
  * existing tests are unaffected; guard just renders richer output.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
-import { grepEnvUsage } from '../shared-source.mjs';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { describeLanguageCounts, grepEnvUsage, resolveSourceRoots, summarizeTiers, tierFor } from '../shared-source.mjs';
+import { shouldIgnore } from '../shared-ignore.mjs';
+import { docHasSection } from '../shared.mjs';
 import { mkFinding, resultFromFindings } from '../findings.mjs';
+
+const ENV_TEMPLATE_NAMES = ['.env.example', '.env.template'];
+
+function isWithin(projectRoot, path) {
+  const rel = relative(projectRoot, path);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+/**
+ * Discover repository-owned env templates at the root and package boundaries.
+ * Source roots may point inside a package (for example `backend/src`), so every
+ * ancestor up to the repository root is considered. `resolveSourceRoots()` also
+ * contributes declared npm/pnpm workspace packages. Candidates are de-duplicated
+ * before reading and rejected when ignored, outside the repository, or reached
+ * through a symlink.
+ */
+function discoverEnvTemplates(projectDir, config) {
+  const projectRoot = resolve(projectDir);
+  const candidateDirs = new Set([projectRoot]);
+
+  for (const sourceRoot of resolveSourceRoots(projectRoot, config)) {
+    let current = resolve(sourceRoot);
+    while (isWithin(projectRoot, current)) {
+      candidateDirs.add(current);
+      if (current === projectRoot) break;
+      const parent = dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+
+  const templates = new Set();
+  for (const dir of candidateDirs) {
+    for (const name of ENV_TEMPLATE_NAMES) {
+      const abs = resolve(dir, name);
+      const rel = relative(projectRoot, abs);
+      if (!rel || !isWithin(projectRoot, abs)) continue;
+      const relPosix = rel.split(sep).join('/');
+      if (shouldIgnore(relPosix, config)) continue;
+
+      let current = projectRoot;
+      let safe = true;
+      for (const segment of rel.split(sep)) {
+        current = resolve(current, segment);
+        try {
+          const stat = lstatSync(current);
+          if (stat.isSymbolicLink()) { safe = false; break; }
+          if (current === abs && !stat.isFile()) { safe = false; break; }
+        } catch {
+          safe = false;
+          break;
+        }
+      }
+      if (safe) templates.add(abs);
+    }
+  }
+
+  return [...templates].sort();
+}
 
 export function validateEnvironment(projectDir, config) {
   const findings = [];
   let passed = 0;
   let total = 0;
+  let applicability = null;
   const ptc = config.projectTypeConfig || {};
 
-  const envDoc = 'docs-canonical/ENVIRONMENT.md';
-  const envDocPath = resolve(projectDir, envDoc);
+  const envDoc = docRolePath(config, 'environment');
+  const envDocPath = resolveDocRole(projectDir, config, 'environment');
   if (!existsSync(envDocPath)) {
     // Structure validator catches missing files. Keep the exact legacy shape
     // here (no `findings` key) — tests deep-equal this early return.
@@ -29,11 +99,12 @@ export function validateEnvironment(projectDir, config) {
 
   const content = readFileSync(envDocPath, 'utf-8');
 
-  // Check for required sections (anchored headings — not substring matches that
-  // could hit a TOC entry or code block).
-  const hasHeading = (re) => re.test(content);
+  // Required sections use the matcher STR003 uses (docHasSection: case-,
+  // whitespace-, section-number- and synonym-tolerant), so the two validators
+  // cannot disagree about the same heading.
+  // @implements docguard.doc-validator-fidelity#FR-001
   total++;
-  if (hasHeading(/^#{2,3}\s+(Prerequisites|Setup Steps)\b/m)) {
+  if (docHasSection(content, '## Setup Steps') || docHasSection(content, '## Prerequisites')) {
     passed++;
   } else {
     findings.push(mkFinding({
@@ -47,7 +118,7 @@ export function validateEnvironment(projectDir, config) {
   }
 
   total++;
-  if (hasHeading(/^#{2,3}\s+Environment Variables\b/m)) {
+  if (docHasSection(content, '## Environment Variables')) {
     passed++;
   } else {
     findings.push(mkFinding({
@@ -72,7 +143,7 @@ export function validateEnvironment(projectDir, config) {
     const varRe = /`([A-Z][A-Z0-9_]*[A-Z0-9])`/g;
     // v0.16-P4 (revised in v0.17.1-B7): skip backticked SYSTEM env vars
     // (PATH, HOME, USER, etc.) that appear in ENVIRONMENT.md prose. Trimmed
-    // to TRULY-system-only after wu feedback — NODE_ENV / CI / GITHUB_* were
+    // to TRULY-system-only after downstream feedback — NODE_ENV / CI / GITHUB_* were
     // causing asymmetric flagging between diff and this validator. Apps
     // legitimately treat NODE_ENV as app config; keep the list to vars that
     // no sane application would read as runtime config.
@@ -102,9 +173,7 @@ export function validateEnvironment(projectDir, config) {
       if (SYSTEM.has(m[1])) continue;
       documented.add(m[1]);
     }
-    for (const envFile of ['.env.example', '.env.template']) {
-      const p = resolve(projectDir, envFile);
-      if (!existsSync(p)) continue;
+    for (const p of discoverEnvTemplates(projectDir, config)) {
       const re = /^([A-Z][A-Z0-9_]*[A-Z0-9])\s*=/gm;
       const ex = readFileSync(p, 'utf-8');
       let em;
@@ -112,6 +181,20 @@ export function validateEnvironment(projectDir, config) {
     }
 
     const codeUsed = grepEnvUsage(projectDir, config);
+    const gaps = [];
+    if (codeUsed.limitations?.length) {
+      const forms = [...new Set(codeUsed.limitations.map(item => item.code))].join(', ');
+      gaps.push(`Environment findings are retained; the parser fallback cannot verify these Worker forms: ${forms}`);
+    }
+    // A source language with no env patterns is not "nothing to check": a
+    // variable read there is unseen, and an empty result used to skip the
+    // comparison as vacuous while the validator still said `checked`
+    // (docguard.fallback-language-coverage#FR-004).
+    if (codeUsed.unscanned?.length) {
+      const total = codeUsed.unscanned.reduce((sum, item) => sum + item.files, 0);
+      gaps.push(`Env reads are matched by pattern in JS/TS, Python, Go, Java, Kotlin, Ruby, PHP, C# and Rust, and in Spring config files; ${describeLanguageCounts(codeUsed.unscanned)} ${total === 1 ? 'has' : 'have'} no env patterns, so a variable read there is not seen and cannot be checked against ${envDoc}.`);
+    }
+    if (gaps.length) applicability = { status: 'partial', reason: gaps.join(' ') };
 
     // Only assess when code actually reads env vars — otherwise the check is
     // vacuous (always passes) and would just inflate the count.
@@ -123,9 +206,20 @@ export function validateEnvironment(projectDir, config) {
       } else {
         const shown = usedButUndocumented.slice(0, 10).join(', ');
         const more = usedButUndocumented.length > 10 ? ` (+${usedButUndocumented.length - 10} more)` : '';
+        // The finding carries the analyzer tier of the files behind it: a
+        // variable read in Go or Java was matched in a language with no
+        // syntax tree (docguard.fallback-language-coverage#FR-002).
+        const tierItems = [];
+        for (const name of usedButUndocumented) {
+          for (const ext of codeUsed.origins?.get(name) || []) {
+            const item = tierFor(`file${ext}`, null);
+            if (item.tier === 'fallback-language') tierItems.push({ ...item, file: `file${ext}` });
+          }
+        }
         findings.push(mkFinding({
           code: 'ENV003',
           validator: 'environment',
+          parserTier: summarizeTiers(tierItems).tier,
           severity: 'warn',
           message: `${usedButUndocumented.length} env var(s) used in code but not documented in ENVIRONMENT.md / .env.example: ${shown}${more}`,
           location: envDoc,
@@ -137,8 +231,10 @@ export function validateEnvironment(projectDir, config) {
 
   // Only check .env.example if the project type needs it
   if (ptc.needsEnvExample !== false && ptc.needsEnvVars !== false) {
-    // Check if .env.example is referenced and exists
-    if (content.includes('.env.example')) {
+    // Check if .env.example is referenced and exists. A mention inside an
+    // HTML comment is template placeholder text (`<!-- e.g. Copy .env.example -->`),
+    // not a reference (docguard.generated-docs-consistency#FR-006).
+    if (content.replace(/<!--[\s\S]*?-->/g, '').includes('.env.example')) {
       total++;
       if (existsSync(resolve(projectDir, '.env.example'))) {
         passed++;
@@ -179,5 +275,5 @@ export function validateEnvironment(projectDir, config) {
     passed++;
   }
 
-  return { name: 'environment', ...resultFromFindings(findings, { passed, total }) };
+  return { name: 'environment', ...(applicability ? { applicability } : {}), ...resultFromFindings(findings, { passed, total }) };
 }

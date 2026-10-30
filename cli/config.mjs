@@ -1,4 +1,7 @@
+import { hasWorkerConfig } from './shared-source.mjs';
+import { applyDocRoles } from './shared-doc-roles.mjs';
 /**
+ * @implements docguard.evidence-scoped-verification#FR-010 {scope=file}
  * DocGuard — configuration loading.
  *
  * Extracted from docguard.mjs (v0.23.0) to break the demo.mjs → docguard.mjs
@@ -11,8 +14,9 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve, basename } from 'node:path';
 import { c, PROFILES, SEVERITY_LEVELS } from './shared.mjs';
+import { CODES } from './findings.mjs';
 import { mergeIgnoreFile } from './shared-ignore.mjs';
-import { detectProjectName } from './scanners/project-type.mjs';
+import { detectProjectName, detectProjectProfile } from './scanners/project-type.mjs';
 
 export function loadConfig(projectDir) {
   const configPath = resolve(projectDir, '.docguard.json');
@@ -77,14 +81,22 @@ export function loadConfig(projectDir) {
       security: false,
       environment: true,
       freshness: true,
+      documentLifecycle: true,
+      specRegistry: true,
+      docDependency: true, // opt-in by declaration: not applicable until a section declares covers=
+      requirementAnchors: true, // opt-in: not applicable without .docguard-anchor-lock.jsonl or anchors.enabled
+      pathScopedRules: true, // not applicable without agent instruction files
+      docOwnership: true, // not applicable without an ownership block or .devin/wiki.json
+      evidence: true,
       // v0.31.0 — all three default ON. Soft (confidence:low, never break CI),
-      // precise (zero false positives across the 6-repo corpus), and quiet when
+      // heuristic (field cases require ongoing precision checks), and quiet when
       // not applicable (no diff / no API-reference doc). api-doc-smells is
-      // low-yield but zero-FP, so on-by-default beats a self-counting split.
+      // Detection yield and false positives must be measured per supported syntax.
       diffSuspicion: true,
       referenceExistence: true,
       apiDocSmells: true,
     },
+    findingSeverity: {},
   };
 
   if (existsSync(configPath)) {
@@ -103,6 +115,9 @@ export function loadConfig(projectDir) {
       // user can write either kebab-case (`test-spec`) or camelCase (`testSpec`)
       // and the internal lookups (always camelCase) still hit.
       const merged = deepMerge(withProfile, normalizeConfig(userConfig));
+      // The schema allows one agent file as a string; every reader expects a
+      // list (docguard.dogfood-findings#FR-001).
+      if (typeof merged.requiredFiles?.agentFile === 'string') merged.requiredFiles.agentFile = [merged.requiredFiles.agentFile];
       merged.profile = profileName;
 
       // v0.24: severity accepts only high|medium|low and changes EXIT-CODE
@@ -114,6 +129,16 @@ export function loadConfig(projectDir) {
         for (const [key, val] of Object.entries(merged.severity)) {
           if (typeof val === 'string' && !SEVERITY_LEVELS.has(val.toLowerCase())) {
             console.error(`${c.yellow}⚠ .docguard.json: severity.${key} = "${val}" is not a valid level${c.reset} ${c.dim}(use high | medium | low). To silence a validator entirely, set ${c.reset}${c.cyan}validators.${key}: false${c.dim}.${c.reset}`);
+          }
+        }
+      }
+      if (merged.findingSeverity && typeof merged.findingSeverity === 'object') {
+        for (const [code, val] of Object.entries(merged.findingSeverity)) {
+          if (!Object.hasOwn(CODES, code)) {
+            throw new Error(`findingSeverity.${code} is not a known finding code`);
+          }
+          if (typeof val !== 'string' || !SEVERITY_LEVELS.has(val.toLowerCase())) {
+            throw new Error(`findingSeverity.${code} must be high, medium, or low`);
           }
         }
       }
@@ -139,7 +164,7 @@ export function loadConfig(projectDir) {
       // Merge .docguardignore patterns into config.ignore so every validator
       // honors them without having to know about the file.
       mergeIgnoreFile(projectDir, merged);
-      return merged;
+      return applyDocRoles(projectDir, merged);
     } catch (e) {
       console.error(`${c.red}Error parsing .docguard.json: ${e.message}${c.reset}`);
       process.exit(1);
@@ -158,42 +183,45 @@ export function loadConfig(projectDir) {
 // PROFILES is exported from shared.mjs (re-exported at line 43)
 
 /**
- * Auto-detect project type from package.json and file structure.
- * Returns: 'cli' | 'library' | 'webapp' | 'api' | 'unknown'
+ * Auto-detect project type: 'cli' | 'library' | 'webapp' | 'api' | 'unknown'.
+ *
+ * One detector: the ecosystem profile (scanners/project-type.mjs), which
+ * reads every manifest DocGuard supports. A root ecosystem that names a
+ * framework or a kind wins over a root `library` (a Python service with a
+ * package.json for tooling), and a `service` with a web framework is an
+ * `api`. A Worker config is checked first, as before.
+ * @implements docguard.python-extraction#FR-010
+ * @implements docguard.output-ux#FR-015
  */
-function autoDetectProjectType(dir) {
-  const pkgPath = resolve(dir, 'package.json');
-  if (existsSync(pkgPath)) {
-    try {
-      const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-      const allDeps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+const KIND_TO_PROJECT_TYPE = { __proto__: null, cli: 'cli', library: 'library', webapp: 'webapp', api: 'api', service: 'api' };
 
-      // CLI tool: has "bin" field
-      if (pkg.bin) return 'cli';
+export function autoDetectProjectType(dir) {
+  if (hasWorkerConfig(dir)) return 'api';
+  let profile;
+  try { profile = detectProjectProfile(dir); } catch { return 'unknown'; }
+  const roots = profile.ecosystems.filter(e => e.dir === '.');
+  const pick = roots.find(e => e.kind !== 'library') || profile.primary;
+  if (!pick) return 'unknown';
+  // A package.json with no entry point, no bin and no framework is not
+  // evidence of a library; keep the historical 'unknown' for it.
+  if (pick.kind === 'library' && pick.manifest === 'package.json' && !hasLibraryEntry(dir)) return 'unknown';
+  // A `service` is an API only when a web framework says so; a bare Go
+  // main package stays 'unknown', as before.
+  if (pick.kind === 'service' && !pick.framework) return 'unknown';
+  return KIND_TO_PROJECT_TYPE[pick.kind] || 'unknown';
+}
 
-      // Web app: has a frontend framework
-      if (allDeps.next || allDeps.react || allDeps.vue || allDeps['@angular/core'] ||
-          allDeps.svelte || allDeps.nuxt || allDeps['@sveltejs/kit']) return 'webapp';
-
-      // API: has a server framework but no frontend
-      if (allDeps.express || allDeps.fastify || allDeps.hono || allDeps.koa) return 'api';
-
-      // Library: has "main" or "exports" and no framework
-      if (pkg.main || pkg.exports || pkg.module) return 'library';
-    } catch { /* fall through */ }
-  }
-
-  // Python project
-  if (existsSync(resolve(dir, 'manage.py'))) return 'webapp';
-  if (existsSync(resolve(dir, 'setup.py')) || existsSync(resolve(dir, 'pyproject.toml'))) return 'library';
-
-  return 'unknown';
+function hasLibraryEntry(dir) {
+  try {
+    const pkg = JSON.parse(readFileSync(resolve(dir, 'package.json'), 'utf-8'));
+    return !!(pkg.main || pkg.exports || pkg.module);
+  } catch { return false; }
 }
 
 /**
  * Get default projectTypeConfig for a given project type.
  */
-function getProjectTypeDefaults(type) {
+export function getProjectTypeDefaults(type) {
   const defaults = {
     cli:     { needsEnvVars: false, needsEnvExample: false, needsE2E: false, needsDatabase: false, testFramework: 'node:test', runCommand: null },
     library: { needsEnvVars: false, needsEnvExample: false, needsE2E: false, needsDatabase: false, testFramework: 'vitest',    runCommand: null },
@@ -215,11 +243,12 @@ function getProjectTypeDefaults(type) {
  * normalized blindly: kebab-case→camelCase always.
  */
 const _KNOWN_VALIDATORS = [
-  'structure', 'docsSync', 'drift', 'changelog', 'testSpec', 'environment',
+  'structure', 'docSections', 'docsSync', 'drift', 'changelog', 'testSpec', 'environment',
   'security', 'architecture', 'freshness', 'traceability', 'docsDiff',
   'apiSurface', 'metadataSync', 'docsCoverage', 'docQuality', 'todoTracking',
   'schemaSync', 'specKit', 'crossReference', 'generatedStaleness',
   'canonicalSync', 'surfaceSync', 'metricsConsistency',
+  'evidence',
 ];
 
 function _kebabToCamel(k) {
@@ -241,6 +270,17 @@ function normalizeConfig(cfg) {
   const out = { ...cfg };
   if (out.validators) out.validators = _normalizeValidatorKeys(out.validators);
   if (out.severity)   out.severity   = _normalizeValidatorKeys(out.severity);
+  if (out.findingSeverity && typeof out.findingSeverity === 'object' && !Array.isArray(out.findingSeverity)) {
+    const normalized = {};
+    for (const [rawCode, value] of Object.entries(out.findingSeverity)) {
+      const code = rawCode.toUpperCase();
+      if (Object.hasOwn(normalized, code)) {
+        throw new Error(`findingSeverity contains duplicate code ${code}`);
+      }
+      normalized[code] = typeof value === 'string' ? value.toLowerCase() : value;
+    }
+    out.findingSeverity = normalized;
+  }
   return out;
 }
 

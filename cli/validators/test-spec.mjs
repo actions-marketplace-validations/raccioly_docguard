@@ -1,3 +1,4 @@
+import { docRolePath, resolveDocRole } from '../shared-doc-roles.mjs';
 /**
  * Test Spec Validator — Checks that tests exist per TEST-SPEC.md coverage rules
  * Now respects projectTypeConfig (e.g., skip E2E for CLI tools)
@@ -19,8 +20,8 @@ export function validateTestSpec(projectDir, config) {
   let total = 0;
   let note;
 
-  const specDoc = 'docs-canonical/TEST-SPEC.md';
-  const testSpecPath = resolve(projectDir, specDoc);
+  const specDoc = docRolePath(config, 'testSpec');
+  const testSpecPath = resolveDocRole(projectDir, config, 'testSpec');
   if (!existsSync(testSpecPath)) {
     // Structure validator catches this. Keep the exact legacy shape here
     // (no `findings` key) — tests deep-equal this early return.
@@ -77,7 +78,7 @@ export function validateTestSpec(projectDir, config) {
     // different shapes (Controllers, Services, an "Integration Tests" inventory
     // like `| test-file | what it covers |`). Without this guard a prose
     // "what it covers" cell — "Health endpoint with real dependencies" — gets
-    // checked as a missing test file (false positive; field test: wu-whatsappinbox).
+    // checked as a missing test file (false positive; field test: downstream-project).
     const isPathLike = (v) => !!v && !/\s/.test(v) && (/[\\/]/.test(v) || /\.[A-Za-z0-9]{1,6}$/.test(v));
 
     for (const row of pipeRows.slice(1)) { // skip the header row
@@ -225,10 +226,20 @@ export function validateTestSpec(projectDir, config) {
   // somewhere — that rendered a confident green ✅ for a doc that mapped nothing.
   if (total === 0) {
     // 1. Check top-level test dirs
-    const commonTestDirs = ['tests', 'test', '__tests__', 'spec'];
-    const hasTestDir = commonTestDirs.some(d =>
-      existsSync(resolve(projectDir, d))
-    );
+    // Match by normalised name rather than exact spelling: `Tests/`, `testing/`,
+    // `e2e/` and `integration/` are the same signal as `tests/`, and probing for
+    // literal names was case-insensitive only by accident (it matched on macOS
+    // and not on Linux, so CI and a laptop disagreed).
+    const TEST_DIR_NAMES = new Set([
+      'tests', 'test', 'spec', 'specs', 'testing',
+      'e2e', 'integration', 'unit', 'acceptance',
+    ]);
+    const normaliseDir = (name) => name.toLowerCase().replace(/[^a-z0-9]/g, '');
+    let hasTestDir = false;
+    try {
+      hasTestDir = readdirSync(projectDir, { withFileTypes: true })
+        .some(e => e.isDirectory() && TEST_DIR_NAMES.has(normaliseDir(e.name)));
+    } catch { /* unreadable root: fall through to the other signals */ }
 
     // 2. Check co-located tests (honors config.sourceRoot + workspaces)
     let hasColocated = false;
@@ -396,7 +407,10 @@ function hasTestFilesRecursive(dir) {
       if (s.isDirectory()) {
         if (entry === '__tests__' || entry === '__test__') return true;
         if (hasTestFilesRecursive(full)) return true;
-      } else if (/\.(test|spec)\.[^.]+$/.test(entry)) {
+      } else if (/\.(test|spec)\.[^.]+$/.test(entry)
+        // Go, pytest and Django test files are tests too; missing them reported
+        // "no test files" for projects that have them (docguard.generated-docs-consistency#FR-010).
+        || /_test\.go$|^test_[^/]+\.py$|_test\.py$|^tests\.py$/.test(entry)) {
         return true;
       }
     } catch { continue; }

@@ -1,0 +1,357 @@
+name: Scheduled Release
+
+# Self-sustaining releases: batches whatever has landed on main since the last
+# tag into a weekly release, instead of cutting a version per merge. The bump
+# defaults to `auto`: minor when the curated [Unreleased] changelog has Added,
+# Removed or Deprecated entries, patch otherwise (docguard.release-readiness).
+# @implements docguard.release-readiness#FR-001
+#
+# WHY BATCHED AND NOT PER-MERGE: every release publishes to npm AND PyPI
+# publicly. Per-merge releases would burn a version number per dependabot
+# patch and publish constantly. Weekly batching keeps releases hands-off
+# without turning the registry into a changelog.
+#
+# HOW IT TRIGGERS THE ACTUAL RELEASE: the repository token validates and opens a
+# protected PR, then arms GitHub's native squash auto-merge. GitHub intentionally
+# holds that PR's workflows for one maintainer approval. Once approved, ordinary
+# PR CI satisfies the required checks and native auto-merge updates main. The
+# scheduler waits briefly and dispatches release.yml after that merge; a
+# 10-minute tag-driven sweep publishes approvals that happen after the wait
+# ends, which is the usual case (#447).
+# @implements docguard.release-dispatch-window#FR-002
+#
+# NO-OP WHEN NOTHING CHANGED: if there are no commits since the last release
+# tag, this exits without bumping — no empty releases.
+
+on:
+  schedule:
+    - cron: '0 9 * * 1' # Mondays 09:00 UTC
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type (auto reads the [Unreleased] changelog)'
+        required: false
+        default: 'auto'
+        type: choice
+        options: [auto, patch, minor]
+
+# Read by default. The cut and the test run happen in read-only jobs; the job
+# that pushes the release branch receives the cut as a patch, checks its paths,
+# and runs no repository code. A bot may merge new test files (spec 067), so no
+# test runs beside a token that can write (specs/068-release-least-privilege).
+# Enforced by tests/workflow-permissions.test.mjs.
+# @implements docguard.release-least-privilege#FR-001
+# @implements docguard.release-least-privilege#FR-005
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduled-release
+  cancel-in-progress: false
+
+jobs:
+  # Is a release due? If so: bump the version, cut the CHANGELOG, sync every
+  # publication surface, validate the candidate, and upload it as a patch.
+  # Runs no tests, so nothing can change the patch between the cut and upload.
+  cut:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      recover: ${{ steps.check.outputs.recover }}
+      current: ${{ steps.check.outputs.current }}
+      last_tag: ${{ steps.check.outputs.last_tag }}
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      - name: Check for unreleased changes
+        id: check
+        run: |
+          CURRENT=$(node -p "require('./package.json').version")
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+
+          if ! git ls-remote --tags origin "refs/tags/v$CURRENT" | grep -q "refs/tags/v$CURRENT$"; then
+            echo "v$CURRENT is not published — the recover job dispatches idempotent release recovery."
+            echo "recover=true" >> "$GITHUB_OUTPUT"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$LAST_TAG" ]; then
+            echo "No tags yet — nothing to compare against, skipping."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Commits since the last tag, excluding the release commits themselves
+          # and the OpenWolf bookkeeping noise (.wolf/ is auto-written by hooks
+          # every session and must never on its own justify a release).
+          COMMITS=$(git log "${LAST_TAG}..HEAD" --oneline -- . ':!.wolf' | grep -viE '^[0-9a-f]+ (release|chore\(release\)):' || true)
+          COUNT=$(echo "$COMMITS" | grep -c . || true)
+
+          echo "Last tag: $LAST_TAG"
+          echo "Releasable commits since: $COUNT"
+          echo "$COMMITS"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
+            # Stash the log for the changelog entry
+            echo "$COMMITS" > /tmp/commits.txt
+          fi
+
+      - name: Bump version and write changelog
+        id: bump
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          BUMP="${{ inputs.bump || 'auto' }}"
+          OLD="${{ steps.check.outputs.current }}"
+          if [ "$BUMP" = "auto" ]; then
+            INFERRED=$(node .github/scripts/release-changelog.mjs infer)
+            BUMP=$(node -p "JSON.parse(process.argv[1]).bump" "$INFERRED")
+            echo "Inferred bump: $INFERRED"
+          fi
+          NEW=$(node --input-type=module -e "import { nextVersion } from './.github/scripts/release-changelog.mjs'; console.log(nextVersion(process.argv[1], process.argv[2]));" "$OLD" "$BUMP")
+          echo "Bumping $OLD → $NEW ($BUMP)"
+
+          node -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('package.json','utf8'));
+            p.version = '$NEW';
+            fs.writeFileSync('package.json', JSON.stringify(p,null,2) + '\n');
+          "
+          npm install --package-lock-only --ignore-scripts
+
+          # The curated [Unreleased] body becomes the '## [NEW]' section that
+          # release.yml's notes extractor reads; the merged commit subjects
+          # follow under their own '### Commits' heading.
+          # @implements docguard.release-readiness#FR-002
+          node .github/scripts/release-changelog.mjs cut --version "$NEW" \
+            --date "$(date -u +%Y-%m-%d)" --last-tag "${{ steps.check.outputs.last_tag }}" \
+            --commits /tmp/commits.txt
+
+          # Synchronize every active publication surface from package.json,
+          # including the checked-in `.agent/` skill and command mirrors. This
+          # is fail-closed: missing or duplicated fields stop the release
+          # before any release metadata is written.
+          node .github/scripts/sync-release-version.mjs
+          # DELIBERATELY NOT REGENERATED HERE: llms.txt / llms-full.txt.
+          # tests/llms-bundle-drift.test.mjs already fails any pull request that
+          # changes a canonical or optional document without running
+          # `npm run llms`, so every section except the inlined changelog body is
+          # current on main at all times. Regenerating them in THIS job bought
+          # only a footer version stamp and the spliced release header, and cost
+          # two outages: the paths were not in RELEASE_PATH_ALLOWLIST (which
+          # failed the v0.42.0 cut outright), and a wholesale-regenerated file
+          # has no line-level ancestor, so any pull request merged while this
+          # release PR waits for approval conflicts hard and forces a recut.
+          # The footer is a provenance record — "generated by the version that
+          # generated it" is true; restamping it from a job that regenerates
+          # nothing else is not.
+
+          echo "NEW_VERSION=$NEW" >> "$GITHUB_ENV"
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Validate the release candidate
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          node .github/scripts/validate-release-candidate.mjs \
+            --base-version "${{ steps.check.outputs.current }}" \
+            --branch "release/v${NEW_VERSION}"
+
+      - name: Write the release patch
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          git add package.json package-lock.json pyproject.toml server.json action.yml README.md docs/ai-integration.md CHANGELOG.md .pre-commit-hooks.yaml templates/ commands/ extensions/ .agent/ 2>/dev/null || true
+          git diff --cached --binary > "$RUNNER_TEMP/release/release.patch"
+          git diff --cached --name-only
+          test -s "$RUNNER_TEMP/release/release.patch"
+
+      - name: Hand the patch to verify and open-pr
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-patch
+          path: ${{ runner.temp }}/release/release.patch
+          if-no-files-found: error
+          retention-days: 3
+
+  # The suite and guard on the cut tree, in a job that can write nothing.
+  verify:
+    needs: cut
+    if: needs.cut.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      - name: Receive the release patch
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-patch
+          path: ${{ runner.temp }}/release
+
+      - name: Verify the tree is still green before releasing
+        run: |
+          git apply "$RUNNER_TEMP/release/release.patch"
+          npm ci
+          npm test
+          node cli/docguard.mjs guard || [ $? -eq 2 ]
+
+  # Pushes the release branch and opens the PR. It holds the write scopes, so
+  # it runs no repository code: only git, gh and jq, on the patch the cut
+  # produced and verify tested.
+  open-pr:
+    needs: [cut, verify]
+    if: needs.cut.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Receive the release patch
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-patch
+          path: ${{ runner.temp }}/release
+
+      - name: Check the patch touches only release paths
+        env:
+          NEW_VERSION: ${{ needs.cut.outputs.version }}
+        run: |
+          PATCH="$RUNNER_TEMP/release/release.patch"
+          BAD=0
+          for f in $(git apply --numstat "$PATCH" | cut -f3); do
+            case "$f" in
+              package.json|package-lock.json|pyproject.toml|server.json|action.yml|README.md|docs/ai-integration.md|CHANGELOG.md|.pre-commit-hooks.yaml|templates/*|commands/*|extensions/*|.agent/*) ;;
+              *) echo "::error::The release patch changes $f, which is not a release path."; BAD=1 ;;
+            esac
+          done
+          [ "$BAD" -eq 0 ] || exit 1
+          git apply --check "$PATCH"
+          # Read the version the patch sets, then return to a clean checkout;
+          # the next step applies it again on the release branch.
+          git apply --index "$PATCH"
+          PATCHED=$(jq -r .version package.json)
+          git reset -q --hard HEAD
+          if [ "$PATCHED" != "$NEW_VERSION" ]; then
+            echo "::error::The patch sets version $PATCHED; the cut produced $NEW_VERSION."
+            exit 1
+          fi
+
+      # Main requires a PR and four pull-request runtime checks. GitHub holds
+      # workflows for PRs opened by GITHUB_TOKEN until a maintainer approves them;
+      # workflow_dispatch jobs do not satisfy those required PR contexts. The
+      # approval is the deliberate human boundary that avoids a stored PAT or App
+      # private key. Native auto-merge remains blocked until all required checks
+      # succeed and resets if the candidate head changes.
+      #
+      #   1. main requires a pull request. github-actions[bot] is not an admin
+      #      and has no bypass, so a direct push is rejected outright.
+      - name: Open release PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_VERSION: ${{ needs.cut.outputs.version }}
+        run: |
+          wait_for_merge_and_publish() {
+            PR_URL="$1"
+            for ATTEMPT in $(seq 1 40); do
+              STATE=$(gh pr view "$PR_URL" --json state --jq '.state')
+              if [ "$STATE" = "MERGED" ]; then
+                echo "Release PR merged; dispatching tag-driven publication."
+                gh workflow run release.yml --ref main
+                return 0
+              fi
+              if [ "$STATE" = "CLOSED" ]; then
+                echo "::error::Release PR closed without merge."
+                return 1
+              fi
+              sleep 15
+            done
+            echo "::notice::Release PR remains open after 10 minutes. The 10-minute tag-driven release sweep will publish within 10 minutes of a later approval and merge."
+          }
+
+          BRANCH="release/v${NEW_VERSION}"
+          EXISTING=$(gh pr list --base main --head "$BRANCH" --state open --json url --jq '.[0].url // ""')
+          if [ -n "$EXISTING" ]; then
+            echo "Reusing existing release PR: $EXISTING"
+            git fetch origin "$BRANCH"
+            if ! git merge-base --is-ancestor HEAD "origin/$BRANCH"; then
+              echo "::error::Existing $BRANCH does not contain current main; refusing to validate a stale release."
+              exit 1
+            fi
+            gh pr merge --auto --squash "$EXISTING"
+            echo "Auto-merge armed. Maintainer action required: approve the PR workflows in GitHub."
+            wait_for_merge_and_publish "$EXISTING"
+            exit 0
+          fi
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "::error::Remote branch $BRANCH exists without an open PR; refusing to overwrite it."
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          # The exact patch the read-only cut job validated, checked above.
+          git apply --index "$RUNNER_TEMP/release/release.patch"
+          git commit -m "release: v${NEW_VERSION} — automated weekly batch
+
+          Cut by .github/workflows/scheduled-release.yml. Publishing itself is
+          dispatched after protected native auto-merge updates main."
+          git push origin "$BRANCH"
+
+          PR_URL=$(gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "release: v${NEW_VERSION} — automated weekly batch" \
+            --body "Automated weekly release cut by \`scheduled-release.yml\`.
+
+          Spec-Exempt: release — automated weekly version cut; each batched change carried its own spec
+
+          Batches everything merged since \`${{ needs.cut.outputs.last_tag }}\`. Tests and \`guard\` already passed on this tree before the PR was opened.
+
+          **Maintainer action required:** select **Approve workflows to run** in GitHub. The ordinary pull-request CI then satisfies branch protection; GitHub's protected native auto-merge merges the exact green head, and the waiting scheduler dispatches \`release.yml\`. A 10-minute tag-driven sweep publishes later approvals.")
+
+          gh pr merge --auto --squash "$PR_URL"
+          echo "Opened $BRANCH with auto-merge armed. Approve its workflows in GitHub to continue the release."
+          wait_for_merge_and_publish "$PR_URL"
+
+  # The current version has no tag: dispatch the idempotent release recovery.
+  # Holds only actions: write and checks nothing out.
+  recover:
+    needs: cut
+    if: needs.cut.outputs.recover == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch release.yml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run release.yml --ref main --repo "${{ github.repository }}"

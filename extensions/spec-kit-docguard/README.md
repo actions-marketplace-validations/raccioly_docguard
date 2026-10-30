@@ -1,15 +1,15 @@
 # DocGuard — CDD Enforcement Extension for Spec Kit
 
-Enterprise-grade Canonical-Driven Development (CDD) enforcement and **AI-readable project memory** for [Spec Kit](https://github.com/github/spec-kit). DocGuard builds a complete, language-aware documentation memory of any codebase (`generate --plan`), keeps it always up to date as code changes (`sync`), and verifies it (`guard`) — with deterministic mechanical fixes (`fix --write`) where it can and grounded agent prompts where prose is needed.
+Enterprise-grade Canonical-Driven Development (CDD) enforcement and **AI-readable project memory** for [Spec Kit](https://github.com/github/spec-kit). DocGuard builds source-derived documentation context for supported code (`generate --plan`), refreshes generated sections as code changes (`sync`), and checks configured rules (`guard`) — with deterministic mechanical fixes (`fix --write`) where it can and grounded agent prompts where prose is needed.
 
 ## Features
 
-- **24 Validators** — Structure, Security, Doc Quality, Test-Spec, Drift-Comments, API-Surface, Freshness, Cross-Reference, and 13 more
-- **Language-agnostic** — JS/TS, Python, Rust, Go, Java/Kotlin, Ruby, PHP, C#. Polyglot/monorepo-aware.
+- **Configurable validators** — Structure, Security, Doc Quality, Test-Spec, Drift-Comments, API-Surface, Freshness, Cross-Reference, and more; use `docguard --help` for the current surface
+- **Language-specific extraction** — Supported checks cover several languages and monorepos. Coverage varies by detector; unsupported inputs remain unverified.
 - **AI-powered Generate** — `generate --plan` builds the code-truth skeleton in `<!-- docguard:section -->` markers and emits a structured agent task manifest; the AI writes the prose.
-- **Always up to date** — `sync` surgically refreshes code-truth doc sections in place, **preserves human prose**, flags prose for agent review.
+- **Refresh and review** — `sync` surgically refreshes code-truth doc sections in place, **preserves human prose**, flags prose for agent review.
 - **Mechanical `fix --write`** — deterministic, no-LLM: remove stale documented endpoints, refresh stale "N validators" counts, replace stale version refs, insert missing `## [Unreleased]`.
-- **5 AI Skills** — docguard-fix, docguard-guard, docguard-sync, docguard-review, docguard-score (enterprise-grade behavior protocols, not just step-lists)
+- **5 AI Skills** — docguard-fix, docguard-guard, docguard-review, docguard-score, docguard-sync (enterprise-grade behavior protocols, not just step-lists)
 - **Workflow Chaining** — YAML handoffs enable guard → sync → fix → review → score flows
 - **Spec Kit Hooks** — Quality gate integrations at implement, tasks, and review phases
 - **Minimal Dependencies** — one pinned, optional-load parser (`@babel/parser`); Node.js built-ins otherwise
@@ -20,10 +20,15 @@ Enterprise-grade Canonical-Driven Development (CDD) enforcement and **AI-readabl
 npm install -g docguard-cli
 ```
 
-Or use via npx:
-```bash
-npx docguard-cli guard
-```
+Requires Spec Kit ≥ 0.11.2 (`requires.speckit_version`). `docguard init` registers
+this extension from the installed package and re-registers it when its version
+differs from the CLI's; `docguard upgrade --apply` does the same.
+
+The command and skill files run `docguard` from PATH when it is installed, and
+otherwise `npx --yes docguard-cli@<version>`, pinned to the release they ship
+with. They never fetch `@latest`. The orchestration scripts require a local
+`node_modules/docguard-cli` installation or `docguard` on PATH; they do not
+download a CLI.
 
 ## Quick Start
 
@@ -43,18 +48,31 @@ docguard score
 
 ## Commands
 
+Agents invoke these in their own form: `/speckit-docguard-guard` in Claude Code
+and other skills-based agents, `/speckit.docguard.guard` for the generic
+integration. Spec Kit registers no extension command for `generic`, so
+`docguard init` writes them into the generic commands directory. The alias
+column lists DocGuard's own commands, installed only for `generic` or an agent
+DocGuard cannot place.
+
 | Command | Alias | Purpose |
 |---------|-------|---------|
-| `speckit.docguard.guard` | `docguard.guard` | Run 19-validator quality gate with severity triage |
+| `speckit.docguard.init` | — | Initialize CDD in a project |
+| `speckit.docguard.guard` | `docguard.guard` | Run configurable quality gate with severity triage |
 | `speckit.docguard.fix` | `docguard.fix` | AI-driven documentation repair with codebase research |
 | `speckit.docguard.review` | `docguard.review` | Cross-document semantic consistency analysis (read-only) |
 | `speckit.docguard.score` | `docguard.score` | CDD maturity score with ROI improvement roadmap |
 | `speckit.docguard.diagnose` | — | Diagnose issues + generate multi-perspective AI prompts |
 | `speckit.docguard.generate` | — | Reverse-engineer canonical docs from codebase |
+| `speckit.docguard.sync` | — | Refresh code-truth sections and flag prose for review |
+| `speckit.docguard.trace` | — | Generate requirements traceability matrix |
+| `speckit.docguard.brief` | — | Load current spec intent before specification |
+| `speckit.docguard.preflight` | — | Gate the generated spec before task generation |
+| `speckit.docguard.complete` | — | Plan reviewed completion and regenerate active context after verification |
 
 ## AI Skills
 
-DocGuard provides 4 enterprise-grade AI behavior protocols modeled after Spec Kit's skill architecture:
+DocGuard provides 5 enterprise-grade AI behavior protocols modeled after Spec Kit's skill architecture:
 
 | Skill | Lines | What It Does |
 |-------|:-----:|-------------|
@@ -62,6 +80,7 @@ DocGuard provides 4 enterprise-grade AI behavior protocols modeled after Spec Ki
 | `docguard-fix` | 195 | 7-step research workflow with per-document codebase research, 3-iteration validation loops |
 | `docguard-review` | 170 | Semantic cross-document analysis with 6 analysis passes and quality scoring matrix |
 | `docguard-score` | 165 | CDD maturity assessment with ROI-based improvement roadmap and grade progression |
+| `docguard-sync` | — | Refresh code-truth sections while preserving human prose and routing it for review |
 
 Skills differ from commands in a critical way: **commands tell agents what to run** (step-lists), while **skills tell agents how to think, validate, and iterate** (behavior protocols).
 
@@ -73,13 +92,26 @@ DocGuard integrates into the spec-kit workflow through hooks:
 
 ```yaml
 hooks:
-  after_implement:   # Optional — quality gate after /speckit.implement
-    command: speckit.docguard.guard
-  before_tasks:      # Optional — review docs before task generation
-    command: speckit.docguard.review
+  before_specify:    # Mandatory — read current spec intent first
+    command: speckit.docguard.brief
+  after_implement:   # Guard is mandatory; completion review is optional
+    - command: speckit.docguard.guard
+    - command: speckit.docguard.complete
+  after_converge:    # Optional completion review after convergence
+    command: speckit.docguard.complete
+  before_tasks:      # Mandatory — gate the generated spec
+    command: speckit.docguard.preflight
   after_tasks:       # Optional — show score after tasks
     command: speckit.docguard.score
 ```
+
+`docguard init` reports the hooks as active only after each mandatory hook
+resolves to a command file the agent can run.
+
+The hooks call the deterministic CLI contract. The pre-specification hook emits
+a current-intent briefing; the pre-task hook checks the actual generated spec.
+Spec Kit dispatches the hooks through its agent workflow, while
+`docguard specs --check` remains the CI enforcement surface.
 
 ### Workflow Chaining
 

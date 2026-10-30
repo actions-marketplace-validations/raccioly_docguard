@@ -1,3 +1,8 @@
+---
+title: Quick Start
+nav_order: 2
+---
+
 # DocGuard — Quick Start
 
 Get AI-enforced documentation in under 5 minutes.
@@ -27,11 +32,11 @@ Creates all 6 canonical docs (including REQUIREMENTS.md) + tracking files + AI s
 If you're using [GitHub Spec Kit](https://github.com/github/spec-kit):
 
 ```bash
-# 1. Initialize spec-kit
-specify init . --ai claude
+# 1. Initialize Spec Kit for your agent
+specify init --here --integration claude
 
-# 2. Add DocGuard as enforcement layer
-specify extension add docguard
+# 2. Add DocGuard: init registers its Spec Kit extension
+npx docguard-cli init
 
 # 3. Write specs with AI, validate with DocGuard
 /speckit.specify Build an app that...
@@ -68,7 +73,7 @@ diagnose  →  AI reads prompts  →  AI fixes docs  →  guard verifies
 ## Verify
 
 ```bash
-npx docguard-cli guard        # Pass/fail check (27 validators)
+npx docguard-cli guard        # Pass/fail check (34 validators)
 npx docguard-cli score        # 0-100 maturity score
 ```
 

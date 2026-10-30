@@ -1,12 +1,13 @@
 import { describe, it, before, after } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { validateReferenceExistence } from '../cli/validators/reference-existence.mjs';
+import { fixtureGit } from './helpers/git.mjs';
+// @implements docguard.test-git-hermeticity#FR-001: this file's fixture git goes through the helper.
 
-function git(dir, ...args) { spawnSync('git', args, { cwd: dir, encoding: 'utf-8' }); }
+function git(dir, ...args) { fixtureGit(dir, args); }
 
 describe('validateReferenceExistence', () => {
   let dir;
@@ -34,6 +35,8 @@ describe('validateReferenceExistence', () => {
     const ref = r.findings.filter(f => f.code === 'REF001');
     assert.ok(ref.some(f => /validateToken/.test(f.message)), `expected validateToken flagged; got ${JSON.stringify(ref.map(f=>f.message))}`);
     assert.ok(ref.every(f => f.confidence === 'low'));
+    assert.ok(ref.every(f => f.suggestion?.kind === 'review' && f.suggestion?.text));
+    assert.ok(ref.every(f => !Object.hasOwn(f.suggestion, 'summary')));
   });
 
   it('does NOT flag a ref that still exists (getUserById)', () => {

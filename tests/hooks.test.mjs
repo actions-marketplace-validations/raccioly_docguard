@@ -1,11 +1,20 @@
 import { describe, it, afterEach, beforeEach } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync, readFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runHooks } from '../cli/commands/hooks.mjs';
 import { getHooksDir } from '../cli/shared-git.mjs';
+import { fixtureGit } from './helpers/git.mjs';
+
+// Hooks install only into this repository's own folder (spec 065). Isolate the
+// global and system Git configuration, so a contributor's global core.hooksPath
+// neither receives these hooks nor makes the installer refuse.
+// @req docguard.hooks-repo-scope#FR-006
+const isolatedGitConfig = join(mkdtempSync(join(tmpdir(), 'dg-gitcfg-')), 'gitconfig');
+writeFileSync(isolatedGitConfig, '');
+process.env.GIT_CONFIG_GLOBAL = isolatedGitConfig;
+process.env.GIT_CONFIG_NOSYSTEM = '1';
 
 describe('runHooks function', () => {
     let tmpDir;
@@ -76,10 +85,10 @@ describe('runHooks function', () => {
     it('removes hooks', () => {
         mkdirSync(join(tmpDir, '.git'));
         mkdirSync(join(tmpDir, '.git', 'hooks'));
-        writeFileSync(join(tmpDir, '.git', 'hooks', 'pre-commit'), 'DocGuard hook');
+        writeFileSync(join(tmpDir, '.git', 'hooks', 'pre-commit'), '#!/bin/sh\n# DocGuard pre-commit hook\n');
         runHooks(tmpDir, { projectName: 'Test' }, { remove: true });
         assert.ok(!existsSync(join(tmpDir, '.git', 'hooks', 'pre-commit')));
-        assert.ok(logs.some(log => log.includes('Removed: pre-commit')));
+        assert.ok(logs.some(log => /Removed legacy DocGuard hook: pre-commit/.test(log)));
     });
 
     it('skips non-DocGuard hooks when removing', () => {
@@ -88,7 +97,7 @@ describe('runHooks function', () => {
         writeFileSync(join(tmpDir, '.git', 'hooks', 'pre-commit'), 'other hook');
         runHooks(tmpDir, { projectName: 'Test' }, { remove: true });
         assert.ok(existsSync(join(tmpDir, '.git', 'hooks', 'pre-commit')));
-        assert.ok(logs.some(log => log.includes('not a DocGuard hook')));
+        assert.ok(logs.some(log => log.includes('not a recognized DocGuard hook')));
     });
 
     it('skips existing non-DocGuard hooks when installing without force', () => {
@@ -100,6 +109,18 @@ describe('runHooks function', () => {
         // v0.16-P3: new message phrasing — "an existing hook is present and has no DocGuard markers"
         assert.ok(logs.some(log => /existing hook|no DocGuard markers|Re-run with --force/i.test(log)),
           `expected refuse-to-overwrite warning; got logs: ${logs.join(' | ')}`);
+    });
+
+    it('does not claim a foreign hook that only mentions marker text inside commands', () => {
+        mkdirSync(join(tmpDir, '.git'));
+        mkdirSync(join(tmpDir, '.git', 'hooks'));
+        const path = join(tmpDir, '.git', 'hooks', 'pre-commit');
+        const foreign = `#!/bin/sh\necho '# BEGIN DOCGUARD MANAGED — do not edit between these markers'\necho '# END DOCGUARD MANAGED'\n`;
+        writeFileSync(path, foreign);
+
+        runHooks(tmpDir, { projectName: 'Test' }, { type: 'pre-commit' });
+        assert.equal(readFileSync(path, 'utf8'), foreign);
+        assert.ok(logs.some(log => /existing hook|no DocGuard markers|Re-run with --force/i.test(log)));
     });
 
     it('overwrites existing hooks when installing with force', () => {
@@ -150,8 +171,67 @@ describe('runHooks function', () => {
         assert.match(afterReinstall, /user postlude/, 'postlude must be preserved');
         assert.match(afterReinstall, /BEGIN DOCGUARD MANAGED/);
         assert.match(afterReinstall, /END DOCGUARD MANAGED/);
+        assert.equal((afterReinstall.match(/BEGIN DOCGUARD MANAGED/g) || []).length, 1,
+          'reinstall must not nest a second managed block');
+        assert.equal((afterReinstall.match(/END DOCGUARD MANAGED/g) || []).length, 1,
+          'reinstall must retain exactly one managed-block boundary');
         assert.ok(logs.some(log => /updated DocGuard managed block|preserved user content/i.test(log)),
           `expected managed-block update message; got: ${logs.join(' | ')}`);
+    });
+
+    it('repairs nested managed markers written by affected releases', () => {
+        mkdirSync(join(tmpDir, '.git'));
+        mkdirSync(join(tmpDir, '.git', 'hooks'));
+        runHooks(tmpDir, { projectName: 'Test' }, { type: 'pre-commit' });
+        const path = join(tmpDir, '.git', 'hooks', 'pre-commit');
+        const managed = readFileSync(path, 'utf8');
+        const begin = managed.match(/^# BEGIN DOCGUARD MANAGED.*$/m)?.[0];
+        const end = managed.match(/^# END DOCGUARD MANAGED$/m)?.[0];
+        assert.ok(begin && end);
+        writeFileSync(path, managed
+          .replace(begin, `${begin}\n${begin}`)
+          .replace(end, `${end}\n${end}`));
+
+        runHooks(tmpDir, { projectName: 'Test' }, { type: 'pre-commit' });
+        const repaired = readFileSync(path, 'utf8');
+        assert.equal((repaired.match(/BEGIN DOCGUARD MANAGED/g) || []).length, 1);
+        assert.equal((repaired.match(/END DOCGUARD MANAGED/g) || []).length, 1);
+    });
+
+    it('removes an affected nested managed block without leaving inner markers', () => {
+        mkdirSync(join(tmpDir, '.git'));
+        mkdirSync(join(tmpDir, '.git', 'hooks'));
+        runHooks(tmpDir, { projectName: 'Test' }, { type: 'pre-commit' });
+        const path = join(tmpDir, '.git', 'hooks', 'pre-commit');
+        const managed = readFileSync(path, 'utf8');
+        const begin = managed.match(/^# BEGIN DOCGUARD MANAGED.*$/m)?.[0];
+        const end = managed.match(/^# END DOCGUARD MANAGED$/m)?.[0];
+        assert.ok(begin && end);
+        writeFileSync(path, `#!/bin/sh\nprintf 'before\\n'\n${managed
+          .replace(/^#!.*\n/, '')
+          .replace(begin, `${begin}\n${begin}`)
+          .replace(end, `${end}\n${end}`)}printf 'after\\n'\n`);
+
+        runHooks(tmpDir, { projectName: 'Test' }, { type: 'pre-commit', remove: true });
+        const remaining = readFileSync(path, 'utf8');
+        assert.doesNotMatch(remaining, /DOCGUARD MANAGED/);
+        assert.match(remaining, /printf 'before\\n'/);
+        assert.match(remaining, /printf 'after\\n'/);
+    });
+
+    it('removes only the managed block and preserves surrounding hook commands', () => {
+        mkdirSync(join(tmpDir, '.git'));
+        mkdirSync(join(tmpDir, '.git', 'hooks'));
+        runHooks(tmpDir, { projectName: 'Test' }, { type: 'pre-commit' });
+        const path = join(tmpDir, '.git', 'hooks', 'pre-commit');
+        const managed = readFileSync(path, 'utf8');
+        writeFileSync(path, managed.replace('# BEGIN DOCGUARD MANAGED', 'echo "before"\n# BEGIN DOCGUARD MANAGED') + 'echo "after"\n');
+
+        runHooks(tmpDir, { projectName: 'Test' }, { type: 'pre-commit', remove: true });
+        const remaining = readFileSync(path, 'utf8');
+        assert.match(remaining, /echo "before"/);
+        assert.match(remaining, /echo "after"/);
+        assert.doesNotMatch(remaining, /DOCGUARD MANAGED|DocGuard guard/);
     });
 });
 
@@ -167,8 +247,8 @@ describe('getHooksDir with core.hooksPath=/dev/null', () => {
 
     beforeEach(() => {
         tmpDir = mkdtempSync(join(tmpdir(), 'sg-hooks-devnull-'));
-        spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: tmpDir });
-        spawnSync('git', ['config', 'core.hooksPath', '/dev/null'], { cwd: tmpDir });
+        fixtureGit(tmpDir, ['init', '-q', '-b', 'main']);
+        fixtureGit(tmpDir, ['config', 'core.hooksPath', '/dev/null']);
         oldLog = console.log;
         logs = [];
         console.log = (...args) => { logs.push(args.join(' ')); };

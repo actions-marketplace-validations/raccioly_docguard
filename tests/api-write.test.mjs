@@ -1,7 +1,9 @@
+// @req docguard.adoption-workflow-integrity#FR-014
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { safeWrite } from '../cli/writers/generate-io.mjs';
 import { tmpdir } from 'node:os';
 
 import { removeEndpoints, hasGeneratedMarker } from '../cli/writers/api-reference.mjs';
@@ -69,7 +71,7 @@ describe('api-reference writer: removeEndpoints', () => {
   });
 });
 
-describe('applyApiSurfaceWrites (gated, spec-confirmed removals)', () => {
+describe('applyApiSurfaceWrites (review-only contract mismatches)', () => {
   let tmp;
   const openapi = (paths) => {
     const lines = ['openapi: 3.0.3', 'info:', '  title: t', '  version: 1.0.0', 'paths:'];
@@ -81,40 +83,58 @@ describe('applyApiSurfaceWrites (gated, spec-confirmed removals)', () => {
   };
   const write = (rel, content) => {
     const full = join(tmp, rel);
-    mkdirSync(join(full, '..'), { recursive: true });
-    writeFileSync(full, content);
+    safeWrite(full, content);
   };
 
   beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'docguard-write-')); });
   afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
 
-  it('removes a spec-confirmed absent endpoint from a generated doc', () => {
+  it('keeps a contract omission review-only even in a generated doc', () => {
     write('package.json', JSON.stringify({ dependencies: { express: '^4' } }));
     write('docs/openapi.yaml', openapi({ '/api/live': ['get'] }));
+    write('src/routes.js', "app.get('/api/live', h); app.post('/api/users/:id', h);");
     write('docs-canonical/API-REFERENCE.md', API_DOC);
 
     const r = applyApiSurfaceWrites(tmp, { sourceRoot: 'src' });
-    assert.equal(r.applied, true);
-    assert.ok(r.removed.some(e => e.path === '/api/dead'));
+    assert.equal(r.applied, false);
+    assert.deepEqual(r.removed, []);
+    assert.match(r.skipped, /require review/);
     const after = readFileSync(join(tmp, 'docs-canonical/API-REFERENCE.md'), 'utf-8');
-    assert.ok(!after.includes('/api/dead'));
+    assert.ok(after.includes('/api/dead'));
     assert.ok(after.includes('/api/live'));
+    assert.ok(after.includes('/api/users/{id}'), 'implemented endpoint omitted from spec survives');
   });
 
-  it('SKIPS a doc without the generated marker unless --force', () => {
+  it('keeps review-only contract omissions immutable regardless of marker or force', () => {
     write('package.json', JSON.stringify({ dependencies: { express: '^4' } }));
     write('docs/openapi.yaml', openapi({ '/api/live': ['get'] }));
+    write('src/routes.js', "app.get('/api/live', h); app.post('/api/users/:id', h);");
     write('docs-canonical/API-REFERENCE.md', API_DOC.replace('<!-- docguard:generated true -->', ''));
 
     const skipped = applyApiSurfaceWrites(tmp, { sourceRoot: 'src' });
     assert.equal(skipped.applied, false);
-    assert.ok(skipped.skipped && /not marked/.test(skipped.skipped));
+    assert.ok(skipped.skipped && /require review/.test(skipped.skipped));
     // Doc untouched
     assert.ok(readFileSync(join(tmp, 'docs-canonical/API-REFERENCE.md'), 'utf-8').includes('/api/dead'));
 
-    // With force, it applies.
+    // Force cannot convert negative scanner evidence into proof of removal.
     const forced = applyApiSurfaceWrites(tmp, { sourceRoot: 'src' }, { force: true });
-    assert.equal(forced.applied, true);
+    assert.equal(forced.applied, false);
+    assert.deepEqual(forced.removed, []);
+    assert.ok(readFileSync(join(tmp, 'docs-canonical/API-REFERENCE.md'), 'utf8').includes('/api/dead'));
+    assert.ok(readFileSync(join(tmp, 'docs-canonical/API-REFERENCE.md'), 'utf8').includes('/api/users/{id}'));
+  });
+
+  it('does not remove spec omissions when code coverage is unknown, even with force', () => {
+    write('docs/openapi.yaml', openapi({ '/api/live': ['get'] }));
+    write('src/routes.js', 'registerFromMetadata(runtimeManifest);');
+    write('docs-canonical/API-REFERENCE.md', API_DOC);
+    for (const force of [false, true]) {
+      const result = applyApiSurfaceWrites(tmp, { sourceRoot: 'src' }, { force });
+      assert.equal(result.applied, false);
+      assert.deepEqual(result.removed, []);
+      assert.equal(readFileSync(join(tmp, 'docs-canonical/API-REFERENCE.md'), 'utf8'), API_DOC);
+    }
   });
 
   it('does NOT delete on a heuristic code-scan (no spec) — needs spec confidence', () => {

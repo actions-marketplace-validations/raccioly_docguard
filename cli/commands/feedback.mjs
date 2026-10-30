@@ -1,33 +1,35 @@
 /**
- * Feedback Command — close the loop with the tool's maintainers (v0.27).
+ * Feedback Command — prepare opt-in detection feedback.
  *
- * DocGuard is a tool for LLMs: when it gets something wrong, the cheapest way to
- * make the NEXT release better is to capture that signal. This command turns the
- * low-confidence findings of a guard run (candidate false positives — and any
- * other finding DocGuard itself flagged as uncertain) into:
+ * Select uncertain findings by default, or challenge active findings with
+ * --code / --all. Full local records may contain private diagnostics;
+ * --preview skips feedback-record writes. Persistence outcomes are explicit.
  *
- *   1. a LOCAL-FIRST record under .docguard/feedback/<code>-<id>.json (full,
- *      reviewable, never sent anywhere automatically), and
- *   2. a one-click, PREFILLED GitHub issue URL that needs zero typing.
+ * Shared issue and search URLs contain only allowlisted finding identity,
+ * tool metadata, and contribution instructions. Paths, source text, messages,
+ * suggestions, and redactedContext are excluded. URLs are capped; users must
+ * review and supply a synthetic reproduction before submitting an issue.
  *
- * Hard constraints (learned the hard way — see commit 3b600fd, where an
- * oversized prefilled URL overflowed GitHub's ~8 KB limit and silently failed):
- *   - The URL is CAPPED well under the limit; bulk lives in the local file.
- *   - It is REDACTED: no source code, no secret values — only a basename, a line
- *     number, and the safe `redactedContext` the validator built.
- *   - It is OPT-IN: nothing is filed automatically; the human clicks (or not).
- *
- * Not read-only in the strict sense — it writes its own .docguard/feedback/ —
- * but it never scaffolds skills and never touches the user's source tree.
- *
- * Zero npm dependencies — pure Node.js built-ins.
+ * Nothing is transmitted automatically. This command never scaffolds skills
+ * or edits source files. Zero npm dependencies — pure Node.js built-ins.
+ * @implements docguard.precision-evidence-loop#FR-012
+ * @implements docguard.precision-evidence-loop#FR-015
+ * @implements docguard.precision-evidence-loop#FR-016
  */
 
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
-import { resolve, dirname, basename } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { resolve, dirname, join, relative, sep } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { c } from '../shared.mjs';
+import { CODES } from '../findings.mjs';
+import { safeWrite } from '../writers/generate-io.mjs';
+import { ensureStateDir } from '../writers/state-dir.mjs';
 import { runGuardInternal } from './guard.mjs';
+import {
+  buildTestOnlyContribution, feedbackFindingIdentity, feedbackSearchUrls, parseFeedbackFixture,
+  reduceFixtureDeterministically,
+} from '../feedback-fixture.mjs';
 
 const _PKG = JSON.parse(
   readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'package.json'), 'utf-8')
@@ -45,69 +47,200 @@ function shortId(str) {
   return h.toString(36).slice(0, 6);
 }
 
-/** Redact a finding location for the SHARED url: basename + line only. */
-function safeLocation(location) {
-  if (!location) return '(unknown)';
-  const [path, line] = String(location).split(/:(?=\d+$)/);
-  return line ? `${basename(path)}:${line}` : basename(path);
-}
-
-/**
- * Build a prefilled, capped issue URL. Drops optional body lines (longest-value
- * first) until under the cap; title + code + location always survive.
- */
-function buildIssueUrl(finding) {
-  const code = finding.code || 'FINDING';
-  const validator = finding.validator || 'unknown';
-  const shortMsg = (finding.message || '').replace(/\s+/g, ' ').slice(0, 70);
-  const title = `[feedback] ${code} (${validator}): ${shortMsg}`;
-
-  // Optional lines are ordered most→least droppable.
-  const required = [
-    `DocGuard v${CLI_VERSION} flagged this and it may be a false positive (or other feedback).`,
-    '',
+/** Shared output deliberately excludes every source-derived string. */
+export function buildIssueUrl(finding, context = null) {
+  const code = Object.hasOwn(CODES, finding.code || '') ? finding.code : 'FINDING';
+  const validator = CODES[code]?.validator || 'unknown';
+  const classification = context?.classification || 'false_positive';
+  const title = `[feedback] ${code} (${validator}): ${classification.replaceAll('_', ' ')}`;
+  const confidence = ['high', 'medium', 'low'].includes(finding.confidence) ? finding.confidence : 'unknown';
+  const body = [
+    `DocGuard v${CLI_VERSION}`,
     `- Code: ${code}`,
     `- Validator: ${validator}`,
-    `- Location: ${safeLocation(finding.location)}`,
-    `- Confidence: ${finding.confidence}`,
-  ];
-  const optional = [];
-  if (finding.redactedContext) optional.push(`- Context: ${finding.redactedContext}`);
-  if (finding.suggestion && finding.suggestion.text) optional.push(`- Suggestion shown: ${finding.suggestion.text}`);
-  const footer = ['', 'Generated by `docguard feedback` — no source code or secret values are included.'];
+    `- Confidence: ${confidence}`,
+    `- Classification: ${classification}`,
+    ...(context?.parserTier ? [`- Parser tier: ${context.parserTier}`] : []),
+    ...(context?.duplicateIdentity ? [`- Duplicate identity: ${context.duplicateIdentity}`] : []),
+    '',
+    'Expected behavior:',
+    'Actual behavior:',
+    'Minimal synthetic reproduction (review before attaching):',
+    '',
+    'Check existing open AND closed issues and pull requests before submitting.',
+    'A regression-test-only contribution is welcome; explain the expected behavior.',
+    '',
+    'Generated by docguard feedback. No project paths, messages, source code, or secret values are included.',
+  ].join('\n');
+  const url = `${ISSUES_BASE}/new?labels=docguard-feedback&title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
+  const query = context?.duplicateIdentity ? `repo:raccioly/docguard "${context.duplicateIdentity}"` : `repo:raccioly/docguard ${code}`;
+  const searchUrl = `https://github.com/search?q=${encodeURIComponent(query)}&type=issues`;
+  return { url: url.length <= URL_CAP ? url : `${ISSUES_BASE}/new`, title, searchUrl };
+}
 
-  const compose = (opt) => `${ISSUES_BASE}/new?labels=${encodeURIComponent('docguard-feedback')}` +
-    `&title=${encodeURIComponent(title)}` +
-    `&body=${encodeURIComponent([...required, ...opt, ...footer].join('\n'))}`;
+const FEEDBACK_CLASSES = new Set(['false_positive', 'false_negative', 'unsupported_syntax', 'ambiguous', 'policy_disagreement']);
 
-  let opt = [...optional];
-  let url = compose(opt);
-  while (url.length > URL_CAP && opt.length > 0) {
-    opt = opt.slice(0, -1);
-    url = compose(opt);
+function projectFile(projectDir, value, label) {
+  if (typeof value !== 'string' || !value || value.includes('\\')) throw new Error(`${label} must be a project-relative path.`);
+  const root = resolve(projectDir);
+  const path = resolve(root, value);
+  const rel = relative(root, path);
+  if (!rel || rel.startsWith(`..${sep}`) || rel === '..' || rel.split(sep).some(part => ['.git', '.local'].includes(part.toLowerCase()))) {
+    throw new Error(`${label} must remain in the project and outside protected directories.`);
   }
-  if (url.length > URL_CAP) {
-    // Even the required body is too long (pathological) — collapse to a stub.
-    url = `${ISSUES_BASE}/new?labels=${encodeURIComponent('docguard-feedback')}` +
-      `&title=${encodeURIComponent(title)}` +
-      `&body=${encodeURIComponent(`DocGuard v${CLI_VERSION} — ${code} (${validator}). Full details saved locally; please attach.`)}`;
+  return path;
+}
+
+function evaluateFileSet(manifest, fileSet) {
+  const root = mkdtempSync(join(tmpdir(), 'docguard-feedback-fixture-'));
+  try {
+    for (const file of fileSet.files) {
+      const target = resolve(root, file.path);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, file.content, 'utf8');
+    }
+    const report = runGuardInternal(root, manifest.config);
+    const validator = (report.validators || []).find(item => item.key === manifest.detector.validator);
+    return {
+      identities: (report.findings || []).filter(item => item.code === manifest.detector.code).map(feedbackFindingIdentity).sort(),
+      applicability: validator?.applicability?.status || 'unknown',
+    };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
-  return { url, title };
+}
+
+function predicateMatches(manifest, result) {
+  if (manifest.interestingness.predicate === 'finding_present') return result.identities.includes(manifest.expectedIdentity);
+  if (manifest.interestingness.predicate === 'finding_absent') return !result.identities.includes(manifest.expectedIdentity);
+  return result.applicability === 'unsupported';
+}
+
+function oppositeMatches(manifest, result) {
+  if (manifest.interestingness.predicate === 'finding_present') return result.identities.includes(manifest.expectedIdentity);
+  if (manifest.interestingness.predicate === 'finding_absent') return !result.identities.includes(manifest.expectedIdentity);
+  return result.applicability === 'checked';
+}
+
+function runFixtureFeedback(projectDir, flags) {
+  let manifest;
+  try {
+    const manifestPath = projectFile(projectDir, flags.fixtureManifest, '--fixture-manifest');
+    if (!existsSync(manifestPath) || lstatSync(manifestPath).isSymbolicLink()) throw new Error('Fixture manifest must be a regular non-symlink file.');
+    const text = readFileSync(manifestPath, 'utf8');
+    if (Buffer.byteLength(text) > 262_144) throw new Error('Fixture manifest exceeds 256 KiB.');
+    manifest = parseFeedbackFixture(JSON.parse(text));
+    if (flags.classification && flags.classification !== manifest.classification) throw new Error('--classification disagrees with the fixture manifest.');
+  } catch (error) {
+    console.log(JSON.stringify({ status: 'ERROR', error: error.message }, null, 2));
+    process.exitCode = 1;
+    return;
+  }
+
+  const initial = evaluateFileSet(manifest, manifest.fixture);
+  const control = evaluateFileSet(manifest, manifest.oppositeControl);
+  const reproduced = predicateMatches(manifest, initial);
+  const controlConfirmed = oppositeMatches(manifest, control);
+  if (!reproduced || !controlConfirmed) {
+    console.log(JSON.stringify({
+      status: 'NOT_REPRODUCED', classification: manifest.classification,
+      reproductionConfirmed: reproduced, controlConfirmed,
+      message: 'The explicit predicate and opposite control must both reproduce before reduction or contribution.',
+    }, null, 2));
+    process.exitCode = 1;
+    return;
+  }
+
+  let reduction = null;
+  if (flags.reduce) {
+    reduction = reduceFixtureDeterministically(manifest, candidate => predicateMatches(candidate, evaluateFileSet(candidate, candidate.fixture)));
+    manifest = reduction.manifest;
+  }
+  const searches = feedbackSearchUrls(manifest, ISSUES_BASE);
+  const issue = buildIssueUrl({ code: manifest.detector.code, confidence: 'unknown' }, {
+    classification: manifest.classification, parserTier: manifest.parserTier, duplicateIdentity: searches.identity,
+  });
+  const feedbackDir = resolve(projectDir, '.docguard', 'feedback');
+  let record = null;
+  let contribution = null;
+  let contributionPreview = null;
+  try {
+    if (!flags.preview) {
+      record = resolve(feedbackDir, `${searches.identity}.fixture.json`);
+      ensureStateDir(projectDir);
+      safeWrite(record, `${JSON.stringify(manifest, null, 2)}\n`);
+    }
+    if (flags.contribution) {
+      if (!/^tests\/[^/]+\.test\.mjs$/.test(flags.contribution)) {
+        throw new Error('--contribution must be a direct tests/<name>.test.mjs path.');
+      }
+      contributionPreview = buildTestOnlyContribution(manifest);
+      if (!flags.preview) {
+        contribution = projectFile(projectDir, flags.contribution, '--contribution');
+        safeWrite(contribution, contributionPreview);
+      }
+    }
+  } catch (error) {
+    console.log(JSON.stringify({ status: 'ERROR', error: error.message }, null, 2));
+    process.exitCode = 1;
+    return;
+  }
+  const output = {
+    status: 'READY', preview: Boolean(flags.preview), classification: manifest.classification,
+    reproductionConfirmed: true, controlConfirmed: true, reduction: reduction ? { status: reduction.status, attempts: reduction.attempts } : null,
+    duplicateIdentity: searches.identity, searchUrls: searches, issueUrl: issue.url,
+    record: record ? relative(projectDir, record).split(sep).join('/') : null,
+    contribution: contribution ? relative(projectDir, contribution).split(sep).join('/') : null,
+    contributionPreview: flags.preview && flags.contribution ? contributionPreview : undefined,
+  };
+  console.log(JSON.stringify(output, null, 2));
 }
 
 export function runFeedback(projectDir, config, flags) {
+  if (flags.fixtureManifest) return runFixtureFeedback(projectDir, flags);
+  const classification = flags.classification || 'false_positive';
+  if (!FEEDBACK_CLASSES.has(classification) || classification === 'false_negative' || classification === 'unsupported_syntax') {
+    const error = classification === 'false_negative' || classification === 'unsupported_syntax'
+      ? 'This classification requires --fixture-manifest with an explicit expected identity and opposite control.'
+      : 'Unknown feedback classification.';
+    if (flags.format === 'json') console.log(JSON.stringify({ error, reportable: [] })); else console.error(error);
+    process.exitCode = 1;
+    return;
+  }
   const data = runGuardInternal(projectDir, config);
-  const reportable = (data.findings || []).filter((f) => f.reportable);
+  const selectedCode = typeof flags.code === 'string' ? flags.code.toUpperCase() : null;
+  if (flags.code !== undefined && (!selectedCode || !Object.hasOwn(CODES, selectedCode))) {
+    const error = 'Unknown finding code. Run docguard explain <CODE> to inspect supported findings.';
+    if (flags.format === 'json') console.log(JSON.stringify({ error, reportable: [] }));
+    else console.error(error);
+    process.exitCode = 1;
+    return;
+  }
+  const reportable = (data.findings || []).filter(f => selectedCode ? f.code === selectedCode : flags.all || f.reportable);
   const isJson = flags.format === 'json';
+
+  // What the default selection LEAVES OUT, stated plainly. `reportable` now
+  // covers unmeasured codes as well as low-confidence ones, so the remainder
+  // is exactly the set DocGuard has measured and is confident about — the one
+  // population a user might still want to challenge, and the one they would
+  // otherwise have no idea was hidden.
+  const excluded = selectedCode || flags.all
+    ? []
+    : (data.findings || []).filter(f => !f.reportable);
+  const excludedCodes = [...new Set(excluded.map(f => f.code))];
 
   if (reportable.length === 0) {
     if (isJson) {
-      console.log(JSON.stringify({ reportable: [], message: 'no uncertain findings' }, null, 2));
+      console.log(JSON.stringify({
+        reportable: [],
+        excluded: { findings: excluded.length, codes: excludedCodes },
+        message: 'no matching findings; use --code <CODE> or --all to challenge confident findings',
+      }, null, 2));
       return;
     }
     console.log(`${c.bold}📮 DocGuard Feedback${c.reset}`);
-    console.log(`${c.green}✅ Nothing to report — DocGuard is confident about everything it flagged.${c.reset}`);
-    console.log(`${c.dim}   (Feedback collects low-confidence findings, i.e. likely false positives.)${c.reset}\n`);
+    console.log(`${c.green}✅ No findings matched this selection. Confidence is not proof of correctness.${c.reset}`);
+    console.log(`${c.dim}   Use --code <CODE> or --all to challenge a confident finding; --preview avoids saving records.${c.reset}\n`);
     return;
   }
 
@@ -115,37 +248,59 @@ export function runFeedback(projectDir, config, flags) {
   const feedbackDir = resolve(projectDir, '.docguard', 'feedback');
   const items = reportable.map((f) => {
     const id = shortId(`${f.code}|${f.location || f.message}`);
-    const { url, title } = buildIssueUrl(f);
+    const { url, title, searchUrl } = buildIssueUrl(f, { classification });
     const fileName = `${(f.code || 'finding').toLowerCase()}-${id}.json`;
     const filePath = resolve(feedbackDir, fileName);
-    return { finding: f, id, url, title, fileName, filePath };
+    return { finding: f, id, url, title, searchUrl, fileName, filePath, saved: false, error: null };
   });
+
+  let wrote = 0;
+  for (const it of flags.preview ? [] : items) {
+    try {
+      ensureStateDir(projectDir);
+      if (!existsSync(feedbackDir)) mkdirSync(feedbackDir, { recursive: true });
+      safeWrite(it.filePath, JSON.stringify({
+        capturedBy: `docguard feedback (v${CLI_VERSION})`,
+        classification,
+        finding: it.finding,
+        issueUrl: it.url,
+        searchUrl: it.searchUrl,
+        sharing: 'The finding record can contain private project information. Share only a reviewed synthetic reproduction.',
+      }, null, 2) + '\n');
+      it.saved = true;
+      wrote++;
+    } catch (err) {
+      it.error = `Unable to save feedback record (${err.code || 'write failed'}).`;
+    }
+  }
+
+  if (items.some(it => it.error)) process.exitCode = 1;
 
   if (isJson) {
     console.log(JSON.stringify({
       version: CLI_VERSION,
-      reportable: items.map((it) => ({ code: it.finding.code, location: it.finding.location, url: it.url, file: `.docguard/feedback/${it.fileName}` })),
+      preview: Boolean(flags.preview),
+      classification,
+      reportable: items.map(it => ({
+        code: it.finding.code,
+        location: it.finding.location,
+        url: it.url,
+        searchUrl: it.searchUrl,
+        file: it.saved ? `.docguard/feedback/${it.fileName}` : null,
+        saved: it.saved,
+        error: it.error,
+      })),
+      excluded: { findings: excluded.length, codes: excludedCodes },
     }, null, 2));
-    // Still write the local records so the JSON path is not a dead end.
+    return;
   }
-
-  let wrote = 0;
-  for (const it of items) {
-    try {
-      if (!existsSync(feedbackDir)) mkdirSync(feedbackDir, { recursive: true });
-      writeFileSync(it.filePath, JSON.stringify({
-        capturedBy: `docguard feedback (v${CLI_VERSION})`,
-        finding: it.finding,
-        issueUrl: it.url,
-      }, null, 2) + '\n', 'utf-8');
-      wrote++;
-    } catch { /* best-effort local capture */ }
-  }
-
-  if (isJson) return;
 
   console.log(`${c.bold}📮 DocGuard Feedback${c.reset}`);
-  console.log(`${c.dim}   ${items.length} uncertain finding(s) — likely false positives. Saved locally to ${c.cyan}.docguard/feedback/${c.reset}\n`);
+  console.log(`${c.dim}   ${items.length} selected finding(s). ${flags.preview ? 'Preview only; no feedback records saved.' : `${wrote} local record(s) saved to .docguard/feedback/`}${c.reset}`);
+  if (excluded.length > 0) {
+    console.log(`${c.dim}   ${excluded.length} finding(s) across ${excludedCodes.length} measured code(s) excluded — DocGuard has benchmark evidence for those and is confident. Challenge one anyway with --code <CODE>, or see everything with --all.${c.reset}`);
+  }
+  console.log('');
 
   for (const it of items) {
     const f = it.finding;
@@ -153,9 +308,11 @@ export function runFeedback(projectDir, config, flags) {
     if (f.suggestion && f.suggestion.pragma) {
       console.log(`     ${c.dim}Suppress locally instead: ${f.suggestion.pragma}${c.reset}`);
     }
-    console.log(`     ${c.dim}Report (1 click, prefilled, redacted):${c.reset}`);
+    console.log(`     ${c.dim}Check for duplicates (including closed work): ${it.searchUrl}${c.reset}`);
+    console.log(`     ${c.dim}Report (review before submitting):${c.reset}`);
     console.log(`     ${c.cyan}${it.url}${c.reset}`);
-    console.log(`     ${c.dim}Local copy: .docguard/feedback/${it.fileName}${c.reset}\n`);
+    if (it.saved) console.log(`     ${c.dim}Local copy (may contain private project details): .docguard/feedback/${it.fileName}${c.reset}\n`);
+    if (it.error) console.error(`     ${c.red}${it.error}${c.reset}`);
   }
 
   console.log(`${c.dim}These reports help DocGuard stop flagging the same false positive in a future release.${c.reset}`);

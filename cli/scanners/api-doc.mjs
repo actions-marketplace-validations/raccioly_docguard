@@ -18,7 +18,11 @@
  * Zero NPM dependencies — pure Node.js built-ins only.
  */
 
-const HTTP_METHODS = new Set(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']);
+// ALL (Express `app.all`) and ANY (Gin/Echo `Any`) are the catch-all methods the
+// route scanners emit and `generate` writes; dropping them made guard report the
+// endpoint DocGuard had just documented as undocumented (docguard.generated-docs-consistency#FR-001).
+const HTTP_METHODS = new Set(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS', 'ALL', 'ANY']);
+const METHOD_ALTERNATION = [...HTTP_METHODS].join('|');
 
 /**
  * Normalize an API path for comparison.
@@ -32,7 +36,7 @@ const HTTP_METHODS = new Set(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', '
  *   optional c-all  `/shop/[[...filters]]`  → `/shop/{}`
  * Without the bracket rule, a doc written in Next.js `[id]` syntax never matched
  * the code-scan's `:id`, so every dynamic route double-fired as both
- * "documented-but-absent" and "undocumented" (field test: hugocross_revamp).
+ * "documented-but-absent" and "undocumented" (field test: a downstream project).
  * @param {string} raw
  * @returns {string} normalized path (e.g. "/api/users/{}") or '' if not a path
  */
@@ -45,10 +49,13 @@ export function normalizePath(raw) {
   p = p.split(/[?#]/)[0];
   if (!p.startsWith('/')) return '';
   // collapse every param syntax to {}: Next.js [id]/[...slug]/[[...slug]],
-  // OpenAPI {param}, and colon :param (incl. catch-all :param*).
+  // OpenAPI {param}, Django/Flask <int:pk> and <pk> (before the colon rule,
+  // which would otherwise leave `<int{}`), and colon :param (incl. catch-all
+  // :param*). @implements docguard.python-extraction#FR-004 {scope=statement}
   p = p
     .replace(/\[{1,2}[^\]]*\]{1,2}/g, '{}')
     .replace(/\{[^}/]+\}/g, '{}')
+    .replace(/<(?:[A-Za-z_]\w*:)?[A-Za-z_]\w*>/g, '{}')
     .replace(/:[^/]+/g, '{}');
   // strip trailing slash (but keep root "/")
   if (p.length > 1) p = p.replace(/\/+$/, '');
@@ -62,6 +69,10 @@ export function endpointKey(method, path) {
 
 /**
  * Parse endpoints documented in an API reference markdown string.
+ * `path` is the path as written (decoration and query stripped), so a message
+ * about it names the parameter (`/users/:id`); `key` is the normalized
+ * comparison key (`DELETE /users/{}`). The root path `/` is an endpoint.
+ * @implements docguard.generated-docs-consistency#FR-001
  * @param {string} content
  * @returns {Array<{ method: string, path: string, key: string }>}
  */
@@ -72,16 +83,17 @@ export function parseApiReferenceDoc(content) {
   const addEndpoint = (method, rawPath) => {
     const m = String(method).toUpperCase();
     if (!HTTP_METHODS.has(m)) return;
-    const path = normalizePath(rawPath);
-    if (!path || path.length < 2) return;
-    const key = `${m} ${path}`;
-    if (!found.has(key)) found.set(key, { method: m, path, key });
+    const normalized = normalizePath(rawPath);
+    if (!normalized) return;
+    const written = String(rawPath).replace(/^[|`'"\s]+/, '').replace(/[|`'"\s]+$/, '').split(/[?#]/)[0];
+    const key = `${m} ${normalized}`;
+    if (!found.has(key)) found.set(key, { method: m, path: written, key });
   };
 
   const lines = content.split('\n');
 
   // Style 1: headings — "#### GET `/api/...`" (method + path, backticks optional)
-  const headingRe = /^#{2,6}\s+`?(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)`?\s+`?(\/[^\s`|]+)`?/i;
+  const headingRe = new RegExp(`^#{2,6}\\s+\`?(${METHOD_ALTERNATION})\`?\\s+\`?(\\/[^\\s\`|]*)\`?`, 'i');
 
   // Style 2: table rows — "| `GET` | `/api/...` | ... |"
   for (const line of lines) {
@@ -111,8 +123,15 @@ export function parseApiReferenceDoc(content) {
 
 /**
  * Compare a documented endpoint set against an actual endpoint set.
+ *
+ * An actual endpoint marked `caseInsensitive` (its framework matches routes
+ * ignoring case, as ASP.NET Core does) matches a documented endpoint whose
+ * path differs only in case. Every other endpoint compares exactly: Spring,
+ * Laravel, Rails, Django and the rest route case-sensitively.
+ *
+ * @implements docguard.coverage-followups#FR-003
  * @param {Array<{method,path}>} documented
- * @param {Array<{method,path}>} actual
+ * @param {Array<{method,path,caseInsensitive?:boolean}>} actual
  * @returns {{ documentedButAbsent: object[], presentButUndocumented: object[], matched: object[] }}
  */
 export function compareEndpoints(documented, actual) {
@@ -120,16 +139,27 @@ export function compareEndpoints(documented, actual) {
   for (const e of documented) docMap.set(endpointKey(e.method, e.path), e);
   const actMap = new Map();
   for (const e of actual) actMap.set(endpointKey(e.method, e.path), e);
+  // Folded key → exact keys of the case-insensitive actual endpoints.
+  const folded = new Map();
+  for (const [key, e] of actMap) {
+    if (!e.caseInsensitive) continue;
+    const k = key.toLowerCase();
+    if (!folded.has(k)) folded.set(k, []);
+    folded.get(k).push(key);
+  }
 
   const documentedButAbsent = [];
   const matched = [];
+  const matchedActual = new Set();
   for (const [key, e] of docMap) {
-    if (actMap.has(key)) matched.push(e);
-    else documentedButAbsent.push(e);
+    if (actMap.has(key)) { matched.push(e); matchedActual.add(key); continue; }
+    const loose = folded.get(key.toLowerCase());
+    if (loose) { matched.push(e); for (const k of loose) matchedActual.add(k); continue; }
+    documentedButAbsent.push(e);
   }
   const presentButUndocumented = [];
   for (const [key, e] of actMap) {
-    if (!docMap.has(key)) presentButUndocumented.push(e);
+    if (!docMap.has(key) && !matchedActual.has(key)) presentButUndocumented.push(e);
   }
 
   return { documentedButAbsent, presentButUndocumented, matched };

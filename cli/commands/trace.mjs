@@ -10,6 +10,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { resolve, join, extname, basename, relative, dirname } from 'node:path';
 import { c } from '../shared.mjs';
 import { detectSpecKit } from '../scanners/speckit.mjs';
+import { scanTestFilesForReferences, collectRequirementIds, resolveRequirementReferences } from '../validators/traceability.mjs';
 import { listCanonicalDocs } from '../shared-ignore.mjs';
 
 const IGNORE_DIRS = new Set([
@@ -25,9 +26,16 @@ const CODE_EXTENSIONS = new Set([
 
 // v0.16-P2: language-aware patterns. The original JS/TS-only sets created
 // false-negative warnings on Python/Rust/Go/Java projects (reported by the
-// quick-recon-tool Python user: TEST-SPEC.md was flagged unlinked even
+// a downstream project Python user: TEST-SPEC.md was flagged unlinked even
 // though Python tests existed because `.test.mjs` didn't match `test_*.py`).
 import { TEST_PATTERNS, TRACE_MAP, isTraceableSource } from '../shared-trace-patterns.mjs';
+import { referenceKind, docAnnotationsIn } from '../scanners/doc-references.mjs';
+import { defaultOwnershipRoots, ownerOf, ownershipReport, SOURCE_RE, projectFiles } from '../scanners/doc-ownership.mjs';
+import { scanComponents } from '../scanners/inventory.mjs';
+import { anchorGranularity, traceMatrix } from '../scanners/anchors.mjs';
+import { CSV_COLUMNS, matrixModel, toCsv, toReqif } from '../writers/trace-matrix.mjs';
+import { safeWrite } from '../writers/generate-io.mjs';
+import { readFileSync as readPackageJson } from 'node:fs';
 
 
 /**
@@ -43,6 +51,90 @@ import { TEST_PATTERNS, TRACE_MAP, isTraceableSource } from '../shared-trace-pat
  *
  * Output: one line per (doc, match-line) pair, with the surrounding context.
  */
+/**
+ * `trace --owners`: the ownership map as data; `--suggest` drafts a block from
+ * the source layout, `@doc` annotations and TRACE_MAP, and never writes.
+ * @implements docguard.doc-ownership-map#FR-005
+ */
+export function runTraceOwners(projectDir, config, flags) {
+  const isJson = flags.format === 'json';
+  if (flags.suggest) {
+    const draft = suggestOwnership(projectDir, config);
+    if (isJson) console.log(JSON.stringify({ ownership: draft, note: 'Draft only: DocGuard never writes it. Replace each purpose, then add it to .docguard.json.' }, null, 2));
+    else {
+      console.log(`${c.bold}Draft ownership block${c.reset} ${c.dim}(not written; fill in each purpose, then add it to .docguard.json)${c.reset}\n`);
+      console.log(JSON.stringify({ ownership: draft }, null, 2));
+    }
+    return draft;
+  }
+  const report = ownershipReport(projectDir, config);
+  const data = {
+    present: report.map.present,
+    error: report.map.error,
+    roots: report.roots,
+    entries: report.entries.map(({ entry, files, deadPatterns }) => ({ key: entry.key, purpose: entry.purpose, paths: entry.patterns.map(p => p.raw), files, deadPatterns })),
+    unowned: report.unowned,
+    ties: report.ties.map(t => ({ entries: t.entries.map(e => e.key), example: t.example, count: t.count })),
+    deadRoots: report.deadRoots,
+  };
+  if (isJson) { console.log(JSON.stringify(data, null, 2)); return data; }
+  console.log(`${c.bold}📍 Doc ownership${c.reset}\n`);
+  if (!data.present) { console.log(`  ${c.dim}No ownership block in .docguard.json. Draft one: ${c.cyan}docguard trace --owners --suggest${c.reset}\n`); return data; }
+  if (data.error) { console.log(`  ${c.red}✗ ${data.error}${c.reset}\n`); return data; }
+  for (const e of data.entries) console.log(`  ${c.cyan}${e.key}${c.reset} ${c.dim}— ${e.files} file(s)${e.deadPatterns.length ? `; no match: ${e.deadPatterns.join(', ')}` : ''}${c.reset}`);
+  if (data.unowned.length) console.log(`\n  ${c.yellow}Unowned:${c.reset} ${data.unowned.join(', ')}`);
+  for (const t of data.ties) console.log(`  ${c.yellow}Tie:${c.reset} ${t.entries.join(' = ')} for ${t.example}`);
+  console.log('');
+  return data;
+}
+
+/**
+ * A draft block: one entry per canonical doc that the layout suggests.
+ * Covers the source files directly in a module's parent directory too, and
+ * assigns paths only to documents that exist when the project has any
+ * (docguard.output-ux#FR-009).
+ * @implements docguard.output-ux#FR-009
+ */
+export function suggestOwnership(projectDir, config) {
+  const { files } = projectFiles(projectDir, config);
+  const sources = files.filter(f => SOURCE_RE.test(f));
+  const { modules, looseDirs } = defaultOwnershipRoots(projectDir, config);
+  const docPath = doc => (doc.includes('/') ? doc : `docs-canonical/${basename(doc)}`);
+  const canonical = listCanonicalDocs(projectDir, { config }).map(d => d.rel).sort();
+  const exists = path => existsSync(resolve(projectDir, path));
+  const fallback = exists('docs-canonical/ARCHITECTURE.md') ? 'docs-canonical/ARCHITECTURE.md'
+    : canonical[0] || 'docs-canonical/ARCHITECTURE.md';
+  /** `@doc` votes first, then TRACE_MAP's patterns; the first document that exists wins. */
+  const chooseDoc = inside => {
+    const votes = new Map();
+    for (const file of inside.slice(0, 200)) {
+      let content = '';
+      try { content = readFileSync(resolve(projectDir, file), 'utf8'); } catch { continue; }
+      for (const doc of docAnnotationsIn(content)) votes.set(doc, (votes.get(doc) || 0) + 1);
+    }
+    const voted = [...votes].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([doc]) => docPath(doc));
+    const traced = Object.entries(TRACE_MAP)
+      .filter(([, spec]) => spec.sourcePatterns.some(p => inside.some(f => p.glob.test(f))))
+      .map(([doc]) => docPath(doc));
+    return [...voted, ...traced].find(exists) || fallback;
+  };
+  const byDoc = new Map();
+  const add = (doc, path) => { if (!byDoc.has(doc)) byDoc.set(doc, new Set()); byDoc.get(doc).add(path); };
+  for (const mod of modules) {
+    const inside = sources.filter(f => f.startsWith(`${mod}/`));
+    if (inside.length === 0) continue;
+    add(chooseDoc(inside), `${mod}/**`);
+  }
+  const loose = sources.filter(f => looseDirs.includes(f.includes('/') ? f.slice(0, f.lastIndexOf('/')) : ''));
+  for (const file of loose) add(chooseDoc([file]), file);
+  return {
+    roots: [...modules.filter(m => sources.some(f => f.startsWith(`${m}/`))), ...looseDirs.filter(d => loose.some(f => f.startsWith(`${d}/`)))].sort(),
+    entries: [...byDoc].sort(([a], [b]) => a.localeCompare(b)).map(([doc, paths]) => ({
+      doc, purpose: '<what this doc explains about these paths>', paths: [...paths].sort(),
+    })),
+  };
+}
+
 export function runTraceReverse(projectDir, config, flags) {
   const target = flags.args && flags.args[0];
   if (!target) {
@@ -71,8 +163,9 @@ export function runTraceReverse(projectDir, config, flags) {
 
   // Normalize the target path: strip leading ./
   const normalized = target.replace(/^\.\//, '');
-  const base = basename(normalized);
-  const stem = base.replace(/\.[^.]+$/, '');
+  // docguard.doc-ownership-map#FR-004: the declared owner is the exact answer;
+  // the text matches below are heuristics.
+  const declared = ownerOf(projectDir, config, normalized);
 
   const matches = []; // { doc, line, content, kind }
   // Recursive — a nested doc mentioning this file must still be found, or
@@ -81,27 +174,33 @@ export function runTraceReverse(projectDir, config, flags) {
     let content;
     try { content = readFileSync(doc.abs, 'utf-8'); } catch { continue; }
     const lines = content.split('\n');
+    // One matcher for trace --reverse, impact and docguard_docs_for_path
+    // (docguard.mcp-doc-tools#FR-003).
     for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      let kind = null;
-      if (line.includes(normalized)) kind = 'path';
-      else if (line.includes(base)) kind = 'basename';
-      else if (new RegExp(`\`${escapeRegex(stem)}\``).test(line)) kind = 'module';
-      if (kind) {
-        matches.push({ doc: doc.rel, line: i + 1, content: line.trim(), kind });
-      }
+      const kind = referenceKind(lines[i], normalized);
+      if (kind) matches.push({ doc: doc.rel, line: i + 1, content: lines[i].trim(), kind });
     }
   }
 
   if (flags.format === 'json') {
     console.log(JSON.stringify({
       target: normalized,
+      owner: declared.owner,
+      // docguard.output-ux#FR-009: say why there is no owner (a tie names its entries).
+      ...(declared.owner || declared.configured === false ? {} : { ownerReason: declared.reason }),
+      ...(declared.tie ? { tie: declared.tie } : {}),
       matches,
       timestamp: new Date().toISOString(),
     }, null, 2));
     return;
   }
 
+  if (declared.owner) {
+    const o = declared.owner;
+    console.log(`  ${c.green}Owner (declared):${c.reset} ${c.cyan}${o.key}${c.reset}${o.purpose ? ` ${c.dim}— ${o.purpose}${c.reset}` : ''} ${c.dim}(matched by ${o.matchedBy})${c.reset}\n`);
+  } else if (declared.tie || /ownership map is invalid/.test(declared.reason || '')) {
+    console.log(`  ${c.yellow}Owner: none — ${declared.reason}${c.reset}\n`);
+  }
   if (matches.length === 0) {
     console.log(`  ${c.yellow}⚠️  No canonical doc references "${normalized}"${c.reset}`);
     console.log(`  ${c.dim}Consider documenting this file in docs-canonical/ARCHITECTURE.md or DATA-MODEL.md${c.reset}`);
@@ -126,11 +225,38 @@ export function runTraceReverse(projectDir, config, flags) {
   }
 }
 
-function escapeRegex(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/**
+ * FR-037: `trace --matrix` exports the requirement → anchor → test chain as
+ * CSV (default), ReqIF 1.2 or JSON, to stdout or through safeWrite.
+ *
+ * @implements docguard.requirement-anchors#FR-037
+ */
+export function runTraceMatrix(projectDir, config, flags) {
+  const format = flags.format || 'csv';
+  if (!['csv', 'reqif', 'json'].includes(format)) {
+    console.error(`${c.red}trace --matrix exports --format csv, reqif or json, not ${format}.${c.reset}`);
+    process.exitCode = 1;
+    return null;
+  }
+  const { rows, requirements } = traceMatrix(projectDir, config, { spec: flags.spec || null });
+  let version = '';
+  try { version = JSON.parse(readPackageJson(new URL('../../package.json', import.meta.url), 'utf8')).version; } catch { /* unknown */ }
+  const text = format === 'csv' ? toCsv(rows)
+    : format === 'reqif' ? toReqif(matrixModel(rows, requirements), { toolVersion: version })
+      : `${JSON.stringify({ columns: CSV_COLUMNS, rows: rows.map(({ key, ...row }) => row) }, null, 2)}\n`;
+  if (flags.out) {
+    const target = resolve(projectDir, flags.out);
+    safeWrite(target, text);
+    process.stderr.write(`Wrote ${rows.length} row(s) for ${requirements.length} requirement(s) to ${flags.out}\n`);
+  } else {
+    process.stdout.write(text);
+  }
+  return { rows: rows.length, requirements: requirements.length };
 }
 
 export function runTrace(projectDir, config, flags) {
+  if (flags.matrix) return runTraceMatrix(projectDir, config, flags);
+  if (flags.owners) return runTraceOwners(projectDir, config, flags);
   // L-2: dispatch to reverse mode when --reverse is set.
   if (flags.reverse) {
     return runTraceReverse(projectDir, config, flags);
@@ -227,14 +353,20 @@ export function runTrace(projectDir, config, flags) {
   }
 
   // ── 5. Output ──
+  // docguard.requirement-anchors#FR-036: anchor granularity, information only.
+  const granularity = anchorGranularity(projectDir, config);
   if (flags.format === 'json') {
-    outputJSON(config.projectName, matrix, orphanedDocs);
+    outputJSON(config.projectName, matrix, orphanedDocs, granularity);
   } else {
     outputText(config.projectName, matrix, canonicalDocs, orphanedDocs);
+    if (granularity) {
+      const tally = t => Object.entries(t).map(([k, v]) => `${k} ${v}`).join(', ') || 'none';
+      console.log(`  ${c.dim}Anchor granularity (info): ${granularity.links} link(s); by scope ${tally(granularity.byScope)}; by tier ${tally(granularity.byTier)}${c.reset}\n`);
+    }
   }
 }
 
-function outputJSON(projectName, matrix, orphanedDocs) {
+function outputJSON(projectName, matrix, orphanedDocs, granularity = null) {
   const result = {
     project: projectName,
     traceability: matrix.map(m => ({
@@ -256,6 +388,7 @@ function outputJSON(projectName, matrix, orphanedDocs) {
       missing: matrix.filter(m => m.coverageSignal === 'MISSING').length,
       orphaned: orphanedDocs.length,
     },
+    ...(granularity ? { anchorGranularity: { ...granularity, info: 'How precisely requirement tags anchor; information only.' } } : {}),
     timestamp: new Date().toISOString(),
   };
   console.log(JSON.stringify(result, null, 2));
@@ -378,7 +511,7 @@ function scanDir(rootDir, dir, files) {
 // repo-wide scores that `docguard score` produces. Deterministic signals only —
 // no LLM judgment:
 //
-//   reqCoverage          40%  FR-/SC- IDs in spec.md referenced by any test file
+//   reqCoverage          40%  FR-/SC- IDs in spec.md explicitly annotated or labeled in test sources
 //   taskCompletion       25%  checked/total `- [x]` tasks in tasks.md
 //   taskEvidence         20%  checked tasks whose line names an existing file
 //   artifactCompleteness 15%  spec.md (40%) + plan.md (30%) + tasks.md (30%)
@@ -425,34 +558,31 @@ function featureBar(score) {
 }
 
 /**
- * Collect every FR-/SC- ID referenced anywhere in a test file, once for the
- * whole project. Test-file discovery mirrors the traceability validator's
- * scanTestFilesForReferences(): TEST_PATTERNS ∪ __tests__/ ∪ tests?/ dirs, and
- * any occurrence of the ID in file content counts (not just @req lines).
+ * Collect declared FR-/SC- test links once for the whole project, using the
+ * validator's source eligibility and annotation/label parser. This is positive
+ * linkage evidence, independent of validator findings or suppression policy.
  */
 function collectTestReferencedIds(projectDir) {
   const projectFiles = [];
   scanDir(projectDir, projectDir, projectFiles);
-  const testFiles = projectFiles.filter(f =>
-    TEST_PATTERNS.some(p => p.test(f)) || /__tests__\//.test(f) || /tests?\//.test(f)
-  );
-
-  const ids = new Set();
-  for (const rel of testFiles) {
-    let content;
-    try { content = readFileSync(resolve(projectDir, rel), 'utf-8'); } catch { continue; }
-    FEATURE_REQ_RE.lastIndex = 0;
-    let m;
-    while ((m = FEATURE_REQ_RE.exec(content)) !== null) ids.add(m[0]);
+  const references = scanTestFilesForReferences(projectDir, projectFiles, [FEATURE_REQ_RE]);
+  // Feature completion evidence must survive spec retirement and ID reuse.
+  // Bare FR-001 references can be useful navigation for the repo-wide matrix,
+  // but they can rebind to a different feature after the original spec leaves
+  // the working tree. Keep only document-qualified identities here.
+  const qualified = new Map();
+  for (const [id, refs] of references) {
+    const scoped = refs.filter(ref => ref.scope);
+    if (scoped.length > 0) qualified.set(id, scoped);
   }
-  return ids;
+  return qualified;
 }
 
 /**
  * Compute the four adherence signals for one detected spec-kit feature.
  * Each signal: { applicable, value (0..1 | null), ...n/m detail fields }.
  */
-function computeFeatureSignals(projectDir, feature, testRefIds) {
+function computeFeatureSignals(projectDir, feature, testRefIds, definitions) {
   // ── artifactCompleteness — always measurable ──
   const artifactValue = (feature.hasSpec ? 0.4 : 0)
     + (feature.hasPlan ? 0.3 : 0)
@@ -483,21 +613,11 @@ function computeFeatureSignals(projectDir, feature, testRefIds) {
     }
   }
 
-  // ── reqCoverage — spec.md IDs that appear in ANY test file ──
-  const specIds = [];
-  if (feature.hasSpec && feature.specPath) {
-    try {
-      const spec = readFileSync(feature.specPath, 'utf-8');
-      const seen = new Set();
-      FEATURE_REQ_RE.lastIndex = 0;
-      let m;
-      while ((m = FEATURE_REQ_RE.exec(spec)) !== null) {
-        if (!seen.has(m[0])) { seen.add(m[0]); specIds.push(m[0]); }
-      }
-    } catch { /* unreadable spec → no IDs */ }
-  }
-  const covered = specIds.filter(id => testRefIds.has(id));
-  const uncovered = specIds.filter(id => !testRefIds.has(id));
+  // ── reqCoverage — spec.md IDs declared in eligible test annotations or labels ──
+  const specPath = feature.specPath ? relative(projectDir, feature.specPath).replaceAll('\\', '/') : null;
+  const specIds = [...definitions.values()].filter(def => def.file === specPath).map(def => def.id);
+  const covered = specIds.filter(id => testRefIds.has(`${specPath}#${id}`));
+  const uncovered = specIds.filter(id => !testRefIds.has(`${specPath}#${id}`));
 
   return {
     reqCoverage: {
@@ -606,10 +726,11 @@ export function runTraceFeatures(projectDir, config, flags) {
     return;
   }
 
-  const testRefIds = collectTestReferencedIds(projectDir);
+  const definitions = collectRequirementIds(projectDir, config, [FEATURE_REQ_RE]);
+  const testRefIds = resolveRequirementReferences(definitions, collectTestReferencedIds(projectDir));
 
   const features = speckit.specs.map(f => {
-    const signals = computeFeatureSignals(projectDir, f, testRefIds);
+    const signals = computeFeatureSignals(projectDir, f, testRefIds, definitions);
     const score = scoreFromSignals(signals);
     const weakest = weakestSignal(signals);
     const needsFix = weakest !== null && signals[weakest].value < 1;

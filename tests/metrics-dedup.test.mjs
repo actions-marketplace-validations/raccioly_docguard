@@ -1,22 +1,27 @@
 /**
  * v0.14.1-N1 — Metrics-Consistency dedup.
  *
- * Reported by wu-whatsappinbox: a file that mentions a stale validator/check
+ * Reported by downstream-project: a file that mentions a stale validator/check
  * count multiple times (e.g. once in a heading, once in a body table) was
  * producing one warning per occurrence — "4 warnings for 2 files".
  *
  * @req SC-N1-001 — same drift in one file → one warning (not one per match)
  * @req SC-N1-002 — distinct drift values in one file are separate warnings
  * @req SC-N1-003 — replace-count fix is emitted exactly once per (file, label)
+ * @req docs-canonical/REQUIREMENTS.md#FR-025
  * @req SC-N1-004 — passed count uses unique-per-(file,label), not per-match
  */
 import { describe, it, afterEach } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { validateMetricsConsistency } from '../cli/validators/metrics-consistency.mjs';
+
+// Derived, never hardcoded: a new validator must not break this test
+// (docs-canonical/REQUIREMENTS.md#FR-025).
+const SHIPPED = readdirSync(new URL('../cli/validators/', import.meta.url)).filter(f => f.endsWith('.mjs')).length;
 
 function makeRepo(files) {
   const dir = mkdtempSync(join(tmpdir(), 'docguard-metrics-dedup-'));
@@ -28,7 +33,8 @@ function makeRepo(files) {
   return dir;
 }
 
-// Simulate guard results so Metrics-Consistency knows what the "actual" count is.
+// Simulate guard results for the configuration-dependent checks count. Validator
+// capability is read from the shipped package modules, not this reduced run.
 function fakeGuardResults(validatorCount, checkTotal) {
   // Build N validators with checkTotal/N checks each (approx) so totals add up.
   const validators = [];
@@ -79,15 +85,16 @@ describe('Metrics-Consistency — dedup per (file, label, found)', () => {
   });
 
   it('same number mentioned twice in correct form → ONE passed credit, not two', () => {
-    // The validator counts itself (+1) so 21 fake guards → "actual = 22 validators".
+    // A matching shipped-validator claim must still earn only one pass credit
+    // when repeated in the same file.
     dir = makeRepo({
       'README.md':
         '# Project\n\n' +
-        'DocGuard ships 22 validators in total.\n' +
-        'See the DocGuard 22 validators table.\n',
+        `DocGuard ships ${SHIPPED} validators in total.\n` +
+        `See the DocGuard ${SHIPPED} validators table.\n`,
     });
     const r = validateMetricsConsistency(dir, { projectName: 't' }, fakeGuardResults(21, 100));
-    // README has TWO "22 validators" occurrences but only one pass should be credited.
+    // README has TWO "N validators" occurrences but only one pass should be credited.
     assert.equal(r.warnings.filter(w => /README\.md/.test(w)).length, 0,
       'matching number should not produce a warning');
     // Validators-pattern contribution should be exactly 1 pass for README (not 2).

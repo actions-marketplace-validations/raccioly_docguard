@@ -60,12 +60,12 @@ describe('Docs-Diff Validator', () => {
     assert.ok(!result.onlyInDocs.includes('Docker'), 'Docker should be detected via Dockerfile');
   });
 
-  // Regression for hugocross Bug 4: the docs-diff warning used to emit only
+  // Regression for a downstream project Bug 4: the docs-diff warning used to emit only
   // the COUNT ("1 documented but not found in code") and not the file path,
   // which made it completely unactionable — the user couldn't tell which of
   // 52 documented tests was the offender. The warning must now name the
   // file (capped at 5 inline + "(+N more)" for long lists).
-  describe('warning includes the offending file path (hugocross bug 4)', () => {
+  describe('warning includes the offending file path (a downstream project bug 4)', () => {
     it('names a missing tech-stack entry', async () => {
       const { validateDocsDiff } = await import('../cli/validators/docs-diff.mjs');
       // Doc declares Redis; package.json declares NONE → "Redis documented but not found"
@@ -81,5 +81,73 @@ describe('Docs-Diff Validator', () => {
       assert.match(drift, /documented but not found in code: `Redis`/,
         `warning must name the file/tech; got: ${drift}`);
     });
+  });
+
+  it('collectCodeTests ignores test files excluded by config', async () => {
+    const { collectCodeTests } = await import('../cli/validators/docs-diff.mjs');
+    const tmpDir2 = mkdtempSync(join(tmpdir(), 'docguard-test2-'));
+    try {
+      mkdirSync(join(tmpDir2, 'src'));
+      writeFileSync(join(tmpDir2, 'src/a.test.js'), 'test()');
+      writeFileSync(join(tmpDir2, 'src/ignored.test.js'), 'test()');
+
+      const config = { ignore: ['src/ignored.test.js'] };
+      const codeTests = collectCodeTests(tmpDir2, config);
+
+      assert.ok(codeTests.has('src/a.test.js'), 'should find a.test.js');
+      assert.ok(!codeTests.has('src/ignored.test.js'), 'should ignore src/ignored.test.js');
+    } finally {
+      rmSync(tmpDir2, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('diffRoutes and diffEntities Coverage', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'docguard-test-diff-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('diffRoutes returns null if neither API-REFERENCE.md nor ARCHITECTURE.md exists', async () => {
+    const { diffRoutes } = await import('../cli/commands/diff.mjs');
+    assert.strictEqual(diffRoutes(tmpDir), null);
+  });
+
+  it('diffEntities returns null if DATA-MODEL.md does not exist', async () => {
+    const { diffEntities } = await import('../cli/commands/diff.mjs');
+    assert.strictEqual(diffEntities(tmpDir), null);
+  });
+});
+
+describe('runDiff Coverage', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'docguard-test-rundiff-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('runDiff formats JSON correctly when --format=json is passed', async () => {
+    const { runDiff } = await import('../cli/commands/diff.mjs');
+    const logs = [];
+    const originalLog = console.log;
+    console.log = (...args) => logs.push(args.join(' '));
+    try {
+      runDiff(tmpDir, {}, { format: 'json' });
+    } finally {
+      console.log = originalLog;
+    }
+
+    // Assert it prints a JSON array of results (which should be empty because no docs exist)
+    assert.strictEqual(logs.length, 1);
+    assert.strictEqual(logs[0], '[]');
   });
 });

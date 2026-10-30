@@ -1,0 +1,243 @@
+import { describe, it } from 'node:test';
+import { strict as assert } from 'node:assert';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+/**
+ * @req specs/006-document-lifecycle/spec.md#FR-001
+ * @req specs/006-document-lifecycle/spec.md#FR-002
+ * @req specs/006-document-lifecycle/spec.md#FR-008
+ * @req specs/006-document-lifecycle/spec.md#SC-004
+ */
+
+import { validateDocumentLifecycle } from '../cli/validators/document-lifecycle.mjs';
+import { FIXTURE_GIT } from './helpers/git.mjs';
+
+function write(dir, path, content) {
+  const target = join(dir, path);
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileSync(target, content);
+}
+
+function repository(t, files) {
+  const dir = mkdtempSync(join(tmpdir(), 'docguard-lifecycle-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  for (const [path, content] of Object.entries(files)) write(dir, path, content);
+  execFileSync('git', [...FIXTURE_GIT, 'init', '-q'], { cwd: dir });
+  execFileSync('git', [...FIXTURE_GIT, 'add', '.'], { cwd: dir });
+  return dir;
+}
+
+function registryEntry(lifecycle) {
+  return {
+    specId: 'docguard.lifecycle-test',
+    path: 'specs/006-lifecycle/spec.md',
+    reviewed: {
+      lifecycle: {
+        approval: 'approved',
+        context: lifecycle.context,
+        delivery: lifecycle.delivery,
+        retirementReason: null,
+        storage: 'working_tree',
+        persistenceModel: lifecycle.persistenceModel,
+      },
+      relations: {
+        extends: [], duplicates: [], conflictsWith: [], supersedes: [], supersededBy: [],
+      },
+      scope: { canonicalDocs: [] },
+      reconciliation: { lastReviewedRevision: null, outcomes: [] },
+    },
+    intent: { requirements: [] },
+    observed: { artifacts: [], taskCompletion: { checked: 1, total: 1 }, implementationEvidence: [], testEvidence: [] },
+  };
+}
+
+describe('Document-Lifecycle validator', () => {
+  it('is not applicable outside a Git working tree', t => {
+    const dir = mkdtempSync(join(tmpdir(), 'docguard-lifecycle-no-git-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    write(dir, 'docs/old-plan.md', '# Plan\n\n**Status:** Superseded\n');
+
+    const result = validateDocumentLifecycle(dir);
+
+    assert.equal(result.applicable, false);
+    assert.equal(result.findings.length, 0);
+  });
+
+  it('reports an explicit terminal state with high confidence', t => {
+    const dir = repository(t, {
+      'docs/old-plan.md': '# Plan\n\n**Status:** Superseded\n',
+    });
+    const result = validateDocumentLifecycle(dir);
+    assert.equal(result.findings.length, 1);
+    assert.equal(result.findings[0].code, 'DLC001');
+    assert.equal(result.findings[0].confidence, 'high');
+  });
+
+  it('reports a fully checked draft spec as a low-confidence review signal', t => {
+    const dir = repository(t, {
+      'specs/001-feature/spec.md': '# Feature\n\n**Status**: Draft\n',
+      'specs/001-feature/tasks.md': '# Tasks\n\n- [x] T001 Build\n- [x] T002 Test\n',
+    });
+    const result = validateDocumentLifecycle(dir);
+    assert.equal(result.findings.length, 1);
+    assert.equal(result.findings[0].code, 'DLC002');
+    assert.equal(result.findings[0].confidence, 'low');
+  });
+
+  it('keeps active specs with open tasks clean', t => {
+    const dir = repository(t, {
+      'specs/002-active/spec.md': '# Feature\n\n**Status**: Active\n',
+      'specs/002-active/tasks.md': '# Tasks\n\n- [x] T001 Design\n- [ ] T002 Build\n',
+    });
+    const result = validateDocumentLifecycle(dir);
+    assert.equal(result.findings.length, 0);
+  });
+
+  it('keeps a registry-verified living spec in active context without a retirement warning', t => {
+    const dir = repository(t, {
+      'specs/006-lifecycle/spec.md': '# Lifecycle\n\n**Status**: Active\n',
+      'specs/006-lifecycle/tasks.md': '# Tasks\n\n- [x] T001 Build\n- [x] T002 Verify\n',
+      '.docguard-specs.json': JSON.stringify({
+        $schema: 'https://raccioly.github.io/docguard/schemas/docguard-specs.schema.json',
+        schemaVersion: 2,
+        specs: [registryEntry({ context: 'current', persistenceModel: 'living', delivery: 'verified' })],
+        tombstones: [],
+      }),
+    });
+
+    const result = validateDocumentLifecycle(dir);
+
+    assert.equal(result.findings.length, 0);
+  });
+
+  it('does not ask to retire a verified living spec whose task ledger says Complete', t => {
+    const files = {
+      'specs/006-lifecycle/spec.md': '# Lifecycle\n\n**Status**: Active\n',
+      'specs/006-lifecycle/tasks.md': '# Tasks\n\n**Status**: Complete\n\n- [x] T001 Build\n',
+    };
+    const registry = lifecycle => JSON.stringify({
+      $schema: 'https://raccioly.github.io/docguard/schemas/docguard-specs.schema.json',
+      schemaVersion: 2, specs: [registryEntry(lifecycle)], tombstones: [],
+    });
+    const living = repository(t, { ...files, '.docguard-specs.json': registry({ context: 'current', persistenceModel: 'living', delivery: 'verified' }) });
+    assert.equal(validateDocumentLifecycle(living).findings.length, 0);
+    const oneShot = repository(t, { ...files, '.docguard-specs.json': registry({ context: 'current', persistenceModel: 'flow_back', delivery: 'verified' }) });
+    assert.ok(validateDocumentLifecycle(oneShot).findings.some(f => f.code === 'DLC002' && /artifact maturity is Complete/.test(f.message)));
+  });
+
+  it('does not suppress completed-task review for unverified or non-living registry entries', t => {
+    const variants = [
+      { context: 'current', persistenceModel: 'living', delivery: 'in_progress' },
+      { context: 'current', persistenceModel: 'flow_back', delivery: 'verified' },
+      { context: 'retired', persistenceModel: 'living', delivery: 'verified' },
+    ];
+    for (const lifecycle of variants) {
+      const dir = repository(t, {
+        'specs/006-lifecycle/spec.md': '# Lifecycle\n\n**Status**: Active\n',
+        'specs/006-lifecycle/tasks.md': '# Tasks\n\n- [x] T001 Build\n',
+        '.docguard-specs.json': JSON.stringify({
+          $schema: 'https://raccioly.github.io/docguard/schemas/docguard-specs.schema.json',
+          schemaVersion: 2,
+          specs: [registryEntry(lifecycle)],
+          tombstones: [],
+        }),
+      });
+
+      const result = validateDocumentLifecycle(dir);
+
+      assert.equal(result.findings.length, 1);
+      assert.equal(result.findings[0].code, 'DLC002');
+    }
+  });
+
+  it('fails closed when the lifecycle registry is malformed', t => {
+    const dir = repository(t, {
+      'specs/006-lifecycle/spec.md': '# Lifecycle\n\n**Status**: Active\n',
+      'specs/006-lifecycle/tasks.md': '# Tasks\n\n- [x] T001 Build\n',
+      '.docguard-specs.json': '{broken',
+    });
+
+    const result = validateDocumentLifecycle(dir);
+
+    assert.equal(result.findings.length, 1);
+    assert.equal(result.findings[0].code, 'DLC002');
+  });
+
+  it('ignores status-like examples outside document metadata', t => {
+    const filler = Array.from({ length: 45 }, (_, index) => `line ${index + 1}`).join('\n');
+    const dir = repository(t, {
+      'README.md': `# Guide\n${filler}\nExample: **Status:** Deprecated\n`,
+    });
+    const result = validateDocumentLifecycle(dir);
+    assert.equal(result.findings.length, 0);
+  });
+
+  it('does not treat free-form status prose as a terminal lifecycle declaration', t => {
+    const dir = repository(t, {
+      'README.md': '# Guide\n\n**Status:** Deprecated API support remains documented\n',
+    });
+    const result = validateDocumentLifecycle(dir);
+    assert.equal(result.findings.length, 0);
+  });
+
+  it('treats completed artifact maturity as review-only', t => {
+    const dir = repository(t, {
+      'specs/003-complete/spec.md': '# Feature\n\n**Status:** Completed\n',
+    });
+    const result = validateDocumentLifecycle(dir);
+    assert.equal(result.findings.length, 1);
+    assert.equal(result.findings[0].code, 'DLC002');
+    assert.equal(result.findings[0].confidence, 'low');
+  });
+
+  it('does not infer completion from an untracked task list', t => {
+    const dir = repository(t, {
+      'specs/004-active/spec.md': '# Feature\n\n**Status:** Draft\n',
+    });
+    write(dir, 'specs/004-active/tasks.md', '# Tasks\n\n- [x] T001 Local experiment\n');
+    const result = validateDocumentLifecycle(dir);
+    assert.equal(result.findings.length, 0);
+  });
+
+  it('accepts manifest-backed deletions and flags manifest entries that remain active', t => {
+    const dir = repository(t, {
+      'docs/old.md': '# Old\n',
+      '.docguard-archive.json': JSON.stringify({
+        schemaVersion: 1,
+        strategy: 'git-history',
+        retention: { ref: 'refs/heads/main', objectFormat: 'sha1', recoverability: 'verified' },
+        entries: [{
+          path: 'docs/old.md',
+          archivedFrom: '0'.repeat(40),
+          blob: '1'.repeat(40),
+          reason: 'Superseded',
+        }],
+      }),
+    });
+    let result = validateDocumentLifecycle(dir);
+    assert.equal(result.findings.length, 1);
+    assert.equal(result.findings[0].code, 'DLC004');
+    rmSync(join(dir, 'docs', 'old.md'));
+    result = validateDocumentLifecycle(dir);
+    assert.equal(result.findings.length, 0);
+  });
+
+  it('rejects an incomplete recovery entry instead of trusting its tombstones', t => {
+    const dir = repository(t, {
+      '.docguard-archive.json': JSON.stringify({
+        schemaVersion: 1,
+        strategy: 'git-history',
+        entries: [{ path: 'specs/retired/spec.md', requirementIds: ['FR-901'] }],
+      }),
+    });
+
+    const result = validateDocumentLifecycle(dir);
+
+    assert.equal(result.findings.length, 1);
+    assert.equal(result.findings[0].code, 'DLC003');
+    assert.match(result.findings[0].message, /invalid recovery entry/);
+  });
+});
